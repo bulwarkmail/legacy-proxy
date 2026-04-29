@@ -1,12 +1,13 @@
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store } from "../../state/store.js";
-import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids.js";
+import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
 import { keywordToFlag } from "../../mapping/flags.js";
+import { buildRfc822, type JmapEmailCreate } from "../../mapping/buildMime.js";
 
 export interface EmailQueryArgs {
   accountId: string;
@@ -217,9 +218,12 @@ export async function emailSet(
   const destroyed: string[] = [];
   const notDestroyed: Record<string, SetError> = {};
 
-  // create not implemented (drafts/import live in Email/import + EmailSubmission)
-  for (const cid of Object.keys(args.create ?? {})) {
-    notCreated[cid] = { type: "forbidden", description: "Email/set create not implemented" };
+  for (const [cid, payload] of Object.entries(args.create ?? {})) {
+    try {
+      created[cid] = await applyEmailCreate(payload as Record<string, unknown>, ctx);
+    } catch (e) {
+      notCreated[cid] = toSetError(e);
+    }
   }
 
   for (const [id, patch] of Object.entries(args.update ?? {})) {
@@ -430,6 +434,81 @@ async function applyEmailUpdate(
       }
     }
   });
+}
+
+interface CreatedEmailResult {
+  id: string;
+  blobId: string;
+  threadId: string;
+  size: number;
+}
+
+async function applyEmailCreate(
+  payload: Record<string, unknown>,
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+): Promise<CreatedEmailResult> {
+  // Resolve target mailbox (single-membership only).
+  const mailboxIds = payload.mailboxIds;
+  if (!mailboxIds || typeof mailboxIds !== "object") {
+    throw new JmapError("invalidProperties", "mailboxIds is required", {
+      properties: ["mailboxIds"],
+    });
+  }
+  const ids = Object.entries(mailboxIds as Record<string, unknown>)
+    .filter(([, v]) => v === true)
+    .map(([k]) => k);
+  if (ids.length === 0) {
+    throw new JmapError("invalidProperties", "mailboxIds must contain at least one entry", {
+      properties: ["mailboxIds"],
+    });
+  }
+  if (ids.length > 1) {
+    throw new JmapError("invalidProperties", "multi-mailbox membership is not supported", {
+      properties: ["mailboxIds"],
+    });
+  }
+  const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, ids[0]!);
+
+  const keywords = (payload.keywords ?? {}) as Record<string, unknown>;
+  const flags: string[] = [];
+  for (const [kw, v] of Object.entries(keywords)) {
+    if (v === true) {
+      try {
+        flags.push(keywordToFlag(kw));
+      } catch (e) {
+        throw new JmapError("invalidProperties", (e as Error).message, {
+          properties: ["keywords"],
+        });
+      }
+    }
+  }
+
+  const mime = await buildRfc822(payload as JmapEmailCreate, ctx.account.host || "localhost");
+
+  const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;
+  const res = await ctx.client.append(target.name, mime, flags.length ? flags : undefined, idate);
+  if (!res) {
+    throw new JmapError("serverFail", `APPEND to "${target.name}" failed`);
+  }
+
+  // UIDPLUS gives us the new UID; without it we can't form a stable JMAP id.
+  // Most modern servers (Stalwart, Dovecot, Cyrus) advertise it.
+  if (res.uid == null) {
+    throw new JmapError("serverFail", "server did not return UID for APPEND (no UIDPLUS)");
+  }
+  const uidvalidity = res.uidValidity != null ? Number(res.uidValidity) : target.uidvalidity;
+  const emailId = encodeEmailId({
+    accountIdx: ctx.account.id,
+    mailboxIdx: target.id,
+    uidvalidity,
+    uid: res.uid,
+  });
+  return {
+    id: emailId,
+    blobId: encodeBlobId(emailId),
+    threadId: emailId,
+    size: mime.length,
+  };
 }
 
 async function applyEmailDestroy(
