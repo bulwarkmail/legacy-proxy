@@ -1,0 +1,35 @@
+services:
+  stalwart:
+    image: stalwartlabs/mail-server:latest
+    restart: unless-stopped
+    ports:
+      - "1143:143"
+      - "1993:993"
+      - "1587:587"
+      - "1465:465"
+      - "14190:4190"
+    volumes:
+      - ./test/integration/stalwart-config:/opt/stalwart/etc:ro
+      - stalwart-data:/opt/stalwart
+
+  legacy-proxy:
+    build: .
+    image: legacy-proxy:test
+    depends_on:
+      - stalwart
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      DATA_DIR: /data
+      LOG_LEVEL: debug
+      PUBLIC_URL: http://localhost:8080
+      VAULT_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      SESSION_HMAC_KEY: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBE=
+      DEFAULT_PROVIDER: stalwart-test
+      PROVIDERS_FILE: /etc/legacy-proxy/providers.json
+    volumes:
+      - ./test/integration/providers.test.json:/etc/legacy-proxy/providers.json:ro
+
+volumes:
+  stalwart-data:

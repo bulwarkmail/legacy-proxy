@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.env
+.env.local
+*.log
+coverage/
+vendor/jmap-test-suite/

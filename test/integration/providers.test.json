@@ -1,0 +1,8 @@
+{
+  "stalwart-test": {
+    "imap":  { "host": "stalwart", "port": 143, "secure": false, "starttls": true },
+    "smtp":  { "host": "stalwart", "port": 587, "secure": false, "starttls": true },
+    "sieve": { "host": "stalwart", "port": 4190, "secure": false, "starttls": true },
+    "auth":  { "mech": ["PLAIN", "LOGIN"] }
+  }
+}

@@ -1,0 +1,24 @@
+services:
+  legacy-proxy:
+    build: .
+    image: legacy-proxy:dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      DATA_DIR: /data
+      LOG_LEVEL: info
+      PUBLIC_URL: http://localhost:8080
+      VAULT_KEY: ${VAULT_KEY}
+      SESSION_HMAC_KEY: ${SESSION_HMAC_KEY}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-generic}
+      PROVIDERS_FILE: /etc/legacy-proxy/providers.json
+    volumes:
+      - ./data:/data
+      - ./providers.json:/etc/legacy-proxy/providers.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

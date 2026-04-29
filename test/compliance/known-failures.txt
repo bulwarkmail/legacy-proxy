@@ -1,0 +1,11 @@
+# Known compliance failures - features the upstream IMAP cannot offer
+# without server-side support, so we cannot fake them in the proxy.
+#
+# Each line is the pytest node-id substring; the runner allow-lists them
+# but does not auto-skip - they show up as warnings.
+
+# Email/queryChanges over a non-CONDSTORE backend
+jmap_test_suite::test_email_query_changes::test_canCalculateChanges_false_is_honoured
+
+# JMAP-only push capability (we only ship eventsource + ws v1)
+jmap_test_suite::test_push::test_pushSubscription_lifecycle
