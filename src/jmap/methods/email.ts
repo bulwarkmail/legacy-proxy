@@ -85,12 +85,26 @@ export async function emailQuery(
 }
 
 export async function emailGet(
-  args: { accountId: string; ids: string[]; properties?: string[] },
+  args: {
+    accountId: string;
+    ids: string[];
+    properties?: string[];
+    fetchTextBodyValues?: boolean;
+    fetchHTMLBodyValues?: boolean;
+    fetchAllBodyValues?: boolean;
+    maxBodyValueBytes?: number;
+  },
   ctx: { account: AccountRow; client: ImapFlow; store: Store },
 ): Promise<{ accountId: string; state: string; list: JmapEmail[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const list: JmapEmail[] = [];
   const notFound: string[] = [];
+  const bodyOpts = {
+    fetchTextBodyValues: args.fetchTextBodyValues,
+    fetchHTMLBodyValues: args.fetchHTMLBodyValues,
+    fetchAllBodyValues: args.fetchAllBodyValues,
+    maxBodyValueBytes: args.maxBodyValueBytes,
+  };
   for (const id of args.ids) {
     const parts = decodeEmailId(id);
     const mboxRow = ctx.store.db
@@ -108,6 +122,7 @@ export async function emailGet(
         ctx.account,
         { ...mboxRow, account_id: ctx.account.id, parent_id: null, delim: "/", role: null, special_use: null, total: 0, unread: 0, subscribed: 0, last_seen: 0 } as never,
         parts.uid,
+        bodyOpts,
       ),
     );
     if (meta) list.push(meta);

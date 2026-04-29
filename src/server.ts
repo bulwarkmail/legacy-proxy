@@ -105,6 +105,59 @@ app.post("/jmap", async (req, reply) => {
   }
 });
 
+app.get<{ Params: { accountId: string; blobId: string; name: string } }>(
+  "/jmap/download/:accountId/:blobId/:name",
+  async (req, reply) => {
+    const account = await authn(req);
+    if (!account) return send401(reply);
+    if (req.params.accountId !== String(account.id)) return reply.code(404).send({ error: "not found" });
+
+    const { decodeBlobId, decodeEmailId } = await import("./mapping/ids.js");
+    const { withMailbox } = await import("./imap/client.js");
+    let parsed;
+    try {
+      parsed = decodeBlobId(req.params.blobId);
+    } catch {
+      return reply.code(400).send({ error: "bad blobId" });
+    }
+    let emailParts;
+    try {
+      emailParts = decodeEmailId(parsed.emailId);
+    } catch {
+      return reply.code(400).send({ error: "bad emailId in blobId" });
+    }
+    const mbox = store.db
+      .prepare(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
+      .get(emailParts.mailboxIdx, account.id) as { id: number; name: string } | undefined;
+    if (!mbox) return reply.code(404).send({ error: "mailbox gone" });
+
+    const client = await pool.getForAccount(account);
+    try {
+      const buf = await withMailbox(client, mbox.name, async () => {
+        if (parsed.partId) {
+          const dl = await client.download(`${emailParts.uid}`, parsed.partId, { uid: true });
+          if (!dl) return null;
+          const chunks: Buffer[] = [];
+          for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
+          return { body: Buffer.concat(chunks), contentType: dl.meta?.contentType ?? "application/octet-stream" };
+        }
+        const dl = await client.download(`${emailParts.uid}`, undefined, { uid: true });
+        if (!dl) return null;
+        const chunks: Buffer[] = [];
+        for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
+        return { body: Buffer.concat(chunks), contentType: "message/rfc822" };
+      });
+      if (!buf) return reply.code(404).send({ error: "blob not found" });
+      reply.header("Content-Type", buf.contentType);
+      reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      return reply.send(buf.body);
+    } catch (e) {
+      log.error({ err: (e as Error).message }, "download error");
+      return reply.code(502).send({ error: "download failed" });
+    }
+  },
+);
+
 app.get("/jmap/eventsource", async (req, reply) => {
   const account = await authn(req);
   if (!account) return send401(reply);
