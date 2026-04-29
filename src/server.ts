@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { loadConfig } from "./util/config.js";
@@ -18,7 +19,7 @@ const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
 
 const app = Fastify({
-  logger: log,
+  loggerInstance: log,
   bodyLimit: cfg.limits.maxSizeRequest,
   disableRequestLogging: false,
 });
@@ -71,21 +72,32 @@ app.get("/.well-known/jmap", async (_req, reply) => {
   reply.redirect(`${cfg.publicUrl}/jmap/session`);
 });
 
+function send401(reply: import("fastify").FastifyReply) {
+  reply.header("WWW-Authenticate", 'Basic realm="legacy-proxy", Bearer');
+  return reply.code(401).send({ error: "unauthorized" });
+}
+
 app.get("/jmap/session", async (req, reply) => {
-  const account = authn(req);
-  if (!account) return reply.code(401).send({ error: "unauthorized" });
+  const account = await authn(req);
+  if (!account) return send401(reply);
   return buildSession(cfg, account);
 });
 
 app.post("/jmap", async (req, reply) => {
-  const account = authn(req);
-  if (!account) return reply.code(401).send({ error: "unauthorized" });
+  const account = await authn(req);
+  if (!account) return send401(reply);
   const env = req.body as RequestEnvelope;
   if (!env || !Array.isArray(env.methodCalls) || !Array.isArray(env.using)) {
     return reply.code(400).send({ error: "malformed JMAP request" });
   }
   try {
     const out = await dispatch(env, { cfg, pool, store, account });
+    if (process.env.JMAP_DEBUG === "1") {
+      log.info(
+        { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },
+        "jmap request",
+      );
+    }
     return out;
   } catch (e) {
     log.error({ err: (e as Error).message }, "jmap dispatch error");
@@ -94,18 +106,66 @@ app.post("/jmap", async (req, reply) => {
 });
 
 app.get("/jmap/eventsource", async (req, reply) => {
-  const account = authn(req);
-  if (!account) return reply.code(401).send({ error: "unauthorized" });
-  hub.add(account, reply);
+  const account = await authn(req);
+  if (!account) return send401(reply);
+  const origin = (req.headers["origin"] as string | undefined) ?? null;
+  hub.add(account, reply, origin);
 });
 
-function authn(req: { headers: Record<string, string | string[] | undefined> }) {
+// Cache of validated Basic-auth credentials → account. Keyed by sha256 of the
+// raw header so we never log or persist plaintext. TTL keeps memory bounded.
+const basicAuthCache = new Map<string, { accountId: number; expires: number }>();
+const BASIC_TTL_MS = 5 * 60_000;
+
+async function authn(req: {
+  headers: Record<string, string | string[] | undefined>;
+}): Promise<import("./state/store.js").AccountRow | null> {
   const h = req.headers["authorization"];
-  if (typeof h !== "string" || !h.startsWith("Bearer ")) return null;
-  const token = h.slice("Bearer ".length).trim();
-  const sess = verifySession(cfg.sessionHmacKey, token);
-  if (!sess) return null;
-  return store.getAccount(sess.accountSlug) ?? null;
+  if (typeof h !== "string") return null;
+
+  if (h.startsWith("Bearer ")) {
+    const token = h.slice("Bearer ".length).trim();
+    const sess = verifySession(cfg.sessionHmacKey, token);
+    if (!sess) return null;
+    return store.getAccount(sess.accountSlug) ?? null;
+  }
+
+  if (h.startsWith("Basic ")) {
+    const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
+    const cached = basicAuthCache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) {
+      return store.getAccountById(cached.accountId) ?? null;
+    }
+    const decoded = Buffer.from(h.slice("Basic ".length).trim(), "base64").toString("utf8");
+    const colon = decoded.indexOf(":");
+    if (colon < 1) return null;
+    const username = decoded.slice(0, colon);
+    const password = decoded.slice(colon + 1);
+
+    const providerName = cfg.defaultProvider;
+    const provider = resolveProvider(cfg, providerName);
+    const creds: Credentials = { mech: "PLAIN", username, password };
+
+    try {
+      const probe = await openImap({ provider, creds });
+      await probe.logout();
+    } catch (e) {
+      log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
+      return null;
+    }
+    const vault = await sealCredentials(cfg.vaultKey, creds);
+    const account = store.upsertAccount({
+      slug: `${providerName}:${username}`,
+      kind: providerName,
+      host: provider.imap.host,
+      username,
+      vault,
+    });
+    basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
+    return account;
+  }
+
+  return null;
 }
 
 const port = cfg.port;
@@ -129,6 +189,12 @@ const shutdown = async () => {
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("uncaughtException", (err) => {
+  log.error({ err: err.message, stack: err.stack }, "uncaughtException — continuing");
+});
+process.on("unhandledRejection", (reason) => {
+  log.error({ reason: String(reason) }, "unhandledRejection — continuing");
+});
 
 // Decorate hub usage so it's not flagged as unused - push wiring is a follow-up.
 void hub;

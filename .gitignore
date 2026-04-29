@@ -6,3 +6,5 @@ data/
 *.log
 coverage/
 vendor/jmap-test-suite/
+
+providers.json

@@ -1,7 +1,7 @@
 # legacy-proxy
 
 > IMAP / SMTP / ManageSieve → JMAP gateway. Use any JMAP client with Gmail,
-> Fastmail, your hosting provider's mailbox, or any RFC 3501 IMAP server.
+> your hosting provider's mailbox, or any RFC 3501 IMAP server.
 
 `legacy-proxy` speaks **JMAP for Mail** (RFC 8620 + RFC 8621) on the front
 side and **IMAP4rev1 + Submission (SMTP) + ManageSieve** on the back side.
@@ -78,7 +78,7 @@ Use the returned `token` as `Authorization: Bearer …` on all JMAP requests.
 | `PROVIDERS_FILE`   | `/etc/legacy-proxy/providers.json` | provider catalogue                     |
 | `LOG_LEVEL`        | `info`                             | pino level                             |
 
-`providers.example.json` ships ready-to-use templates for Gmail, Fastmail,
+`providers.example.json` ships ready-to-use templates for Gmail,
 and a generic `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` form.
 
 ---

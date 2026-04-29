@@ -4,7 +4,7 @@ A Node service that speaks **JMAP for Mail** (RFC 8620 + RFC 8621) on the
 front side and **IMAP4rev1/2 + Submission (SMTP) + ManageSieve** on the back
 side. The goal is to let any JMAP client (Bulwark Webmail, JMAP-compatible
 mobile clients, the official `jmap-test-suite`) talk to legacy mailservers
-(Gmail, Fastmail-via-IMAP, cPanel/Dovecot/Cyrus, generic providers) as if
+(Gmail, cPanel/Dovecot/Cyrus, generic providers) as if
 they were native JMAP servers.
 
 ---

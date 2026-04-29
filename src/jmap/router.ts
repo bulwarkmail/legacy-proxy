@@ -35,6 +35,7 @@ type Handler = (args: Record<string, unknown>, ctx: Ctx) => Promise<unknown>;
 
 export function makeMethodTable(): Record<string, Handler> {
   return {
+    "Core/echo": async (a) => a,
     "Mailbox/get": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
       return mailboxGet(a as never, { account: c.account, client, store: c.store });

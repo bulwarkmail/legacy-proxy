@@ -8,7 +8,7 @@ export interface SsePayload {
 export class EventSourceHub {
   private clients = new Map<number, Set<FastifyReply>>();
 
-  add(account: AccountRow, reply: FastifyReply, pingSec = 30) {
+  add(account: AccountRow, reply: FastifyReply, origin: string | null, pingSec = 30) {
     let set = this.clients.get(account.id);
     if (!set) {
       set = new Set();
@@ -19,6 +19,11 @@ export class EventSourceHub {
     reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.setHeader("X-Accel-Buffering", "no");
+    if (origin) {
+      reply.raw.setHeader("Access-Control-Allow-Origin", origin);
+      reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
+      reply.raw.setHeader("Vary", "Origin");
+    }
     reply.raw.write(`: connected\n\n`);
     const ping = setInterval(() => reply.raw.write(`: ping\n\n`), pingSec * 1000);
     reply.raw.on("close", () => {
