@@ -1,6 +1,7 @@
 import type { ImapPool } from "../imap/pool.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
+import { log } from "../util/log.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
 import { harvestCreatedIds, resolveArgs, type CreatedIds } from "./refs.js";
 import { mailboxGet } from "./methods/mailbox.js";
@@ -175,13 +176,18 @@ export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<Response
     const [name, rawArgs, callId] = call;
     let result: unknown;
     let respName = name;
+    const t0 = Date.now();
     try {
       const args = resolveArgs(rawArgs, prior, createdIds) as Record<string, unknown>;
       const handler = TABLE[name];
       if (!handler) throw unknownMethod(name);
       result = await handler(args, ctx);
       harvestCreatedIds(createdIds, name, result);
+      const ms = Date.now() - t0;
+      if (ms >= 250) log.info({ method: name, callId, ms }, "jmap method slow");
     } catch (e) {
+      const ms = Date.now() - t0;
+      log.warn({ method: name, callId, ms, err: (e as Error).message }, "jmap method error");
       respName = "error";
       if (e instanceof JmapError) {
         result = e.toMethodError();

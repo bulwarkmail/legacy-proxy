@@ -18,13 +18,22 @@ export interface EmailQueryArgs {
   collapseThreads?: boolean;
 }
 
-const SORT_MAP: Record<string, string> = {
-  receivedAt: "date",
-  from: "from",
-  to: "to",
-  subject: "subject",
-  size: "size",
-};
+// IMAP without the SORT extension can only deliver UID order, which approximates
+// receivedAt. Other JMAP sort properties (subject, from, size, ...) would require
+// fetching metadata for every match — refuse them rather than silently lying.
+const SUPPORTED_SORT_PROPS = new Set(["receivedAt"]);
+
+function findInMailbox(filter: Filter): string | null {
+  if ("operator" in filter) {
+    if (filter.operator !== "AND") return null;
+    for (const c of filter.conditions) {
+      const m = findInMailbox(c);
+      if (m) return m;
+    }
+    return null;
+  }
+  return filter.inMailbox ?? null;
+}
 
 export async function emailQuery(
   args: EmailQueryArgs,
@@ -39,7 +48,7 @@ export async function emailQuery(
 }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const filter = args.filter ?? ({} as Filter);
-  const inMailbox = "operator" in filter ? null : filter.inMailbox;
+  const inMailbox = findInMailbox(filter);
   if (!inMailbox) throw invalidArguments("inMailbox is required for v1");
 
   const m = decodeMailboxId(inMailbox);
@@ -57,8 +66,10 @@ export async function emailQuery(
   }
 
   for (const s of args.sort ?? []) {
-    if (!SORT_MAP[s.property]) throw unsupportedSort();
+    if (!SUPPORTED_SORT_PROPS.has(s.property)) throw unsupportedSort();
   }
+  // Default JMAP order is unspecified; clients usually want newest-first.
+  const ascending = args.sort?.[0]?.isAscending === true;
 
   return await withMailbox(ctx.client, mboxRow.name, async () => {
     const status = ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
@@ -67,8 +78,9 @@ export async function emailQuery(
     );
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
 
-    const uids = (await ctx.client.search(imapFilter, { uid: true })) as number[];
-    const sorted = uids.sort((a, b) => b - a);
+    const searchResult = await ctx.client.search(imapFilter, { uid: true });
+    const uids: number[] = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+    const sorted = uids.sort((a, b) => (ascending ? a - b : b - a));
     const pos = Math.max(0, args.position ?? 0);
     const lim = Math.min(args.limit ?? 50, 500);
     const slice = sorted.slice(pos, pos + lim);

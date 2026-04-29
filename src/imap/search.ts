@@ -62,7 +62,11 @@ function compileLeaf(c: FilterCondition): ImapSearch {
   if (c.maxSize != null) out.smaller = c.maxSize + 1;
   if (c.hasKeyword) out.keyword = keywordToFlag(c.hasKeyword);
   if (c.notKeyword) out.unKeyword = keywordToFlag(c.notKeyword);
-  if (c.text) out.body = c.text;
+  // JMAP `text` matches across from/to/cc/bcc/subject/body — IMAP TEXT, not BODY.
+  // Multi-word queries become per-token TEXT criteria ANDed together; otherwise
+  // the server hunts for the literal string (incl. spaces and *), scans the
+  // whole mailbox, and returns nothing.
+  if (c.text) Object.assign(out, compileTextTokens(c.text));
   if (c.from) out.from = c.from;
   if (c.to) out.to = c.to;
   if (c.cc) out.cc = c.cc;
@@ -79,4 +83,17 @@ function compileLeaf(c: FilterCondition): ImapSearch {
     throw new UnsupportedFilter("hasAttachment requires backend support");
   }
   return out;
+}
+
+function compileTextTokens(s: string): ImapSearch {
+  // IMAP SEARCH does substring matching with no wildcard support; `*` and `?`
+  // are sent literally and never match. Strip them and split on whitespace so
+  // each remaining token becomes its own TEXT criterion.
+  const tokens = s.split(/\s+/).map((t) => t.replace(/[*?]/g, "")).filter(Boolean);
+  if (tokens.length === 0) return {};
+  if (tokens.length === 1) return { text: tokens[0] };
+  // A SearchObject can only carry one `text` key, so we can't AND multiple TEXT
+  // criteria directly. De Morgan: A ∧ B ∧ … = ¬(¬A ∨ ¬B ∨ …), which imapflow's
+  // not/or compiler emits correctly.
+  return { not: { or: tokens.map((t) => ({ not: { text: t } })) } };
 }
