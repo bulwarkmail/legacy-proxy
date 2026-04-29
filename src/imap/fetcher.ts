@@ -62,7 +62,7 @@ function decodePartText(buf: Buffer, charset: string | null): string {
   }
 }
 
-// IMAP `BODY[partId]` returns the raw bytes — still in their Content-Transfer
+// IMAP `BODY[partId]` returns the raw bytes - still in their Content-Transfer
 // -Encoding (typically quoted-printable or base64 for text parts). imapflow's
 // `download()` decodes that for us, but `fetch({bodyParts})` does not, so we
 // must reverse the CTE ourselves before applying the charset.
@@ -320,7 +320,7 @@ export async function fetchEmailsBatch(
 
   // For mail-list views (preview requested, full bodies not requested) we
   // still want to populate `preview`. Group UIDs by their first text/html
-  // partId so a single FETCH per group covers the whole page — typical
+  // partId so a single FETCH per group covers the whole page - typical
   // mailboxes collapse to 2-3 round trips total instead of N.
   const previewByUid = new Map<number, string>();
   if (!wantsBodies) {

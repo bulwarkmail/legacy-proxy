@@ -11,6 +11,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "setup": "node scripts/setup.mjs",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "lint": "tsc --noEmit",

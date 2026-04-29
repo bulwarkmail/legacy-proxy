@@ -2,14 +2,14 @@
 //
 // Two distinct cross-call mechanisms:
 //
-// §3.7 — Result references: an arg key prefixed with `#` whose value is
+// §3.7 - Result references: an arg key prefixed with `#` whose value is
 //   `{ resultOf, name, path }` is replaced by walking that JSON pointer
 //   into the previous response. Only valid at the top level of the args
-//   object — nested `#`-prefixed keys (e.g. EmailSubmission/set's
+//   object - nested `#`-prefixed keys (e.g. EmailSubmission/set's
 //   `onSuccessUpdateEmail: { "#tempId": patch }`) are creation-reference
 //   keys per RFC 8621 §7.3 and must pass through unchanged.
 //
-// §5.3 — Creation references: any string value that looks like `#name`
+// §5.3 - Creation references: any string value that looks like `#name`
 //   refers to the createdId returned by a previous `*/set` call in the
 //   same request. The server replaces it with the actual server-assigned
 //   id.

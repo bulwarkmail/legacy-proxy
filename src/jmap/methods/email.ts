@@ -357,7 +357,7 @@ function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
       else if (v === null || v === false) out.keywordRemove.add(kw);
     }
     // Other Email properties (subject, from, etc.) cannot be edited in-place
-    // on IMAP — silently ignore so the client can still patch flags/folder.
+    // on IMAP - silently ignore so the client can still patch flags/folder.
   }
 
   if (mailboxFull !== null) {
@@ -370,7 +370,7 @@ function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
       .map(([k]) => k);
     // Removals: anything explicitly set to null is dropped; in our 1-mailbox
     // model the email is removed from its current box only if the current id
-    // appears in the null entries — applyEmailUpdate handles that by checking
+    // appears in the null entries - applyEmailUpdate handles that by checking
     // newMailboxIds against current.
   }
 

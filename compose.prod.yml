@@ -1,0 +1,27 @@
+services:
+  legacy-proxy:
+    image: ghcr.io/bulwarkmail/legacy-proxy:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: 8080
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-generic}
+      PROVIDERS_FILE: /etc/legacy-proxy/providers.json
+    volumes:
+      - data:/data
+      - ./providers.json:/etc/legacy-proxy/providers.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  data:

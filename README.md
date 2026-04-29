@@ -39,29 +39,76 @@ This is the v0.1 scaffold described by the plan. It includes:
 
 ## Quickstart
 
+### Run the published image (no clone needed)
+
+Requires Docker. Three files land in your working directory; the image is
+pulled from `ghcr.io/bulwarkmail/legacy-proxy`.
+
 ```bash
-git clone <this repo>
-cd legacy-proxy
+mkdir legacy-proxy && cd legacy-proxy
 
-# generate keys
-export VAULT_KEY=$(openssl rand -base64 32)
-export SESSION_HMAC_KEY=$(openssl rand -base64 32)
+# .env with two random 32-byte keys
+cat > .env <<EOF
+VAULT_KEY=$(openssl rand -base64 32)
+SESSION_HMAC_KEY=$(openssl rand -base64 32)
+EOF
+chmod 600 .env
 
-cp providers.example.json providers.json
-docker compose up --build
+# config + compose
+curl -fsSLo providers.json   https://raw.githubusercontent.com/bulwarkmail/legacy-proxy/main/providers.example.json
+curl -fsSLo compose.prod.yml https://raw.githubusercontent.com/bulwarkmail/legacy-proxy/main/compose.prod.yml
+
+# edit providers.json so the `generic` entry points at your IMAP/SMTP host
+docker compose -f compose.prod.yml up -d
 ```
 
+Verify with `curl http://localhost:8080/healthz` (should return `ok`).
 Then point a JMAP client at `http://localhost:8080/.well-known/jmap`.
 
-Login (one-time, exchanges IMAP creds for a JMAP session token):
+### Run from a clone (for development, or if you want to build locally)
+
+```bash
+git clone https://github.com/bulwarkmail/legacy-proxy.git
+cd legacy-proxy
+npm run setup            # generates .env + providers.json
+docker compose up -d     # builds locally; for the published image use compose.prod.yml
+```
+
+`npm run setup` is idempotent and won't overwrite an existing `.env` unless
+you pass `-- --force`.
+
+### Logging in
+
+Once the proxy is up, exchange IMAP credentials for a JMAP session token:
 
 ```bash
 curl -s http://localhost:8080/api/login \
   -H 'content-type: application/json' \
-  -d '{"username":"you@example.com","password":"…","provider":"gmail"}'
+  -d '{"username":"you@example.com","password":"…","provider":"generic"}'
 ```
 
 Use the returned `token` as `Authorization: Bearer …` on all JMAP requests.
+
+### Connecting Gmail
+
+Gmail no longer accepts plain account passwords over IMAP. Use an
+[App Password](https://support.google.com/accounts/answer/185833) (requires
+2-Step Verification) and pass `"provider": "gmail"`:
+
+```bash
+curl -s http://localhost:8080/api/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"you@gmail.com","password":"<16-char app password>","provider":"gmail"}'
+```
+
+XOAUTH2 is also supported if you bring your own OAuth tokens.
+
+### Exposing on a real host
+
+The proxy speaks plain HTTP - terminate TLS in front of it (Caddy, Traefik,
+nginx) and set `PUBLIC_URL` in `.env` to the URL clients will see, e.g.
+`PUBLIC_URL=https://jmap.example.com`. The Session resource hands out URLs
+based on `PUBLIC_URL`, so JMAP clients break if it's wrong.
 
 ---
 

@@ -249,10 +249,10 @@ const shutdown = async () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("uncaughtException", (err) => {
-  log.error({ err: err.message, stack: err.stack }, "uncaughtException — continuing");
+  log.error({ err: err.message, stack: err.stack }, "uncaughtException - continuing");
 });
 process.on("unhandledRejection", (reason) => {
-  log.error({ reason: String(reason) }, "unhandledRejection — continuing");
+  log.error({ reason: String(reason) }, "unhandledRejection - continuing");
 });
 
 // Decorate hub usage so it's not flagged as unused - push wiring is a follow-up.

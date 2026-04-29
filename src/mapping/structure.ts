@@ -14,7 +14,7 @@ export interface EmailBodyPart {
   language: string[] | null;
   location: string | null;
   // Content-Transfer-Encoding ("quoted-printable", "base64", "7bit", ...)
-  // — kept on the part for decoders that fetch raw bytes via BODY[partId].
+  // - kept on the part for decoders that fetch raw bytes via BODY[partId].
   encoding: string | null;
   subParts: EmailBodyPart[] | null;
 }

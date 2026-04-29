@@ -15,7 +15,7 @@ interface PoolEntry {
 
 // Skip the sanity-NOOP if the connection was used within this window.
 // Every JMAP method funnels through getForAccount, so a per-call NOOP
-// adds one IMAP round-trip to every request — visible as multi-second
+// adds one IMAP round-trip to every request - visible as multi-second
 // latency on slow links. Most servers don't drop idle TCP for tens of
 // seconds, so we only NOOP after a meaningful idle gap.
 const NOOP_FRESHNESS_MS = 30_000;

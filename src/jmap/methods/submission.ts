@@ -104,7 +104,7 @@ async function resolveEnvelope(
       to: envelope.rcptTo.map((r) => r.email!).filter(Boolean),
     };
   }
-  // Spec §7: if no envelope is given, derive from headers — From for
+  // Spec §7: if no envelope is given, derive from headers - From for
   // mailFrom, To+Cc+Bcc for rcptTo.
   const parsed = await simpleParser(raw);
   const fromAddr =
@@ -188,7 +188,7 @@ export async function emailSubmissionSet(
   }
 
   // updates / destroys on EmailSubmission objects don't make sense for our
-  // synchronous SMTP path — accept and report no-op.
+  // synchronous SMTP path - accept and report no-op.
   const notUpdated: Record<string, SetError> = {};
   for (const id of Object.keys(args.update ?? {})) {
     notUpdated[id] = { type: "forbidden", description: "EmailSubmission/set update not supported" };
