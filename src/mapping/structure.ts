@@ -41,9 +41,13 @@ export function structureToBodyParts(
   root: ImapflowPart,
   blobIdFor: (partId: string | null) => string | null,
 ): EmailBodyPart {
-  function walk(p: ImapflowPart): EmailBodyPart {
+  function walk(p: ImapflowPart, fallbackPartId: string | null): EmailBodyPart {
     const isMulti = (p.type ?? "").toLowerCase().startsWith("multipart/");
-    const partId = p.part ?? null;
+    // imapflow omits `.part` for single-part messages; IMAP convention is "1".
+    const partId = p.part ?? fallbackPartId ?? null;
+    const children = p.childNodes
+      ? p.childNodes.map((child, i) => walk(child, partId ? `${partId}.${i + 1}` : `${i + 1}`))
+      : null;
     return {
       partId: isMulti ? null : partId,
       blobId: isMulti ? null : blobIdFor(partId),
@@ -56,10 +60,10 @@ export function structureToBodyParts(
       cid: p.id ? p.id.replace(/^<|>$/g, "") : null,
       language: p.language && p.language.length ? p.language : null,
       location: p.location ?? null,
-      subParts: p.childNodes ? p.childNodes.map(walk) : null,
+      subParts: children,
     };
   }
-  return walk(root);
+  return walk(root, "1");
 }
 
 export interface SelectedBodies {
