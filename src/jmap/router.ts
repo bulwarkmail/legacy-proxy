@@ -6,6 +6,12 @@ import { resolveArgs } from "./refs.js";
 import { mailboxGet } from "./methods/mailbox.js";
 import { emailGet, emailQuery, emailSet } from "./methods/email.js";
 import { identityGet } from "./methods/identity.js";
+import {
+  emailSubmissionChanges,
+  emailSubmissionGet,
+  emailSubmissionQuery,
+  emailSubmissionSet,
+} from "./methods/submission.js";
 import { vacationGet, vacationSet } from "./methods/vacation.js";
 import {
   addressBookGet,
@@ -119,6 +125,21 @@ export function makeMethodTable(): Record<string, Handler> {
     "Email/set": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
       return emailSet(a as never, { account: c.account, client, store: c.store });
+    },
+    "EmailSubmission/get": async (a, c) =>
+      emailSubmissionGet(a as never, { account: c.account, store: c.store }),
+    "EmailSubmission/query": async (a, c) =>
+      emailSubmissionQuery(a as never, { account: c.account, store: c.store }),
+    "EmailSubmission/changes": async (a, c) =>
+      emailSubmissionChanges(a as never, { account: c.account, store: c.store }),
+    "EmailSubmission/set": async (a, c) => {
+      const client = await c.pool.getForAccount(c.account);
+      return emailSubmissionSet(a as never, {
+        cfg: c.cfg,
+        account: c.account,
+        client,
+        store: c.store,
+      });
     },
     "Identity/get": async (a, c) => identityGet(a as never, { account: c.account }),
     "VacationResponse/get": async (a, c) => {

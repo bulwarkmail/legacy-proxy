@@ -377,7 +377,7 @@ function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
   return out;
 }
 
-async function applyEmailUpdate(
+export async function applyEmailUpdate(
   id: string,
   patch: Record<string, unknown>,
   ctx: { account: AccountRow; client: ImapFlow; store: Store },
