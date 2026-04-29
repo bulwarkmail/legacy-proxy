@@ -167,12 +167,51 @@ function addr(list: { name?: string | null; address?: string | null }[] | null |
     .map((a) => ({ name: a.name?.trim() || null, email: a.address! }));
 }
 
+// Bytes of body text to fetch for the preview snippet. JMAP previews cap at
+// 256 chars; pulling a few KB tolerates multi-byte charsets, quoted-printable
+// expansion, and HTML markup overhead before the htmlToPlain step.
+const PREVIEW_FETCH_BYTES = 4096;
+
+function buildPreview(text: string, isHtml: boolean): string {
+  const plain = isHtml ? htmlToPlain(text) : text;
+  return plain.replace(/\s+/g, " ").trim().slice(0, 256);
+}
+
+// Single-message preview fetch: pulls a small slice of the first text or html
+// part. Used by `fetchEmailMeta`; batched callers should use the precomputed
+// path on `processMessage` instead to collapse round trips.
+async function fetchPreviewSnippet(
+  client: ImapFlow,
+  uid: number,
+  sel: ReturnType<typeof selectBodies>,
+): Promise<string> {
+  const text = sel.textBody.find((p) => p.partId);
+  const html = sel.htmlBody.find((p) => p.partId);
+  const part = text ?? html;
+  if (!part?.partId) return "";
+  try {
+    const msg = await client.fetchOne(
+      `${uid}`,
+      { uid: true, bodyParts: [{ key: part.partId, start: 0, maxLength: PREVIEW_FETCH_BYTES }] },
+      { uid: true },
+    );
+    const buf = msg && msg.bodyParts ? msg.bodyParts.get(part.partId) : undefined;
+    if (!buf) return "";
+    const decoded = decodeTransferEncoding(buf, part.encoding);
+    const decodedText = decodePartText(decoded, part.charset);
+    return buildPreview(decodedText, !text);
+  } catch {
+    return "";
+  }
+}
+
 async function processMessage(
   client: ImapFlow,
   account: AccountRow,
   mailbox: MailboxRow,
   msg: FetchMessageObject,
   bodyOpts: BodyFetchOpts,
+  precomputedPreview?: string,
 ): Promise<JmapEmail> {
   const emailId = encodeEmailId({
     accountIdx: account.id,
@@ -197,18 +236,23 @@ async function processMessage(
     ? await fetchBodyValues(client, msg.uid!, sel.textBody, sel.htmlBody, sel.attachments, bodyOpts)
     : {};
 
-  let preview = "";
-  if (wantsBodies) {
+  let preview = precomputedPreview ?? "";
+  if (!preview && wantsBodies) {
     const firstText = sel.textBody[0]?.partId;
     if (firstText && bodyValues[firstText]) {
-      preview = bodyValues[firstText].value.replace(/\s+/g, " ").trim().slice(0, 256);
+      preview = buildPreview(bodyValues[firstText].value, false);
     }
     if (!preview) {
       const firstHtml = sel.htmlBody[0]?.partId;
       if (firstHtml && bodyValues[firstHtml]) {
-        preview = htmlToPlain(bodyValues[firstHtml].value).slice(0, 256);
+        preview = buildPreview(bodyValues[firstHtml].value, true);
       }
     }
+  }
+  // Mail list views request `preview` without `fetchTextBodyValues`; fetch a
+  // small slice so the list still shows snippets.
+  if (!preview && !wantsBodies && precomputedPreview === undefined) {
+    preview = await fetchPreviewSnippet(client, msg.uid!, sel);
   }
 
   return {
@@ -268,9 +312,82 @@ export async function fetchEmailsBatch(
   for await (const m of client.fetch(uids, META_QUERY, { uid: true })) {
     messages.push(m);
   }
+
+  const wantsBodies =
+    bodyOpts.fetchTextBodyValues === true ||
+    bodyOpts.fetchHTMLBodyValues === true ||
+    bodyOpts.fetchAllBodyValues === true;
+
+  // For mail-list views (preview requested, full bodies not requested) we
+  // still want to populate `preview`. Group UIDs by their first text/html
+  // partId so a single FETCH per group covers the whole page — typical
+  // mailboxes collapse to 2-3 round trips total instead of N.
+  const previewByUid = new Map<number, string>();
+  if (!wantsBodies) {
+    interface PreviewTask {
+      uid: number;
+      partId: string;
+      encoding: string | null;
+      charset: string | null;
+      isHtml: boolean;
+    }
+    const tasks: PreviewTask[] = [];
+    for (const m of messages) {
+      if (m.uid == null || !m.bodyStructure) continue;
+      const root = structureToBodyParts(m.bodyStructure as never, () => null);
+      const sel = selectBodies(root);
+      const text = sel.textBody.find((p) => p.partId);
+      const html = sel.htmlBody.find((p) => p.partId);
+      const part = text ?? html;
+      if (!part?.partId) continue;
+      tasks.push({
+        uid: m.uid,
+        partId: part.partId,
+        encoding: part.encoding,
+        charset: part.charset,
+        isHtml: !text,
+      });
+    }
+    const byPartId = new Map<string, PreviewTask[]>();
+    for (const t of tasks) {
+      let arr = byPartId.get(t.partId);
+      if (!arr) {
+        arr = [];
+        byPartId.set(t.partId, arr);
+      }
+      arr.push(t);
+    }
+    for (const [partId, group] of byPartId) {
+      const groupUids = group.map((t) => t.uid);
+      const taskByUid = new Map(group.map((t) => [t.uid, t]));
+      try {
+        for await (const m of client.fetch(
+          groupUids,
+          { uid: true, bodyParts: [{ key: partId, start: 0, maxLength: PREVIEW_FETCH_BYTES }] },
+          { uid: true },
+        )) {
+          if (m.uid == null) continue;
+          const buf = m.bodyParts?.get(partId);
+          if (!buf) continue;
+          const t = taskByUid.get(m.uid);
+          if (!t) continue;
+          const decoded = decodeTransferEncoding(buf, t.encoding);
+          const decodedText = decodePartText(decoded, t.charset);
+          previewByUid.set(m.uid, buildPreview(decodedText, t.isHtml));
+        }
+      } catch {
+        // best-effort: leave preview empty for this group
+      }
+    }
+  }
+
   for (const m of messages) {
     if (m.uid == null) continue;
-    out.set(m.uid, await processMessage(client, account, mailbox, m, bodyOpts));
+    const preview = previewByUid.get(m.uid);
+    out.set(
+      m.uid,
+      await processMessage(client, account, mailbox, m, bodyOpts, preview),
+    );
   }
   return out;
 }
