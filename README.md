@@ -1,5 +1,10 @@
 # legacy-proxy
 
+> **Not production ready.** This is a v0.1 scaffold. Core JMAP write paths
+> (`Email/set`, `EmailSubmission/set`, etc.) are not implemented yet, there
+> are no security audits, and the API and storage formats may change without
+> notice. Use it for development, testing, and self-hosted experiments only.
+
 IMAP / SMTP / ManageSieve to JMAP gateway. Lets any JMAP client talk to
 Gmail, your hosting provider's mailbox, or any RFC 3501 IMAP server.
 
