@@ -6,8 +6,6 @@ Gmail, your hosting provider's mailbox, or any RFC 3501 IMAP server.
 Front: JMAP for Mail (RFC 8620 + RFC 8621). Back: IMAP4rev1, SMTP
 Submission, ManageSieve.
 
-Design notes in [PLAN.md](./PLAN.md).
-
 ## Status
 
 v0.1. Working:
@@ -24,8 +22,8 @@ v0.1. Working:
 - Docker image + compose files (prod, integration)
 - 28 unit tests, jmap-test-suite runner
 
-Not done yet (M3-M6 in PLAN.md): `Email/set`, `Email/copy`, `Email/import`,
-`EmailSubmission/set`, `Thread/get`, IMAP IDLE -> SSE, WebSocket transport.
+Not done yet: `Email/set`, `Email/copy`, `Email/import`, `EmailSubmission/set`,
+`Thread/get`, IMAP IDLE -> SSE, WebSocket transport.
 
 ## Quickstart
 
@@ -120,8 +118,6 @@ upstream failures live in `test/compliance/known-failures.txt`, mostly
 things the IMAP server can't offer (e.g. `queryChanges` without CONDSTORE).
 
 ## Architecture
-
-PLAN.md §2 has the long version. Layout:
 
 ```
 src/
