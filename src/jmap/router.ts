@@ -2,7 +2,7 @@ import type { ImapPool } from "../imap/pool.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
-import { resolveArgs } from "./refs.js";
+import { harvestCreatedIds, resolveArgs, type CreatedIds } from "./refs.js";
 import { mailboxGet } from "./methods/mailbox.js";
 import { emailGet, emailQuery, emailSet } from "./methods/email.js";
 import { identityGet } from "./methods/identity.js";
@@ -164,16 +164,23 @@ export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<Response
   }
   const responses: MethodCall[] = [];
   const prior: Record<string, { name: string; result: unknown }> = {};
+  const createdIds: CreatedIds = new Map();
+  // Seed with any createdIds the client passed in the request envelope so
+  // references can span requests (RFC 8620 §3.3).
+  for (const [k, v] of Object.entries(env.createdIds ?? {})) {
+    if (typeof v === "string") createdIds.set(k, v);
+  }
 
   for (const call of env.methodCalls) {
     const [name, rawArgs, callId] = call;
     let result: unknown;
     let respName = name;
     try {
-      const args = resolveArgs(rawArgs, prior) as Record<string, unknown>;
+      const args = resolveArgs(rawArgs, prior, createdIds) as Record<string, unknown>;
       const handler = TABLE[name];
       if (!handler) throw unknownMethod(name);
       result = await handler(args, ctx);
+      harvestCreatedIds(createdIds, name, result);
     } catch (e) {
       respName = "error";
       if (e instanceof JmapError) {
@@ -186,8 +193,12 @@ export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<Response
     prior[callId] = { name: respName, result };
   }
 
+  const createdIdsOut: Record<string, string> = {};
+  for (const [k, v] of createdIds) createdIdsOut[k] = v;
+
   return {
     methodResponses: responses,
+    createdIds: Object.keys(createdIdsOut).length ? createdIdsOut : undefined,
     sessionState: `s${ctx.account.id}`,
   };
 }
