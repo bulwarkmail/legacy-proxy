@@ -60,7 +60,9 @@ export async function emailQuery(
 
   return await withMailbox(ctx.client, mboxRow.name, async () => {
     const status = ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
-    const uidvalidity = (status as { uidValidity?: number } | null)?.uidValidity ?? mboxRow.uidvalidity;
+    const uidvalidity = Number(
+      (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? mboxRow.uidvalidity,
+    );
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
 
     const uids = (await ctx.client.search(imapFilter, { uid: true })) as number[];

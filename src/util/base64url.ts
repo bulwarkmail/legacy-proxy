@@ -7,10 +7,12 @@ export function b64uDecode(s: string): Buffer {
   return Buffer.from(s.replaceAll("-", "+").replaceAll("_", "/") + pad, "base64");
 }
 
-export function varintEncode(n: number): Buffer {
-  if (n < 0 || !Number.isInteger(n)) throw new RangeError("varintEncode: non-negative int");
+export function varintEncode(n: number | bigint): Buffer {
+  let v = typeof n === "bigint" ? Number(n) : n;
+  if (!Number.isFinite(v) || v < 0 || !Number.isInteger(v)) {
+    throw new RangeError(`varintEncode: non-negative int (got ${String(n)})`);
+  }
   const out: number[] = [];
-  let v = n;
   while (v >= 0x80) {
     out.push((v & 0x7f) | 0x80);
     v >>>= 7;

@@ -36,6 +36,46 @@ type Handler = (args: Record<string, unknown>, ctx: Ctx) => Promise<unknown>;
 export function makeMethodTable(): Record<string, Handler> {
   return {
     "Core/echo": async (a) => a,
+    // Stubs for capabilities we don't advertise but the UI may probe anyway.
+    // Returning an empty result is more graceful than `unknownMethod`, which
+    // some clients treat as a fatal protocol error.
+    "Quota/get": async (a) => ({
+      accountId: (a as { accountId?: string }).accountId ?? "",
+      state: "0",
+      list: [],
+      notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+    }),
+    "AddressBook/get": async (a) => ({
+      accountId: (a as { accountId?: string }).accountId ?? "",
+      state: "0",
+      list: [],
+      notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+    }),
+    "AddressBook/set": async (a) => ({
+      accountId: (a as { accountId?: string }).accountId ?? "",
+      oldState: "0",
+      newState: "0",
+      created: null,
+      updated: null,
+      destroyed: null,
+      notCreated: null,
+      notUpdated: null,
+      notDestroyed: null,
+    }),
+    "ContactCard/get": async (a) => ({
+      accountId: (a as { accountId?: string }).accountId ?? "",
+      state: "0",
+      list: [],
+      notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+    }),
+    "ContactCard/query": async (a) => ({
+      accountId: (a as { accountId?: string }).accountId ?? "",
+      queryState: "0",
+      canCalculateChanges: false,
+      position: 0,
+      total: 0,
+      ids: [],
+    }),
     "Mailbox/get": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
       return mailboxGet(a as never, { account: c.account, client, store: c.store });
