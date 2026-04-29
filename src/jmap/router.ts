@@ -4,7 +4,7 @@ import type { AppConfig } from "../util/config.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
 import { resolveArgs } from "./refs.js";
 import { mailboxGet } from "./methods/mailbox.js";
-import { emailGet, emailQuery } from "./methods/email.js";
+import { emailGet, emailQuery, emailSet } from "./methods/email.js";
 import { identityGet } from "./methods/identity.js";
 import { vacationGet, vacationSet } from "./methods/vacation.js";
 import {
@@ -115,6 +115,10 @@ export function makeMethodTable(): Record<string, Handler> {
     "Email/get": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
       return emailGet(a as never, { account: c.account, client, store: c.store });
+    },
+    "Email/set": async (a, c) => {
+      const client = await c.pool.getForAccount(c.account);
+      return emailSet(a as never, { account: c.account, client, store: c.store });
     },
     "Identity/get": async (a, c) => identityGet(a as never, { account: c.account }),
     "VacationResponse/get": async (a, c) => {
