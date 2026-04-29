@@ -2,7 +2,7 @@ import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store } from "../../state/store.js";
 import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
-import { fetchEmailMeta, type JmapEmail } from "../../imap/fetcher.js";
+import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
@@ -106,28 +106,59 @@ export async function emailGet(
     fetchAllBodyValues: args.fetchAllBodyValues,
     maxBodyValueBytes: args.maxBodyValueBytes,
   };
+
+  // Group ids by mailbox so we can do one SELECT + one batched FETCH per
+  // mailbox, instead of one per id. UI flows (open thread, open folder)
+  // typically request many ids in the same mailbox.
+  type Group = { mailboxIdx: number; entries: { id: string; uid: number }[] };
+  const groups = new Map<number, Group>();
   for (const id of args.ids) {
-    const parts = decodeEmailId(id);
-    const mboxRow = ctx.store.db
-      .prepare(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
-      .get(parts.mailboxIdx, ctx.account.id) as
-      | { id: number; name: string; uidvalidity: number; highest_modseq: number }
-      | undefined;
-    if (!mboxRow) {
+    let parts;
+    try {
+      parts = decodeEmailId(id);
+    } catch {
       notFound.push(id);
       continue;
     }
-    const meta = await withMailbox(ctx.client, mboxRow.name, async () =>
-      fetchEmailMeta(
-        ctx.client,
-        ctx.account,
-        { ...mboxRow, account_id: ctx.account.id, parent_id: null, delim: "/", role: null, special_use: null, total: 0, unread: 0, subscribed: 0, last_seen: 0 } as never,
-        parts.uid,
-        bodyOpts,
-      ),
+    let g = groups.get(parts.mailboxIdx);
+    if (!g) {
+      g = { mailboxIdx: parts.mailboxIdx, entries: [] };
+      groups.set(parts.mailboxIdx, g);
+    }
+    g.entries.push({ id, uid: parts.uid });
+  }
+
+  for (const group of groups.values()) {
+    const mboxRow = ctx.store.db
+      .prepare(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
+      .get(group.mailboxIdx, ctx.account.id) as
+      | { id: number; name: string; uidvalidity: number; highest_modseq: number }
+      | undefined;
+    if (!mboxRow) {
+      for (const e of group.entries) notFound.push(e.id);
+      continue;
+    }
+    const mailboxArg = {
+      ...mboxRow,
+      account_id: ctx.account.id,
+      parent_id: null,
+      delim: "/",
+      role: null,
+      special_use: null,
+      total: 0,
+      unread: 0,
+      subscribed: 0,
+      last_seen: 0,
+    } as never;
+    const uids = group.entries.map((e) => e.uid);
+    const fetched = await withMailbox(ctx.client, mboxRow.name, async () =>
+      fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts),
     );
-    if (meta) list.push(meta);
-    else notFound.push(id);
+    for (const e of group.entries) {
+      const meta = fetched.get(e.uid);
+      if (meta) list.push(meta);
+      else notFound.push(e.id);
+    }
   }
   return {
     accountId: args.accountId,

@@ -1,8 +1,18 @@
-import type { ImapFlow } from "imapflow";
+import type { FetchMessageObject, ImapFlow } from "imapflow";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId } from "../mapping/ids.js";
 import type { AccountRow, MailboxRow } from "../state/store.js";
+
+const META_QUERY = {
+  uid: true as const,
+  flags: true as const,
+  size: true as const,
+  internalDate: true as const,
+  envelope: true as const,
+  bodyStructure: true as const,
+  headers: ["Message-ID", "References", "In-Reply-To"],
+};
 
 export interface JmapEmail {
   id: string;
@@ -37,18 +47,6 @@ export interface BodyFetchOpts {
   fetchHTMLBodyValues?: boolean;
   fetchAllBodyValues?: boolean;
   maxBodyValueBytes?: number;
-}
-
-async function downloadPart(client: ImapFlow, uid: number, partId: string): Promise<Buffer | null> {
-  try {
-    const dl = await client.download(`${uid}`, partId, { uid: true });
-    if (!dl) return null;
-    const chunks: Buffer[] = [];
-    for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
-    return Buffer.concat(chunks);
-  } catch {
-    return null;
-  }
 }
 
 function decodePartText(buf: Buffer, charset: string | null): string {
@@ -100,8 +98,26 @@ async function fetchBodyValues(
     }
   }
   const out: Record<string, { value: string; isEncodingProblem: boolean; isTruncated: boolean }> = {};
+  if (wanted.size === 0) return out;
+
+  // Fetch all wanted body parts in a single FETCH instead of one round-trip
+  // per part. For a typical multipart/alternative email this collapses
+  // 2+ round-trips into one.
+  const partIds = [...wanted.keys()];
+  let bodyParts: Map<string, Buffer> | undefined;
+  try {
+    const msg = await client.fetchOne(
+      `${uid}`,
+      { uid: true, bodyParts: partIds },
+      { uid: true },
+    );
+    if (msg && msg.bodyParts) bodyParts = msg.bodyParts;
+  } catch {
+    // fall through and mark all as encoding problems
+  }
+
   for (const [partId, part] of wanted) {
-    const raw = await downloadPart(client, uid, partId);
+    const raw = bodyParts?.get(partId);
     if (!raw) {
       out[partId] = { value: "", isEncodingProblem: true, isTruncated: false };
       continue;
@@ -121,28 +137,13 @@ function addr(list: { name?: string | null; address?: string | null }[] | null |
     .map((a) => ({ name: a.name?.trim() || null, email: a.address! }));
 }
 
-export async function fetchEmailMeta(
+async function processMessage(
   client: ImapFlow,
   account: AccountRow,
   mailbox: MailboxRow,
-  uid: number,
-  bodyOpts: BodyFetchOpts = {},
-): Promise<JmapEmail | null> {
-  const msg = await client.fetchOne(
-    `${uid}`,
-    {
-      uid: true,
-      flags: true,
-      size: true,
-      internalDate: true,
-      envelope: true,
-      bodyStructure: true,
-      headers: ["Message-ID", "References", "In-Reply-To"],
-    },
-    { uid: true },
-  );
-  if (!msg) return null;
-
+  msg: FetchMessageObject,
+  bodyOpts: BodyFetchOpts,
+): Promise<JmapEmail> {
   const emailId = encodeEmailId({
     accountIdx: account.id,
     mailboxIdx: mailbox.id,
@@ -166,7 +167,6 @@ export async function fetchEmailMeta(
     ? await fetchBodyValues(client, msg.uid!, sel.textBody, sel.htmlBody, sel.attachments, bodyOpts)
     : {};
 
-  // Cheap preview: first 256 chars of decoded plaintext (or stripped HTML).
   let preview = "";
   if (wantsBodies) {
     const firstText = sel.textBody[0]?.partId;
@@ -184,7 +184,7 @@ export async function fetchEmailMeta(
   return {
     id: emailId,
     blobId,
-    threadId: emailId, // refined by threads.ts when called via Email/get
+    threadId: emailId,
     mailboxIds: { [String(mailbox.id)]: true },
     keywords: flagsToKeywords(Array.from(msg.flags ?? [])),
     size: msg.size ?? 0,
@@ -208,6 +208,41 @@ export async function fetchEmailMeta(
     attachments: sel.attachments,
     bodyValues,
   };
+}
+
+export async function fetchEmailMeta(
+  client: ImapFlow,
+  account: AccountRow,
+  mailbox: MailboxRow,
+  uid: number,
+  bodyOpts: BodyFetchOpts = {},
+): Promise<JmapEmail | null> {
+  const msg = await client.fetchOne(`${uid}`, META_QUERY, { uid: true });
+  if (!msg) return null;
+  return processMessage(client, account, mailbox, msg, bodyOpts);
+}
+
+// Bulk variant: a single FETCH for all UIDs in a mailbox, then per-message
+// body fetch (each already collapsed to one round trip by fetchBodyValues).
+// Returns a Map keyed by uid so callers can match notFound by id.
+export async function fetchEmailsBatch(
+  client: ImapFlow,
+  account: AccountRow,
+  mailbox: MailboxRow,
+  uids: number[],
+  bodyOpts: BodyFetchOpts = {},
+): Promise<Map<number, JmapEmail>> {
+  const out = new Map<number, JmapEmail>();
+  if (uids.length === 0) return out;
+  const messages: FetchMessageObject[] = [];
+  for await (const m of client.fetch(uids, META_QUERY, { uid: true })) {
+    messages.push(m);
+  }
+  for (const m of messages) {
+    if (m.uid == null) continue;
+    out.set(m.uid, await processMessage(client, account, mailbox, m, bodyOpts));
+  }
+  return out;
 }
 
 function stripBrackets(s: string): string {

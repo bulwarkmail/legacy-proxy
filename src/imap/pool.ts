@@ -13,6 +13,13 @@ interface PoolEntry {
   busy: number;
 }
 
+// Skip the sanity-NOOP if the connection was used within this window.
+// Every JMAP method funnels through getForAccount, so a per-call NOOP
+// adds one IMAP round-trip to every request — visible as multi-second
+// latency on slow links. Most servers don't drop idle TCP for tens of
+// seconds, so we only NOOP after a meaningful idle gap.
+const NOOP_FRESHNESS_MS = 30_000;
+
 export class ImapPool {
   private entries = new Map<number, PoolEntry>();
 
@@ -24,8 +31,9 @@ export class ImapPool {
   async getForAccount(account: AccountRow): Promise<ImapFlow> {
     const existing = this.entries.get(account.id);
     if (existing && existing.client.usable) {
+      const idleMs = Date.now() - existing.lastUsed;
       existing.lastUsed = Date.now();
-      // sanity-ping; some servers drop idle TCP after 5–10 min
+      if (idleMs < NOOP_FRESHNESS_MS) return existing.client;
       try {
         await existing.client.noop();
         return existing.client;
