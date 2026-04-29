@@ -13,6 +13,9 @@ export interface EmailBodyPart {
   cid: string | null;
   language: string[] | null;
   location: string | null;
+  // Content-Transfer-Encoding ("quoted-printable", "base64", "7bit", ...)
+  // — kept on the part for decoders that fetch raw bytes via BODY[partId].
+  encoding: string | null;
   subParts: EmailBodyPart[] | null;
 }
 
@@ -60,6 +63,7 @@ export function structureToBodyParts(
       cid: p.id ? p.id.replace(/^<|>$/g, "") : null,
       language: p.language && p.language.length ? p.language : null,
       location: p.location ?? null,
+      encoding: p.encoding ? p.encoding.toLowerCase() : null,
       subParts: children,
     };
   }

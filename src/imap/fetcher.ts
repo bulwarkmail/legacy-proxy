@@ -1,4 +1,8 @@
 import type { FetchMessageObject, ImapFlow } from "imapflow";
+// libqp ships no types; we only use `decode(string) => Buffer`.
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-expect-error no declaration file
+import libqp from "libqp";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId } from "../mapping/ids.js";
@@ -56,6 +60,31 @@ function decodePartText(buf: Buffer, charset: string | null): string {
   } catch {
     return buf.toString("utf8");
   }
+}
+
+// IMAP `BODY[partId]` returns the raw bytes — still in their Content-Transfer
+// -Encoding (typically quoted-printable or base64 for text parts). imapflow's
+// `download()` decodes that for us, but `fetch({bodyParts})` does not, so we
+// must reverse the CTE ourselves before applying the charset.
+function decodeTransferEncoding(buf: Buffer, encoding: string | null): Buffer {
+  const enc = (encoding ?? "").toLowerCase();
+  if (enc === "quoted-printable") {
+    try {
+      return libqp.decode(buf.toString("binary"));
+    } catch {
+      return buf;
+    }
+  }
+  if (enc === "base64") {
+    try {
+      // Strip CR/LF so partial-line base64 still decodes cleanly.
+      return Buffer.from(buf.toString("binary").replace(/[\r\n]/g, ""), "base64");
+    } catch {
+      return buf;
+    }
+  }
+  // 7bit, 8bit, binary, or unspecified: no transform.
+  return buf;
 }
 
 function htmlToPlain(html: string): string {
@@ -122,8 +151,9 @@ async function fetchBodyValues(
       out[partId] = { value: "", isEncodingProblem: true, isTruncated: false };
       continue;
     }
-    const truncated = raw.length > cap;
-    const slice = truncated ? raw.subarray(0, cap) : raw;
+    const decoded = decodeTransferEncoding(raw, part.encoding);
+    const truncated = decoded.length > cap;
+    const slice = truncated ? decoded.subarray(0, cap) : decoded;
     const value = decodePartText(slice, part.charset);
     out[partId] = { value, isEncodingProblem: false, isTruncated: truncated };
   }
