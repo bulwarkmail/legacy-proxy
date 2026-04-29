@@ -1,9 +1,9 @@
 # legacy-proxy
 
-> **Not production ready.** This is a v0.1 scaffold. Core JMAP write paths
-> (`Email/set`, `EmailSubmission/set`, etc.) are not implemented yet, there
-> are no security audits, and the API and storage formats may change without
-> notice. Use it for development, testing, and self-hosted experiments only.
+> **Not production ready.** This is a v0.1 scaffold. Some JMAP methods are
+> still missing (see Status), there are no security audits, and the API and
+> storage formats may change without notice. Use it for development, testing,
+> and self-hosted experiments only.
 
 IMAP / SMTP / ManageSieve to JMAP gateway. Lets any JMAP client talk to
 Gmail, your hosting provider's mailbox, or any RFC 3501 IMAP server.
@@ -17,18 +17,24 @@ v0.1. Working:
 
 - JMAP `Session` with the full capability table
 - Batched `methodCalls`, back-references (`#ref`)
-- `Mailbox/get`, `Email/get`, `Email/query`, `Identity/get`, `VacationResponse/get|set`
+- `Mailbox/get`
+- `Email/get`, `Email/query`, `Email/set` (create drafts, flag/mailbox updates, destroy)
+- `EmailSubmission/get|query|changes|set`
+- `Identity/get`
+- `VacationResponse/get|set`
+- `ContactCard/get|query|set` via CardDAV
 - IMAP via imapflow, per-account connection pool
 - ManageSieve (RFC 5804), used by `VacationResponse`
 - SMTP submission (nodemailer)
 - Auth: PLAIN, LOGIN, XOAUTH2. HMAC session tokens. AES-256-GCM vault
 - better-sqlite3 state store
-- EventSource push
+- EventSource transport (SSE endpoint, ping keepalive)
 - Docker image + compose files (prod, integration)
 - 28 unit tests, jmap-test-suite runner
 
-Not done yet: `Email/set`, `Email/copy`, `Email/import`, `EmailSubmission/set`,
-`Thread/get`, IMAP IDLE -> SSE, WebSocket transport.
+Not done yet: `Email/copy`, `Email/import`, `Thread/get`, IMAP IDLE -> SSE
+publishing (the SSE endpoint exists but never emits state changes),
+WebSocket transport (advertised in the Session capability, no handler yet).
 
 ## Quickstart
 
