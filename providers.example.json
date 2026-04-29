@@ -3,12 +3,14 @@
     "imap": { "host": "imap.gmail.com", "port": 993, "secure": true },
     "smtp": { "host": "smtp.gmail.com", "port": 465, "secure": true },
     "sieve": null,
+    "carddav": null,
     "auth": { "mech": ["XOAUTH2", "PLAIN"] }
   },
   "generic": {
     "imap": { "host": "$IMAP_HOST", "port": 993, "secure": true },
     "smtp": { "host": "$SMTP_HOST", "port": 587, "starttls": true },
     "sieve": { "host": "$SIEVE_HOST", "port": 4190, "starttls": true },
+    "carddav": { "host": "$CARDDAV_HOST", "port": 443, "secure": true, "basePath": "/.well-known/carddav" },
     "auth": { "mech": ["PLAIN", "LOGIN"] }
   }
 }

@@ -5,6 +5,13 @@ export interface ProviderConfig {
   imap: { host: string; port: number; secure?: boolean; starttls?: boolean };
   smtp: { host: string; port: number; secure?: boolean; starttls?: boolean };
   sieve: { host: string; port: number; secure?: boolean; starttls?: boolean } | null;
+  carddav: {
+    host: string;
+    port: number;
+    secure?: boolean;
+    basePath?: string;
+    principalPath?: string;
+  } | null;
   auth: { mech: string[] };
 }
 

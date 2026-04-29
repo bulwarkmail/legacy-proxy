@@ -7,6 +7,14 @@ import { mailboxGet } from "./methods/mailbox.js";
 import { emailGet, emailQuery } from "./methods/email.js";
 import { identityGet } from "./methods/identity.js";
 import { vacationGet, vacationSet } from "./methods/vacation.js";
+import {
+  addressBookGet,
+  addressBookSet,
+  contactCardGet,
+  contactCardQuery,
+  contactCardSet,
+  contactsAvailable,
+} from "./methods/contacts.js";
 import { resolveProvider } from "../auth/providers.js";
 import { openCredentials } from "../auth/credentials.js";
 
@@ -45,37 +53,57 @@ export function makeMethodTable(): Record<string, Handler> {
       list: [],
       notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
     }),
-    "AddressBook/get": async (a) => ({
-      accountId: (a as { accountId?: string }).accountId ?? "",
-      state: "0",
-      list: [],
-      notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
-    }),
-    "AddressBook/set": async (a) => ({
-      accountId: (a as { accountId?: string }).accountId ?? "",
-      oldState: "0",
-      newState: "0",
-      created: null,
-      updated: null,
-      destroyed: null,
-      notCreated: null,
-      notUpdated: null,
-      notDestroyed: null,
-    }),
-    "ContactCard/get": async (a) => ({
-      accountId: (a as { accountId?: string }).accountId ?? "",
-      state: "0",
-      list: [],
-      notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
-    }),
-    "ContactCard/query": async (a) => ({
-      accountId: (a as { accountId?: string }).accountId ?? "",
-      queryState: "0",
-      canCalculateChanges: false,
-      position: 0,
-      total: 0,
-      ids: [],
-    }),
+    "AddressBook/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!contactsAvailable(provider)) {
+        return {
+          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+          state: "0",
+          list: [],
+          notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+        };
+      }
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return addressBookGet(a as never, { account: c.account, provider, creds });
+    },
+    "AddressBook/set": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return addressBookSet(a as never, { account: c.account, provider, creds });
+    },
+    "ContactCard/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!contactsAvailable(provider)) {
+        return {
+          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+          state: "0",
+          list: [],
+          notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+        };
+      }
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return contactCardGet(a as never, { account: c.account, provider, creds });
+    },
+    "ContactCard/query": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!contactsAvailable(provider)) {
+        return {
+          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+          queryState: "0",
+          canCalculateChanges: false,
+          position: 0,
+          total: 0,
+          ids: [],
+        };
+      }
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return contactCardQuery(a as never, { account: c.account, provider, creds });
+    },
+    "ContactCard/set": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return contactCardSet(a as never, { account: c.account, provider, creds });
+    },
     "Mailbox/get": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
       return mailboxGet(a as never, { account: c.account, client, store: c.store });

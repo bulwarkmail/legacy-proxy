@@ -12,6 +12,14 @@ function interpolate(p: ProviderConfig): ProviderConfig {
     imap: { ...p.imap, host: env(p.imap.host) },
     smtp: { ...p.smtp, host: env(p.smtp.host) },
     sieve: p.sieve ? { ...p.sieve, host: env(p.sieve.host) } : null,
+    carddav: p.carddav
+      ? {
+          ...p.carddav,
+          host: env(p.carddav.host),
+          basePath: p.carddav.basePath ? env(p.carddav.basePath) : undefined,
+          principalPath: p.carddav.principalPath ? env(p.carddav.principalPath) : undefined,
+        }
+      : null,
     auth: p.auth,
   };
 }

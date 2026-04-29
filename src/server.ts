@@ -80,7 +80,13 @@ function send401(reply: import("fastify").FastifyReply) {
 app.get("/jmap/session", async (req, reply) => {
   const account = await authn(req);
   if (!account) return send401(reply);
-  return buildSession(cfg, account);
+  let provider;
+  try {
+    provider = resolveProvider(cfg, account.kind);
+  } catch {
+    provider = undefined;
+  }
+  return buildSession(cfg, account, provider);
 });
 
 app.post("/jmap", async (req, reply) => {

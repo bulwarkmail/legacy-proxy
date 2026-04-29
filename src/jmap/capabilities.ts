@@ -6,6 +6,7 @@ export const SUBMISSION_CAPABILITY = "urn:ietf:params:jmap:submission";
 export const VACATION_CAPABILITY = "urn:ietf:params:jmap:vacationresponse";
 export const WS_CAPABILITY = "urn:ietf:params:jmap:websocket";
 export const SIEVE_CAPABILITY = "urn:bulwark:params:jmap:sieve";
+export const CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
 
 export function coreCapabilityProps(cfg: AppConfig) {
   return {
@@ -36,4 +37,8 @@ export function submissionCapabilityProps() {
     maxDelayedSend: 0,
     submissionExtensions: {},
   };
+}
+
+export function contactsCapabilityProps() {
+  return {};
 }
