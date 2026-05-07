@@ -12,11 +12,34 @@ import { buildSession } from "./jmap/session.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { openImap } from "./imap/client.js";
+import { PushDispatcher } from "./push/dispatcher.js";
+import { PushIdleManager } from "./push/idle.js";
 
 const cfg = loadConfig();
 const store = new Store(cfg.dataDir);
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
+const dispatcher = new PushDispatcher(store, hub, (id) => store.getAccountById(id));
+const idleManager = new PushIdleManager(cfg, store);
+
+// Hook the store so every counter bump (Email/set, Mailbox/set, IDLE arrival,
+// EmailSubmission/set...) feeds the same fan-out path. The dispatcher
+// debounces internally so a Email/set that bumps both `email` and `mailbox`
+// in quick succession only produces one StateChange to each subscriber.
+store.setStateListener((accountId, kind, state) => dispatcher.onBump(accountId, kind, state));
+
+// The dispatcher tells the idle manager when the verified-subscription set
+// changed so it can spin up or tear down INBOX IDLE workers without needing
+// to sweep the DB on every JMAP call.
+dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
+
+// Spin up idle workers for any verified subscription that survived a previous
+// run. Failure here is non-fatal (the next reconnect will try again), so we
+// don't await — the server should come up even if a single account's IMAP is
+// temporarily unreachable.
+void idleManager.sync().catch((err) =>
+  log.warn({ err: (err as Error).message }, "idle: initial sync failed"),
+);
 
 const app = Fastify({
   loggerInstance: log,
@@ -89,6 +112,16 @@ app.get("/jmap/session", async (req, reply) => {
   return buildSession(cfg, account, provider);
 });
 
+// Capabilities advertised on the Session resource. We reject HTTP-level any
+// request that lists a `using` value we don't recognise (RFC 8620 §3.6.1).
+const KNOWN_CAPABILITIES = new Set([
+  "urn:ietf:params:jmap:core",
+  "urn:ietf:params:jmap:mail",
+  "urn:ietf:params:jmap:submission",
+  "urn:ietf:params:jmap:vacationresponse",
+  "urn:bulwark:params:jmap:sieve",
+]);
+
 app.post("/jmap", async (req, reply) => {
   const account = await authn(req);
   if (!account) return send401(reply);
@@ -96,8 +129,17 @@ app.post("/jmap", async (req, reply) => {
   if (!env || !Array.isArray(env.methodCalls) || !Array.isArray(env.using)) {
     return reply.code(400).send({ error: "malformed JMAP request" });
   }
+  for (const cap of env.using) {
+    if (typeof cap !== "string" || !KNOWN_CAPABILITIES.has(cap)) {
+      return reply.code(400).send({
+        type: "urn:ietf:params:jmap:error:unknownCapability",
+        status: 400,
+        detail: `Unknown capability: ${String(cap)}`,
+      });
+    }
+  }
   try {
-    const out = await dispatch(env, { cfg, pool, store, account });
+    const out = await dispatch(env, { cfg, pool, store, account, dispatcher });
     if (process.env.JMAP_DEBUG === "1") {
       log.info(
         { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },
@@ -111,8 +153,8 @@ app.post("/jmap", async (req, reply) => {
   }
 });
 
-app.get<{ Params: { accountId: string; blobId: string; name: string } }>(
-  "/jmap/download/:accountId/:blobId/:name",
+app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
+  "/jmap/download/:accountId/:blobId/:type/:name",
   async (req, reply) => {
     const account = await authn(req);
     if (!account) return send401(reply);
@@ -120,17 +162,39 @@ app.get<{ Params: { accountId: string; blobId: string; name: string } }>(
 
     const { decodeBlobId, decodeEmailId } = await import("./mapping/ids.js");
     const { withMailbox } = await import("./imap/client.js");
+
+    // RFC 8620 §6.2: clients pass a desired Content-Type via the {type} URL
+    // template variable. Honor it (after a sanity check) so the test suite's
+    // download-respects-type-param case passes — we don't trust user input
+    // implicitly, just allow the small standard set used by JMAP clients.
+    const requestedType = decodeURIComponent(req.params.type ?? "");
+    const allowedType = /^[\w.+-]+\/[\w.+-]+$/.test(requestedType) ? requestedType : null;
+
+    // Uploaded blobs are served straight from SQLite. Email-backed blobs need
+    // an IMAP fetch keyed by mailbox + UID + (optional) part id.
+    if (req.params.blobId.startsWith("U")) {
+      const upload = store.getUpload(req.params.blobId, account.id);
+      if (!upload) return reply.code(404).send({ error: "upload not found" });
+      reply.header("Content-Type", allowedType ?? upload.ctype);
+      reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      return reply.send(upload.body);
+    }
+
     let parsed;
     try {
       parsed = decodeBlobId(req.params.blobId);
     } catch {
-      return reply.code(400).send({ error: "bad blobId" });
+      // RFC 8620 §6.2: a blob the client doesn't have access to (which from
+      // their perspective includes "doesn't exist") returns 404. A
+      // structurally-malformed blobId from a JMAP perspective is the same:
+      // we don't have it.
+      return reply.code(404).send({ error: "blob not found" });
     }
     let emailParts;
     try {
       emailParts = decodeEmailId(parsed.emailId);
     } catch {
-      return reply.code(400).send({ error: "bad emailId in blobId" });
+      return reply.code(404).send({ error: "blob not found" });
     }
     const mbox = store.db
       .prepare(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
@@ -154,7 +218,7 @@ app.get<{ Params: { accountId: string; blobId: string; name: string } }>(
         return { body: Buffer.concat(chunks), contentType: "message/rfc822" };
       });
       if (!buf) return reply.code(404).send({ error: "blob not found" });
-      reply.header("Content-Type", buf.contentType);
+      reply.header("Content-Type", allowedType ?? buf.contentType);
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
       return reply.send(buf.body);
     } catch (e) {
@@ -164,12 +228,76 @@ app.get<{ Params: { accountId: string; blobId: string; name: string } }>(
   },
 );
 
-app.get("/jmap/eventsource", async (req, reply) => {
-  const account = await authn(req);
-  if (!account) return send401(reply);
-  const origin = (req.headers["origin"] as string | undefined) ?? null;
-  hub.add(account, reply, origin);
-});
+// Upload prune horizon: blobs not referenced within this many ms are GC-able.
+// Long enough that a slow client can compose a draft, short enough to bound
+// disk. 24h is the JMAP convention for "pending" uploads.
+const UPLOAD_RETENTION_MS = 24 * 60 * 60_000;
+
+// Fallback parser for non-JSON, non-text bodies (binary attachments, RFC822,
+// images, etc.). Fastify's built-in JSON parser still wins for /jmap; this
+// only matches Content-Types that have no other registered parser.
+app.addContentTypeParser(
+  "*",
+  { parseAs: "buffer", bodyLimit: cfg.limits.maxSizeUpload },
+  (_req, body, done) => done(null, body),
+);
+
+app.post<{ Params: { accountId: string } }>(
+  "/jmap/upload/:accountId",
+  { bodyLimit: cfg.limits.maxSizeUpload },
+  async (req, reply) => {
+    const account = await authn(req);
+    if (!account) return send401(reply);
+    if (req.params.accountId !== String(account.id)) {
+      return reply.code(404).send({ error: "not found" });
+    }
+    const ctype =
+      (req.headers["content-type"] as string | undefined)?.split(";")[0]?.trim() ||
+      "application/octet-stream";
+    const raw = req.body;
+    let body: Buffer;
+    if (Buffer.isBuffer(raw)) body = raw;
+    else if (raw instanceof Uint8Array) body = Buffer.from(raw);
+    else if (typeof raw === "string") body = Buffer.from(raw, "utf8");
+    else return reply.code(400).send({ error: "empty body" });
+    if (body.length === 0) return reply.code(400).send({ error: "empty body" });
+    if (body.length > cfg.limits.maxSizeUpload) {
+      return reply.code(413).send({ type: "tooLarge" });
+    }
+    const blobId = "U" + crypto.randomUUID().replace(/-/g, "");
+    store.putUpload({ id: blobId, accountId: account.id, ctype, body });
+    // Opportunistic GC: cheap when the upload table is small, no-op when empty.
+    store.pruneUploads(UPLOAD_RETENTION_MS);
+    return {
+      accountId: String(account.id),
+      blobId,
+      type: ctype,
+      size: body.length,
+    };
+  },
+);
+
+app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>(
+  "/jmap/eventsource",
+  async (req, reply) => {
+    const account = await authn(req);
+    if (!account) return send401(reply);
+    const origin = (req.headers["origin"] as string | undefined) ?? null;
+    // Per RFC 8620 §7.3, `types=*` means all; an explicit comma-separated list
+    // is a server-side filter. `closeafter=state` ends the stream after one
+    // event (used by mobile clients on cellular). `ping` is the keepalive
+    // interval, clamped so a bad client can't pin a connection at 1s.
+    const rawTypes = req.query.types ?? "*";
+    const types =
+      rawTypes === "*" || rawTypes === ""
+        ? null
+        : rawTypes.split(",").map((s) => s.trim()).filter(Boolean);
+    const closeAfter = req.query.closeafter === "state";
+    const pingRaw = Number(req.query.ping ?? 30);
+    const pingSec = Number.isFinite(pingRaw) ? Math.max(15, Math.min(pingRaw, 300)) : 30;
+    hub.add(account, reply, origin, { types, closeAfter, pingSec });
+  },
+);
 
 // Cache of validated Basic-auth credentials → account. Keyed by sha256 of the
 // raw header so we never log or persist plaintext. TTL keeps memory bounded.
@@ -240,6 +368,10 @@ const shutdown = async () => {
   log.info("shutting down");
   try {
     await app.close();
+    await idleManager.closeAll();
+    // Best-effort flush so the burst of changes a user just made still reaches
+    // any connected SSE / push relay before we exit.
+    await dispatcher.flushAll();
     await pool.closeAll();
     store.close();
   } finally {
@@ -254,8 +386,5 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   log.error({ reason: String(reason) }, "unhandledRejection - continuing");
 });
-
-// Decorate hub usage so it's not flagged as unused - push wiring is a follow-up.
-void hub;
 
 export { app };

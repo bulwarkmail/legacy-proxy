@@ -7,8 +7,10 @@ import { withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
-import { JmapError, accountNotFound, invalidArguments, notFound } from "../errors.js";
+import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, notFound } from "../errors.js";
 import { applyEmailUpdate } from "./email.js";
+import { SIDE_RESPONSES, type MethodCall } from "../router.js";
+import { encodeEmailState } from "../../state/states.js";
 
 interface SetError {
   type: string;
@@ -36,6 +38,31 @@ interface SubmissionResult {
   deliveryStatus: null;
   dsnBlobIds: string[];
   mdnBlobIds: string[];
+}
+
+// Per-account ring buffer of recent submissions so EmailSubmission/get can
+// answer the common "I just sent something — show it back to me" pattern. We
+// don't persist these (no SQLite table); the cache survives only as long as
+// the process. Bounded to keep memory tame across long uptimes.
+const MAX_PER_ACCOUNT = 256;
+const submissionsByAccount = new Map<number, Map<string, SubmissionResult>>();
+
+function rememberSubmission(accountId: number, sub: SubmissionResult): void {
+  let bucket = submissionsByAccount.get(accountId);
+  if (!bucket) {
+    bucket = new Map();
+    submissionsByAccount.set(accountId, bucket);
+  }
+  bucket.set(sub.id, sub);
+  if (bucket.size > MAX_PER_ACCOUNT) {
+    // Maps preserve insertion order; drop the oldest.
+    const firstKey = bucket.keys().next().value;
+    if (firstKey != null) bucket.delete(firstKey);
+  }
+}
+
+function recallSubmission(accountId: number, id: string): SubmissionResult | undefined {
+  return submissionsByAccount.get(accountId)?.get(id);
 }
 
 export interface EmailSubmissionSetArgs {
@@ -136,7 +163,7 @@ async function resolveEnvelope(
 export async function emailSubmissionSet(
   args: EmailSubmissionSetArgs,
   ctx: { cfg: AppConfig; account: AccountRow; client: ImapFlow; store: Store },
-): Promise<EmailSubmissionSetResponse> {
+): Promise<EmailSubmissionSetResponse & { [SIDE_RESPONSES]?: MethodCall[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
 
   const provider = resolveProvider(ctx.cfg, ctx.account.kind);
@@ -166,7 +193,7 @@ export async function emailSubmissionSet(
         raw,
       });
       const id = `s-${ctx.account.id}-${Date.now()}-${tempId}`;
-      created[tempId] = {
+      const sub: SubmissionResult = {
         id,
         emailId: payload.emailId,
         identityId: payload.identityId ?? `i-${ctx.account.id}`,
@@ -181,6 +208,8 @@ export async function emailSubmissionSet(
         dsnBlobIds: [],
         mdnBlobIds: [],
       };
+      created[tempId] = sub;
+      rememberSubmission(ctx.account.id, sub);
       successByTempId.set(tempId, { emailId: payload.emailId });
     } catch (e) {
       notCreated[tempId] = toSetError(e);
@@ -198,7 +227,14 @@ export async function emailSubmissionSet(
     notDestroyed[id] = { type: "notFound" };
   }
 
-  // onSuccessUpdateEmail / onSuccessDestroyEmail: apply post-send.
+  // onSuccessUpdateEmail / onSuccessDestroyEmail: apply post-send. Per
+  // RFC 8621 §7.3 the server emits an implicit Email/set response so the
+  // client doesn't have to issue a follow-up call. We collect updates here
+  // and ride them out as a SIDE_RESPONSES entry.
+  const implicitUpdated: Record<string, null> = {};
+  const implicitDestroyed: string[] = [];
+  const implicitNotUpdated: Record<string, SetError> = {};
+  const implicitNotDestroyed: Record<string, SetError> = {};
   const skipDestroy = new Set<string>();
   for (const tempId of args.onSuccessDestroyEmail ?? []) {
     const key = tempId.startsWith("#") ? tempId.slice(1) : tempId;
@@ -207,8 +243,9 @@ export async function emailSubmissionSet(
     try {
       await applyEmailUpdate(ok.emailId, { mailboxIds: {} }, ctx);
       skipDestroy.add(ok.emailId);
-    } catch {
-      // best-effort: don't fail the submission if cleanup fails
+      implicitDestroyed.push(ok.emailId);
+    } catch (e) {
+      implicitNotDestroyed[ok.emailId] = toSetErrorLike(e);
     }
   }
   for (const [refKey, patch] of Object.entries(args.onSuccessUpdateEmail ?? {})) {
@@ -218,17 +255,22 @@ export async function emailSubmissionSet(
     if (skipDestroy.has(ok.emailId)) continue;
     try {
       await applyEmailUpdate(ok.emailId, patch as Record<string, unknown>, ctx);
-    } catch {
-      // best-effort
+      implicitUpdated[ok.emailId] = null;
+    } catch (e) {
+      implicitNotUpdated[ok.emailId] = toSetErrorLike(e);
     }
   }
 
   if (Object.keys(created).length > 0) {
     ctx.store.bumpState(ctx.account.id, "submission");
     ctx.store.bumpState(ctx.account.id, "email");
+    // The onSuccessUpdateEmail / onSuccessDestroyEmail hooks move the draft
+    // into Sent or destroy it, both of which shift folder counts. Bump
+    // Mailbox too so caches drop the now-wrong unread/total numbers.
+    ctx.store.bumpState(ctx.account.id, "mailbox");
   }
 
-  return {
+  const primary: EmailSubmissionSetResponse & { [SIDE_RESPONSES]?: MethodCall[] } = {
     accountId: args.accountId,
     oldState,
     newState: stateString(ctx.store.getState(ctx.account.id, "submission")),
@@ -239,6 +281,36 @@ export async function emailSubmissionSet(
     destroyed: null,
     notDestroyed: Object.keys(notDestroyed).length ? notDestroyed : null,
   };
+
+  const hasImplicit =
+    Object.keys(implicitUpdated).length > 0 ||
+    Object.keys(implicitNotUpdated).length > 0 ||
+    implicitDestroyed.length > 0 ||
+    Object.keys(implicitNotDestroyed).length > 0;
+  if (hasImplicit) {
+    const emailModseq = ctx.store.getState(ctx.account.id, "email");
+    const implicitEmailSet: Record<string, unknown> = {
+      accountId: args.accountId,
+      oldState: encodeEmailState({ uidvalidity: 0, modseq: Math.max(0, emailModseq - 1) }),
+      newState: encodeEmailState({ uidvalidity: 0, modseq: emailModseq }),
+      created: null,
+      notCreated: null,
+      updated: Object.keys(implicitUpdated).length ? implicitUpdated : null,
+      notUpdated: Object.keys(implicitNotUpdated).length ? implicitNotUpdated : null,
+      destroyed: implicitDestroyed.length ? implicitDestroyed : null,
+      notDestroyed: Object.keys(implicitNotDestroyed).length ? implicitNotDestroyed : null,
+    };
+    // Call id for the side response is filled in by the dispatch loop with
+    // the parent EmailSubmission/set's call id (RFC 8621 §7.3); we pass an
+    // empty placeholder here that the loop overwrites.
+    primary[SIDE_RESPONSES] = [["Email/set", implicitEmailSet, ""] as MethodCall];
+  }
+  return primary;
+}
+
+function toSetErrorLike(e: unknown): SetError {
+  if (e instanceof JmapError) return { type: e.type, description: e.message };
+  return { type: "serverFail", description: (e as Error).message };
 }
 
 export async function emailSubmissionGet(
@@ -246,15 +318,24 @@ export async function emailSubmissionGet(
   ctx: { account: AccountRow; store: Store },
 ): Promise<{ accountId: string; state: string; list: SubmissionResult[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
-  // We don't persist submissions; treat all as notFound. Clients that only
-  // call /get to confirm a submission they just created already have the
-  // result from the same request via back-reference.
-  const requested = args.ids ?? [];
+  const list: SubmissionResult[] = [];
+  const notFound: string[] = [];
+  if (args.ids == null) {
+    // null = "return everything we know about." Drain the in-memory cache.
+    const bucket = submissionsByAccount.get(ctx.account.id);
+    if (bucket) for (const sub of bucket.values()) list.push(sub);
+  } else {
+    for (const id of args.ids) {
+      const sub = recallSubmission(ctx.account.id, id);
+      if (sub) list.push(sub);
+      else notFound.push(id);
+    }
+  }
   return {
     accountId: args.accountId,
     state: stateString(ctx.store.getState(ctx.account.id, "submission")),
-    list: [],
-    notFound: requested,
+    list,
+    notFound,
   };
 }
 
@@ -294,6 +375,14 @@ export async function emailSubmissionChanges(
 }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const cur = stateString(ctx.store.getState(ctx.account.id, "submission"));
+  // We don't persist submissions, so the only `sinceState` we can answer for
+  // is the current one (no changes since). Anything else means the client
+  // has a stale state from a prior session that we cannot reconstruct;
+  // RFC 8620 §5.2 says reply with `cannotCalculateChanges` so the client
+  // re-syncs from /query.
+  if (args.sinceState !== cur) {
+    throw cannotCalculateChanges();
+  }
   return {
     accountId: args.accountId,
     oldState: args.sinceState,

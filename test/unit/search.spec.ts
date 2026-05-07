@@ -44,4 +44,28 @@ describe("Email/query filter compiler", () => {
   it("rejects hasAttachment when backend lacks support", () => {
     expect(() => compileFilter({ hasAttachment: true })).toThrow(UnsupportedFilter);
   });
+  it("routes Gmail text through X-GM-RAW", () => {
+    expect(compileFilter({ text: "tax 2024" }, { dialect: "gmail" })).toEqual({
+      gmraw: '"tax 2024"',
+    });
+  });
+  it("combines Gmail header criteria into a single X-GM-RAW query", () => {
+    const r = compileFilter(
+      {
+        operator: "AND",
+        conditions: [{ from: "alice@example.com" }, { subject: "invoice" }],
+      },
+      { dialect: "gmail" },
+    ) as { gmraw: string };
+    expect(r.gmraw).toContain("from:alice@example.com");
+    expect(r.gmraw).toContain("subject:invoice");
+  });
+  it("Gmail hasAttachment becomes has:attachment", () => {
+    expect(compileFilter({ hasAttachment: true }, { dialect: "gmail" })).toEqual({
+      gmraw: "has:attachment",
+    });
+    expect(compileFilter({ hasAttachment: false }, { dialect: "gmail" })).toEqual({
+      gmraw: "-has:attachment",
+    });
+  });
 });

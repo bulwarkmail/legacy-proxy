@@ -5,9 +5,14 @@ import type { FetchMessageObject, ImapFlow } from "imapflow";
 import libqp from "libqp";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
 import { flagsToKeywords } from "../mapping/flags.js";
-import { encodeBlobId, encodeEmailId } from "../mapping/ids.js";
+import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
+import { parseHeaderBlock, asMessageIds, computeThreadIdFromHeaders, type ParsedHeader } from "./headers.js";
 import type { AccountRow, MailboxRow } from "../state/store.js";
 
+// Fetch the entire header block so Email/get can project `header:Name:asForm`
+// properties (RFC 8621 §4.1.3) and we can read multi-line References without
+// a follow-up FETCH. The block is small relative to message size and IMAP
+// servers serve it efficiently.
 const META_QUERY = {
   uid: true as const,
   flags: true as const,
@@ -15,7 +20,7 @@ const META_QUERY = {
   internalDate: true as const,
   envelope: true as const,
   bodyStructure: true as const,
-  headers: ["Message-ID", "References", "In-Reply-To"],
+  headers: true as const,
 };
 
 export interface JmapEmail {
@@ -44,6 +49,9 @@ export interface JmapEmail {
   htmlBody: ReturnType<typeof selectBodies>["htmlBody"];
   attachments: ReturnType<typeof selectBodies>["attachments"];
   bodyValues: Record<string, { value: string; isEncodingProblem: boolean; isTruncated: boolean }>;
+  // The parsed RFC 5322 header block. Internal-only; Email/get strips this
+  // before serialising and the JMAP client never sees it.
+  _headers: ParsedHeader[];
 }
 
 export interface BodyFetchOpts {
@@ -51,6 +59,11 @@ export interface BodyFetchOpts {
   fetchHTMLBodyValues?: boolean;
   fetchAllBodyValues?: boolean;
   maxBodyValueBytes?: number;
+  // When false, skip the per-batch preview FETCH. Email/get callers that
+  // don't request `preview` in `properties` set this to avoid an extra IMAP
+  // round trip on every page of a folder list. Defaults to true (legacy
+  // behaviour) for callers that don't pass `properties`.
+  wantsPreview?: boolean;
 }
 
 function decodePartText(buf: Buffer, charset: string | null): string {
@@ -227,6 +240,12 @@ async function processMessage(
   const sel = selectBodies(root);
 
   const env = msg.envelope ?? null;
+  const headerBlock =
+    typeof msg.headers === "string" || Buffer.isBuffer(msg.headers)
+      ? msg.headers
+      : (msg.headers != null ? String(msg.headers as never) : "");
+  const headers = parseHeaderBlock(headerBlock);
+  const referencesIds = asMessageIds(headers, "References");
 
   const wantsBodies =
     bodyOpts.fetchTextBodyValues === true ||
@@ -236,8 +255,9 @@ async function processMessage(
     ? await fetchBodyValues(client, msg.uid!, sel.textBody, sel.htmlBody, sel.attachments, bodyOpts)
     : {};
 
+  const wantsPreview = bodyOpts.wantsPreview !== false;
   let preview = precomputedPreview ?? "";
-  if (!preview && wantsBodies) {
+  if (!preview && wantsBodies && wantsPreview) {
     const firstText = sel.textBody[0]?.partId;
     if (firstText && bodyValues[firstText]) {
       preview = buildPreview(bodyValues[firstText].value, false);
@@ -250,22 +270,29 @@ async function processMessage(
     }
   }
   // Mail list views request `preview` without `fetchTextBodyValues`; fetch a
-  // small slice so the list still shows snippets.
-  if (!preview && !wantsBodies && precomputedPreview === undefined) {
+  // small slice so the list still shows snippets. Skip when the caller has
+  // declared they don't need preview (saves one IMAP round trip per message
+  // on Email/get calls that only ask for header fields).
+  if (!preview && !wantsBodies && wantsPreview && precomputedPreview === undefined) {
     preview = await fetchPreviewSnippet(client, msg.uid!, sel);
   }
+
+  const threadId =
+    computeThreadIdFromHeaders(headers, env?.messageId ?? null) ?? emailId;
 
   return {
     id: emailId,
     blobId,
-    threadId: emailId,
-    mailboxIds: { [String(mailbox.id)]: true },
+    threadId,
+    mailboxIds: {
+      [encodeMailboxId({ accountIdx: account.id, mailboxIdx: mailbox.id })]: true,
+    },
     keywords: flagsToKeywords(Array.from(msg.flags ?? [])),
     size: msg.size ?? 0,
     receivedAt: new Date(msg.internalDate ?? Date.now()).toISOString(),
     messageId: env?.messageId ? [stripBrackets(env.messageId)] : null,
     inReplyTo: env?.inReplyTo ? [stripBrackets(env.inReplyTo)] : null,
-    references: null,
+    references: referencesIds,
     sender: addr(env?.sender as never),
     from: addr(env?.from as never),
     to: addr(env?.to as never),
@@ -281,6 +308,7 @@ async function processMessage(
     htmlBody: sel.htmlBody,
     attachments: sel.attachments,
     bodyValues,
+    _headers: headers,
   };
 }
 
@@ -317,13 +345,16 @@ export async function fetchEmailsBatch(
     bodyOpts.fetchTextBodyValues === true ||
     bodyOpts.fetchHTMLBodyValues === true ||
     bodyOpts.fetchAllBodyValues === true;
+  const wantsPreview = bodyOpts.wantsPreview !== false;
 
   // For mail-list views (preview requested, full bodies not requested) we
   // still want to populate `preview`. Group UIDs by their first text/html
   // partId so a single FETCH per group covers the whole page - typical
-  // mailboxes collapse to 2-3 round trips total instead of N.
+  // mailboxes collapse to 2-3 round trips total instead of N. When the
+  // caller said it doesn't need `preview`, skip this entirely — that's
+  // the most expensive avoidable round trip on a folder click.
   const previewByUid = new Map<number, string>();
-  if (!wantsBodies) {
+  if (!wantsBodies && wantsPreview) {
     interface PreviewTask {
       uid: number;
       partId: string;

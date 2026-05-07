@@ -12,8 +12,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "setup": "node scripts/setup.mjs",
-    "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts",
+    "start": "node --env-file=.env --env-file-if-exists=.env.local dist/server.js",
+    "dev": "tsx watch --env-file=.env --env-file-if-exists=.env.local src/server.ts",
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -27,6 +27,7 @@
     "better-sqlite3": "^11.5.0",
     "fastify": "^5.1.0",
     "imapflow": "^1.0.165",
+    "libqp": "^2.1.1",
     "mailparser": "^3.7.1",
     "nodemailer": "^6.9.16",
     "pino": "^9.5.0"

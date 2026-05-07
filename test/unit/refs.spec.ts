@@ -15,6 +15,17 @@ describe("JMAP back-references", () => {
   it("jsonPointer walks objects and arrays", () => {
     expect(jsonPointer({ a: { b: [10, 20, 30] } }, "/a/b/2")).toBe(30);
   });
+  it("jsonPointer flattens through the * wildcard", () => {
+    // The common JMAP chain: Email/query -> Email/get with
+    // path: "/list/*/id". Without wildcard support every chained back-ref
+    // returned undefined and clients silently lost ids.
+    const list = [{ id: "a" }, { id: "b" }, { id: "c" }];
+    expect(jsonPointer({ list }, "/list/*/id")).toEqual(["a", "b", "c"]);
+  });
+  it("jsonPointer * keeps nested arrays flat", () => {
+    const groups = [{ ids: ["a", "b"] }, { ids: ["c"] }];
+    expect(jsonPointer({ groups }, "/groups/*/ids")).toEqual(["a", "b", "c"]);
+  });
   it("does not treat nested #-prefixed keys as result references", () => {
     // EmailSubmission/set's onSuccessUpdateEmail uses `#tempId` keys per
     // RFC 8621 §7.3. These must pass through unchanged so the method

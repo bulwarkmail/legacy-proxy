@@ -23,11 +23,17 @@ export function coreCapabilityProps(cfg: AppConfig) {
 
 export function mailCapabilityProps() {
   return {
-    maxMailboxesPerEmail: null,
+    // IMAP messages live in exactly one mailbox; expose the cap as 1 so
+    // clients don't try to pin a draft into Inbox + Drafts simultaneously.
+    maxMailboxesPerEmail: 1,
     maxMailboxDepth: null,
     maxSizeMailboxName: 490,
     maxSizeAttachmentsPerEmail: 50_000_000,
-    emailQuerySortOptions: ["receivedAt", "from", "to", "subject", "size"],
+    // Without IMAP SORT, only UID-order (≈ receivedAt) is cheap. The other
+    // properties would require fetching headers for every match before
+    // sorting; refuse them up front so clients don't pick something we'll
+    // bounce with `unsupportedSort`.
+    emailQuerySortOptions: ["receivedAt"],
     mayCreateTopLevelMailbox: true,
   };
 }

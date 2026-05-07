@@ -6,7 +6,6 @@ import {
   SIEVE_CAPABILITY,
   SUBMISSION_CAPABILITY,
   VACATION_CAPABILITY,
-  WS_CAPABILITY,
   contactsCapabilityProps,
   coreCapabilityProps,
   mailCapabilityProps,
@@ -34,12 +33,15 @@ export function buildSession(cfg: AppConfig, account: AccountRow, provider?: Pro
   };
   if (hasContacts) primaryAccounts[CONTACTS_CAPABILITY] = accountId;
 
+  // WebSocket capability is held back until we register a /jmap/ws handler.
+  // EventSource is fully wired (RFC 8620 §7.3): clients open the
+  // `eventSourceUrl` and receive `state` events whenever any account-level
+  // counter bumps. PushSubscription/* (§7.2) covers the offline path.
   const capabilities: Record<string, unknown> = {
     [CORE_CAPABILITY]: coreCapabilityProps(cfg),
     [MAIL_CAPABILITY]: mailCapabilityProps(),
     [SUBMISSION_CAPABILITY]: submissionCapabilityProps(),
     [VACATION_CAPABILITY]: {},
-    [WS_CAPABILITY]: { url: cfg.publicUrl.replace(/^http/, "ws") + "/jmap/ws", supportsPush: true },
     [SIEVE_CAPABILITY]: {},
   };
   if (hasContacts) capabilities[CONTACTS_CAPABILITY] = contactsCapabilityProps();
@@ -57,8 +59,8 @@ export function buildSession(cfg: AppConfig, account: AccountRow, provider?: Pro
     primaryAccounts,
     username: account.username,
     apiUrl: `${cfg.publicUrl}/jmap`,
-    downloadUrl: `${cfg.publicUrl}/jmap/download/{accountId}/{blobId}/{name}`,
-    uploadUrl: `${cfg.publicUrl}/jmap/upload/{accountId}/`,
+    downloadUrl: `${cfg.publicUrl}/jmap/download/{accountId}/{blobId}/{type}/{name}`,
+    uploadUrl: `${cfg.publicUrl}/jmap/upload/{accountId}`,
     eventSourceUrl: `${cfg.publicUrl}/jmap/eventsource?types={types}&closeafter={closeafter}&ping={ping}`,
     state: `s${account.id}`,
   };

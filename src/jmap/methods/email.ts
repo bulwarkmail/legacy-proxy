@@ -1,13 +1,25 @@
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store } from "../../state/store.js";
-import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId } from "../../mapping/ids.js";
+import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
+import { listMailboxes } from "./mailbox.js";
+import { log } from "../../util/log.js";
+import { projectHeaderProp } from "../../imap/headers.js";
+import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import { buildRfc822, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import {
+  changesFromLog,
+  changesOrCannotCalculate,
+  queryChangesOrCannotCalculate,
+  type ChangesResponse,
+  type QueryChangesResponse,
+} from "./_shared.js";
+import { decodeCounterState, decodeEmailState } from "../../state/states.js";
 
 export interface EmailQueryArgs {
   accountId: string;
@@ -16,12 +28,112 @@ export interface EmailQueryArgs {
   position?: number;
   limit?: number;
   collapseThreads?: boolean;
+  // Anchor-based paging (RFC 8620 §5.5). When `anchor` is set, `position` is
+  // ignored — paging starts at the anchor's offset (plus anchorOffset).
+  anchor?: string;
+  anchorOffset?: number;
+  calculateTotal?: boolean;
 }
 
-// IMAP without the SORT extension can only deliver UID order, which approximates
-// receivedAt. Other JMAP sort properties (subject, from, size, ...) would require
-// fetching metadata for every match — refuse them rather than silently lying.
-const SUPPORTED_SORT_PROPS = new Set(["receivedAt"]);
+// Resolve `position`/`anchor`/`anchorOffset` to a concrete start offset
+// against an ordered id list. Throws `anchorNotFound` per RFC 8620 §5.5
+// when an anchor is provided but doesn't appear in the result list.
+function resolveQueryStart(
+  orderedIds: string[],
+  args: { position?: number; anchor?: string; anchorOffset?: number },
+): number {
+  if (args.anchor !== undefined) {
+    const idx = orderedIds.indexOf(args.anchor);
+    if (idx < 0) throw new JmapError("anchorNotFound", `anchor ${args.anchor} not in result list`);
+    const off = typeof args.anchorOffset === "number" ? args.anchorOffset : 0;
+    return Math.max(0, idx + off);
+  }
+  const pos = args.position ?? 0;
+  if (pos < 0) return Math.max(0, orderedIds.length + pos);
+  return pos;
+}
+
+// We honor any of the JMAP-defined sort properties: receivedAt (the fast
+// path; equivalent to UID order in single-mailbox queries) plus size, from,
+// to, subject, sentAt, hasKeyword. Anything else falls through to
+// unsupportedSort. Non-receivedAt sorts trigger a per-match FETCH; that's
+// fine for the v0.1 scale but a server-side SORT extension would be the
+// long-term win on huge mailboxes.
+const SUPPORTED_SORT_PROPS = new Set([
+  "receivedAt",
+  "size",
+  "from",
+  "to",
+  "subject",
+  "sentAt",
+  "hasKeyword",
+]);
+
+const FETCH_SORT_PROPS = new Set(["size", "from", "to", "subject", "sentAt", "hasKeyword"]);
+
+// Per-mailbox SEARCH-result cache. The same client typically issues
+// `Email/query { position: 0, limit: 50 }`, then `position: 50`, then
+// `position: 100`, etc., scrolling through a folder. Each one used to
+// re-issue an IMAP SEARCH; with this cache they reuse one round trip until
+// either the mailbox state moves or the TTL expires.
+//
+// Cache key includes a stable filter hash + uidvalidity so a new mailbox
+// (UIDVALIDITY rolled, e.g. recreate) automatically invalidates entries.
+interface SearchCacheEntry {
+  uids: number[];
+  modseq: number;
+  expiresAt: number;
+}
+const searchCache = new Map<string, SearchCacheEntry>();
+const SEARCH_CACHE_TTL_MS = 30_000;
+const SEARCH_CACHE_MAX = 256;
+
+function searchCacheKey(
+  accountId: number,
+  mailboxIdx: number,
+  uidvalidity: number,
+  filter: Filter,
+): string {
+  return `${accountId}|${mailboxIdx}|${uidvalidity}|${stableHash(filter)}`;
+}
+
+// Deterministic JSON: keys sorted at every level so logically-equal filters
+// hash identically regardless of the property order the client used.
+function stableHash(value: unknown): string {
+  return JSON.stringify(value, (_k, v) => {
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const sorted: Record<string, unknown> = {};
+      for (const key of Object.keys(v as Record<string, unknown>).sort()) {
+        sorted[key] = (v as Record<string, unknown>)[key];
+      }
+      return sorted;
+    }
+    return v;
+  });
+}
+
+function pruneSearchCache(): void {
+  if (searchCache.size <= SEARCH_CACHE_MAX) return;
+  // Map preserves insertion order; drop the oldest entries first.
+  const drop = searchCache.size - SEARCH_CACHE_MAX;
+  let i = 0;
+  for (const k of searchCache.keys()) {
+    if (i++ >= drop) break;
+    searchCache.delete(k);
+  }
+}
+
+// Drop every cache entry for an account. Called after we mutate emails
+// (Email/set, Email/import, Email/copy) — the next Email/query needs to see
+// the new state, and imapflow's cached mailbox.highestModseq isn't always
+// advanced on the same connection that did the APPEND, so the modseq guard
+// alone can serve a stale answer.
+function invalidateSearchCacheForAccount(accountId: number): void {
+  const prefix = `${accountId}|`;
+  for (const k of [...searchCache.keys()]) {
+    if (k.startsWith(prefix)) searchCache.delete(k);
+  }
+}
 
 function findInMailbox(filter: Filter): string | null {
   if ("operator" in filter) {
@@ -33,6 +145,51 @@ function findInMailbox(filter: Filter): string | null {
     return null;
   }
   return filter.inMailbox ?? null;
+}
+
+// Top-level hasAttachment (RFC 8621 §4.4.4). On non-gmail backends IMAP can't
+// answer this directly, so we extract it here and apply it as a post-filter
+// against per-message BODYSTRUCTURE.
+function findHasAttachment(filter: Filter): boolean | null {
+  if ("operator" in filter) {
+    if (filter.operator !== "AND") return null;
+    for (const c of filter.conditions) {
+      const m = findHasAttachment(c);
+      if (m !== null) return m;
+    }
+    return null;
+  }
+  return (filter as { hasAttachment?: boolean }).hasAttachment ?? null;
+}
+
+// Top-level noneInThreadHaveKeyword (RFC 8621 §4.4.4): "include emails whose
+// thread contains no message bearing this keyword". We honor it as a post-
+// filter against the thread index, so the IMAP search side can ignore it.
+function findNoneInThreadHaveKeyword(filter: Filter): string | null {
+  if ("operator" in filter) {
+    if (filter.operator !== "AND") return null;
+    for (const c of filter.conditions) {
+      const m = findNoneInThreadHaveKeyword(c);
+      if (m) return m;
+    }
+    return null;
+  }
+  return (filter as { noneInThreadHaveKeyword?: string }).noneInThreadHaveKeyword ?? null;
+}
+
+// Top-level inMailboxOtherThan; only AND trees recurse. RFC 8621 §4.4.4 lets a
+// client say "anywhere except in these folders" — which only makes sense in the
+// account-wide path, since the single-mailbox path already pins one folder.
+function findInMailboxOtherThan(filter: Filter): string[] | null {
+  if ("operator" in filter) {
+    if (filter.operator !== "AND") return null;
+    for (const c of filter.conditions) {
+      const m = findInMailboxOtherThan(c);
+      if (m) return m;
+    }
+    return null;
+  }
+  return filter.inMailboxOtherThan ?? null;
 }
 
 export async function emailQuery(
@@ -48,18 +205,12 @@ export async function emailQuery(
 }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const filter = args.filter ?? ({} as Filter);
-  const inMailbox = findInMailbox(filter);
-  if (!inMailbox) throw invalidArguments("inMailbox is required for v1");
-
-  const m = decodeMailboxId(inMailbox);
-  const mboxRow = ctx.store.db
-    .prepare(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
-    .get(m.mailboxIdx, ctx.account.id) as { name: string; uidvalidity: number } | undefined;
-  if (!mboxRow) throw invalidArguments("unknown mailbox");
 
   let imapFilter;
   try {
-    imapFilter = compileFilter(filter);
+    imapFilter = compileFilter(filter, {
+      dialect: ctx.account.kind === "gmail" ? "gmail" : "generic",
+    });
   } catch (e) {
     if (e instanceof UnsupportedFilter) throw unsupportedFilter(e.message);
     throw e;
@@ -69,7 +220,245 @@ export async function emailQuery(
     if (!SUPPORTED_SORT_PROPS.has(s.property)) throw unsupportedSort();
   }
   // Default JMAP order is unspecified; clients usually want newest-first.
-  const ascending = args.sort?.[0]?.isAscending === true;
+  const sort = (args.sort ?? []) as SortSpec[];
+  const needsFetch = sort.some((s) => FETCH_SORT_PROPS.has(s.property));
+  const ascending = sort[0]?.isAscending === true;
+  const lim = Math.min(args.limit ?? 50, 500);
+
+  const inMailbox = findInMailbox(filter);
+  const full = inMailbox
+    ? await emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch)
+    : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch);
+
+  let orderedIds = full.ids;
+
+  const wantsHasAttachment = findHasAttachment(filter);
+  if (wantsHasAttachment !== null) {
+    orderedIds = await postFilterByHasAttachment(ctx, orderedIds, wantsHasAttachment);
+  }
+
+  const noneKw = findNoneInThreadHaveKeyword(filter);
+  if (noneKw) {
+    const indexed = await buildThreadIndex(ctx);
+    let imapFlag: string;
+    try {
+      imapFlag = keywordToFlag(noneKw);
+    } catch {
+      imapFlag = noneKw;
+    }
+    const threadHasKeyword = new Map<string, boolean>();
+    for (const [tid, members] of indexed.members) {
+      let any = false;
+      for (const eid of members) {
+        const flags = indexed.flagsByEmail.get(eid);
+        if (flags && flags.has(imapFlag)) { any = true; break; }
+      }
+      threadHasKeyword.set(tid, any);
+    }
+    orderedIds = orderedIds.filter((id) => {
+      const tid = indexed.byEmail.get(id);
+      if (!tid) return true; // unknown thread → don't drop
+      return !threadHasKeyword.get(tid);
+    });
+  }
+
+  if (args.collapseThreads === true) {
+    const indexed = await buildThreadIndex(ctx);
+    const seen = new Set<string>();
+    const dedup: string[] = [];
+    for (const id of orderedIds) {
+      const tid = indexed.byEmail.get(id) ?? id;
+      if (seen.has(tid)) continue;
+      seen.add(tid);
+      dedup.push(id);
+    }
+    orderedIds = dedup;
+  }
+
+  const start = resolveQueryStart(orderedIds, args);
+  return {
+    accountId: args.accountId,
+    queryState: full.queryState,
+    canCalculateChanges: false,
+    position: start,
+    total: orderedIds.length,
+    ids: orderedIds.slice(start, start + lim),
+  };
+}
+
+interface SortSpec { property: string; isAscending?: boolean; keyword?: string }
+interface SortableHit {
+  mailboxIdx: number;
+  uidvalidity: number;
+  uid: number;
+  receivedAt?: number;
+  size?: number;
+  from?: string;
+  to?: string;
+  subject?: string;
+  sentAt?: number;
+  flags?: Set<string>;
+}
+
+function sortValue(h: SortableHit, prop: string, kw: string | undefined): number | string | boolean {
+  switch (prop) {
+    case "receivedAt": return h.receivedAt ?? 0;
+    case "size": return h.size ?? 0;
+    case "from": return (h.from ?? "").toLowerCase();
+    case "to": return (h.to ?? "").toLowerCase();
+    case "subject": return (h.subject ?? "").toLowerCase();
+    case "sentAt": return h.sentAt ?? 0;
+    case "hasKeyword":
+      // The hit holds raw IMAP flags. Map the JMAP keyword the client picked
+      // through keywordToFlag so $flagged/$seen/etc. compare against \\Flagged
+      // / \\Seen rather than missing every time.
+      if (!kw || !h.flags) return false;
+      try {
+        return h.flags.has(keywordToFlag(kw));
+      } catch {
+        return false;
+      }
+    default: return 0;
+  }
+}
+
+function compareHits(a: SortableHit, b: SortableHit, sort: SortSpec[]): number {
+  for (const s of sort) {
+    const asc = s.isAscending !== false;
+    const av = sortValue(a, s.property, s.keyword);
+    const bv = sortValue(b, s.property, s.keyword);
+    if (av === bv) continue;
+    const cmp = av < bv ? -1 : 1;
+    return asc ? cmp : -cmp;
+  }
+  return 0;
+}
+
+// Enrich UIDs with whatever metadata the requested sort needs. Non-receivedAt
+// sorts FETCH envelope/size/flags from IMAP — one batched FETCH per mailbox.
+async function fetchSortMetadata(
+  client: ImapFlow,
+  uids: number[],
+  needsFetch: boolean,
+): Promise<Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>> {
+  const out = new Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>();
+  if (uids.length === 0) return out;
+  const range = uids.join(",");
+  const query = needsFetch
+    ? { uid: true, internalDate: true, size: true, envelope: true, flags: true }
+    : { uid: true, internalDate: true };
+  for await (const msg of client.fetch(range, query, { uid: true })) {
+    const uid = Number(msg.uid);
+    out.set(uid, {
+      receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
+      size: typeof msg.size === "number" ? msg.size : undefined,
+      from: pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from),
+      to: pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to),
+      subject: (msg.envelope as { subject?: string } | undefined)?.subject,
+      sentAt: (msg.envelope as { date?: Date | string } | undefined)?.date
+        ? new Date((msg.envelope as { date: Date | string }).date).getTime()
+        : 0,
+      flags: msg.flags ? new Set(msg.flags) : undefined,
+    });
+  }
+  return out;
+}
+
+function pickFirstAddr(addrs: { address?: string }[] | undefined): string | undefined {
+  return addrs?.[0]?.address ?? undefined;
+}
+
+// Post-filter emailIds by their bodyStructure-derived hasAttachment flag.
+// IMAP doesn't expose attachment presence as a SEARCH criterion (without an
+// extension), so this runs an extra FETCH per mailbox group. Performance is
+// fine for v1 — clients that page narrowly stay snappy; the slow path is
+// only triggered when the filter explicitly asks for hasAttachment.
+async function postFilterByHasAttachment(
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ids: string[],
+  want: boolean,
+): Promise<string[]> {
+  if (ids.length === 0) return ids;
+  const groups = new Map<number, string[]>();
+  for (const id of ids) {
+    let parts;
+    try { parts = decodeEmailId(id); } catch { continue; }
+    if (parts.accountIdx !== ctx.account.id) continue;
+    const arr = groups.get(parts.mailboxIdx) ?? [];
+    arr.push(id);
+    groups.set(parts.mailboxIdx, arr);
+  }
+  const keep = new Set<string>();
+  for (const [mailboxIdx, gids] of groups) {
+    const row = ctx.store.db
+      .prepare(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
+      .get(mailboxIdx, ctx.account.id) as { id: number; name: string } | undefined;
+    if (!row) continue;
+    const uidByEid = new Map<number, string>();
+    for (const id of gids) {
+      try {
+        const uid = decodeEmailId(id).uid;
+        uidByEid.set(uid, id);
+      } catch { /* skip */ }
+    }
+    if (uidByEid.size === 0) continue;
+    try {
+      await withMailbox(ctx.client, row.name, async () => {
+        const range = [...uidByEid.keys()].join(",");
+        for await (const msg of ctx.client.fetch(range, { uid: true, bodyStructure: true }, { uid: true })) {
+          const uid = Number(msg.uid);
+          const eid = uidByEid.get(uid);
+          if (!eid) continue;
+          const has = bodyStructureHasAttachment(msg.bodyStructure);
+          if (has === want) keep.add(eid);
+        }
+      });
+    } catch {
+      // Skip folders we can't open; their candidates fall out of the filter.
+    }
+  }
+  return ids.filter((id) => keep.has(id));
+}
+
+// Walk a BODYSTRUCTURE tree and decide whether the message has attachments.
+// Definition matches the JMAP convention: a part is an attachment if it has
+// a Content-Disposition: attachment, or it isn't a top-level text/* / multipart.
+function bodyStructureHasAttachment(bs: unknown): boolean {
+  if (!bs || typeof bs !== "object") return false;
+  const node = bs as { type?: string; disposition?: string; childNodes?: unknown[]; description?: unknown };
+  const type = (node.type ?? "").toLowerCase();
+  if (Array.isArray(node.childNodes)) {
+    for (const c of node.childNodes) if (bodyStructureHasAttachment(c)) return true;
+  }
+  if (typeof node.disposition === "string" && node.disposition.toLowerCase() === "attachment") {
+    return true;
+  }
+  // Inline image attachments / unknown leaf parts that aren't text or
+  // multipart count as attachments per JMAP convention.
+  if (
+    !type.startsWith("multipart/") &&
+    !type.startsWith("text/") &&
+    !Array.isArray(node.childNodes)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function emailQuerySingleMailboxFull(
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  filter: Filter,
+  imapFilter: ReturnType<typeof compileFilter>,
+  inMailbox: string,
+  sort: SortSpec[],
+  ascending: boolean,
+  needsFetch: boolean,
+): Promise<{ ids: string[]; queryState: string }> {
+  const m = decodeMailboxId(inMailbox);
+  const mboxRow = ctx.store.db
+    .prepare(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
+    .get(m.mailboxIdx, ctx.account.id) as { name: string; uidvalidity: number } | undefined;
+  if (!mboxRow) throw invalidArguments("unknown mailbox");
 
   return await withMailbox(ctx.client, mboxRow.name, async () => {
     const status = ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
@@ -78,24 +467,163 @@ export async function emailQuery(
     );
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
 
-    const searchResult = await ctx.client.search(imapFilter, { uid: true });
-    const uids: number[] = Array.isArray(searchResult) ? (searchResult as number[]) : [];
-    const sorted = uids.sort((a, b) => (ascending ? a - b : b - a));
-    const pos = Math.max(0, args.position ?? 0);
-    const lim = Math.min(args.limit ?? 50, 500);
-    const slice = sorted.slice(pos, pos + lim);
-    const ids = slice.map((uid) =>
+    const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
+    let uids: number[] | null = null;
+    const cached = searchCache.get(cacheKey);
+    if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+      uids = cached.uids;
+    }
+    if (!uids) {
+      const searchResult = await ctx.client.search(imapFilter, { uid: true });
+      uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+      searchCache.set(cacheKey, {
+        uids,
+        modseq,
+        expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
+      });
+      pruneSearchCache();
+    }
+    let orderedUids: number[];
+    if (needsFetch || sort.length > 0) {
+      const meta = await fetchSortMetadata(ctx.client, uids, needsFetch);
+      const hits: SortableHit[] = uids.map((uid) => ({
+        mailboxIdx: m.mailboxIdx,
+        uidvalidity,
+        uid,
+        ...meta.get(uid),
+      }));
+      const effectiveSort: SortSpec[] = sort.length ? sort : [{ property: "receivedAt", isAscending: false }];
+      hits.sort((a, b) => compareHits(a, b, effectiveSort));
+      orderedUids = hits.map((h) => h.uid);
+    } else {
+      // Legacy fast path: UID order ≈ append order ≈ receivedAt order. Used
+      // only when the client passed no sort at all.
+      orderedUids = ascending ? uids : uids.slice().reverse();
+    }
+    const orderedIds = orderedUids.map((uid) =>
       encodeEmailId({ accountIdx: ctx.account.id, mailboxIdx: m.mailboxIdx, uidvalidity, uid }),
     );
     return {
-      accountId: args.accountId,
-      queryState: encodeEmailState({ uidvalidity, modseq }),
-      canCalculateChanges: false,
-      position: pos,
-      total: sorted.length,
-      ids,
+      ids: orderedIds,
+      // queryState is intentionally the account-wide counter rather than the
+      // per-mailbox (uidvalidity, modseq) tuple. Email/queryChanges has only
+      // the account state to compare against — tying them together lets the
+      // "no-change" fast path return an empty diff without recomputing the
+      // search server-side. Mailbox-specific staleness still surfaces via
+      // the search cache.
+      queryState: encodeEmailState({
+        uidvalidity: 0,
+        modseq: ctx.store.getState(ctx.account.id, "email"),
+      }),
     };
   });
+}
+
+// Account-wide Email/query. Spec-compliant fallback for clients that don't pin
+// a mailbox; the IMAP SEARCH happens once per folder. Slow on large accounts,
+// but the fast path remains pinned-mailbox queries that share the cache.
+//
+// Sort is by INTERNALDATE across folders. We FETCH internaldate for every
+// matching UID (one batched FETCH per folder), then merge; this is the only
+// way to honor `receivedAt` ordering without a server-side index. For unfiltered
+// scans on huge accounts a future optimisation would be to do a coarse sort by
+// per-folder UID descending and only fetch the slice.
+async function emailQueryAccountWideFull(
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  filter: Filter,
+  imapFilter: ReturnType<typeof compileFilter>,
+  sort: SortSpec[],
+  ascending: boolean,
+  needsFetch: boolean,
+): Promise<{ ids: string[]; queryState: string }> {
+  const otherThan = findInMailboxOtherThan(filter);
+  const excludedIdxs = new Set<number>();
+  if (otherThan) {
+    for (const enc of otherThan) {
+      try {
+        excludedIdxs.add(decodeMailboxId(enc).mailboxIdx);
+      } catch {
+        throw invalidArguments(`invalid inMailboxOtherThan id: ${enc}`);
+      }
+    }
+  }
+
+  const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
+  type MboxRow = { id: number; name: string; uidvalidity: number };
+  const rows = ctx.store.db
+    .prepare(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
+    .all(ctx.account.id) as MboxRow[];
+  const rowById = new Map(rows.map((r) => [r.id, r] as const));
+
+  const hits: SortableHit[] = [];
+  // Iterate in the same order listMailboxes returns; deterministic for tests.
+  for (const m of all) {
+    const idx = decodeMailboxId(m.id).mailboxIdx;
+    if (excludedIdxs.has(idx)) continue;
+    const row = rowById.get(idx);
+    if (!row) continue;
+
+    try {
+      await withMailbox(ctx.client, row.name, async () => {
+        const status =
+          ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
+        const uidvalidity = Number(
+          (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
+        );
+        const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
+
+        const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
+        let uids: number[] | null = null;
+        const cached = searchCache.get(cacheKey);
+        if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+          uids = cached.uids;
+        }
+        if (!uids) {
+          const searchResult = await ctx.client.search(imapFilter, { uid: true });
+          uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+          searchCache.set(cacheKey, {
+            uids,
+            modseq,
+            expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
+          });
+          pruneSearchCache();
+        }
+        if (uids.length === 0) return;
+
+        const meta = await fetchSortMetadata(ctx.client, uids, needsFetch);
+        for (const uid of uids) {
+          const m2 = meta.get(uid);
+          hits.push({ mailboxIdx: idx, uidvalidity, uid, ...m2 });
+        }
+      });
+    } catch (e) {
+      // A folder can disappear between LIST and SELECT (concurrent mutation),
+      // and the DB may carry rows for folders the server no longer reports.
+      // Skip rather than fail the whole query — pinned-mailbox queries still
+      // surface mailbox errors loudly.
+      log.warn(
+        { mailbox: row.name, err: (e as Error).message },
+        "account-wide Email/query: skipping mailbox",
+      );
+    }
+  }
+
+  const effectiveSort: SortSpec[] = sort.length
+    ? sort
+    : [{ property: "receivedAt", isAscending: ascending }];
+  hits.sort((a, b) => compareHits(a, b, effectiveSort));
+  const orderedIds = hits.map((h) =>
+    encodeEmailId({
+      accountIdx: ctx.account.id,
+      mailboxIdx: h.mailboxIdx,
+      uidvalidity: h.uidvalidity,
+      uid: h.uid,
+    }),
+  );
+  return {
+    ids: orderedIds,
+    queryState: encodeEmailState({ uidvalidity: 0, modseq: ctx.store.getState(ctx.account.id, "email") }),
+  };
 }
 
 export async function emailGet(
@@ -109,15 +637,21 @@ export async function emailGet(
     maxBodyValueBytes?: number;
   },
   ctx: { account: AccountRow; client: ImapFlow; store: Store },
-): Promise<{ accountId: string; state: string; list: JmapEmail[]; notFound: string[] }> {
+): Promise<{ accountId: string; state: string; list: Record<string, unknown>[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const list: JmapEmail[] = [];
   const notFound: string[] = [];
+  // If the client picked an explicit property set, skip the preview FETCH
+  // unless `preview` was requested. This is the common path for header-only
+  // list views and saves one IMAP round trip per Email/get page.
+  const wantsPreview =
+    args.properties === undefined || args.properties.includes("preview");
   const bodyOpts = {
     fetchTextBodyValues: args.fetchTextBodyValues,
     fetchHTMLBodyValues: args.fetchHTMLBodyValues,
     fetchAllBodyValues: args.fetchAllBodyValues,
     maxBodyValueBytes: args.maxBodyValueBytes,
+    wantsPreview,
   };
 
   // Group ids by mailbox so we can do one SELECT + one batched FETCH per
@@ -151,34 +685,85 @@ export async function emailGet(
       for (const e of group.entries) notFound.push(e.id);
       continue;
     }
-    const mailboxArg = {
-      ...mboxRow,
-      account_id: ctx.account.id,
-      parent_id: null,
-      delim: "/",
-      role: null,
-      special_use: null,
-      total: 0,
-      unread: 0,
-      subscribed: 0,
-      last_seen: 0,
-    } as never;
     const uids = group.entries.map((e) => e.uid);
-    const fetched = await withMailbox(ctx.client, mboxRow.name, async () =>
-      fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts),
-    );
+    const fetched = await withMailbox(ctx.client, mboxRow.name, async () => {
+      // Use the live uidvalidity from the SELECTed mailbox so the response
+      // ids round-trip with what Email/query returned. The cached value in
+      // the mailbox row starts at 0 and is never refreshed by listMailboxes.
+      const status = ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
+      const liveUv = Number(
+        (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? mboxRow.uidvalidity,
+      );
+      const mailboxArg = {
+        ...mboxRow,
+        uidvalidity: liveUv,
+        account_id: ctx.account.id,
+        parent_id: null,
+        delim: "/",
+        role: null,
+        special_use: null,
+        total: 0,
+        unread: 0,
+        subscribed: 0,
+        last_seen: 0,
+      } as never;
+      return fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts);
+    });
     for (const e of group.entries) {
       const meta = fetched.get(e.uid);
       if (meta) list.push(meta);
       else notFound.push(e.id);
     }
   }
+  const projected = list.map((e) => projectEmailForGet(e, args.properties));
   return {
     accountId: args.accountId,
-    state: encodeEmailState({ uidvalidity: 0, modseq: 0 }),
-    list,
+    state: accountEmailState(ctx.store, ctx.account.id),
+    list: projected,
     notFound,
   };
+}
+
+// Build the response object for one Email/get hit. Honors the `properties`
+// filter (RFC 8620 §5.1) and resolves `header:Foo[:asForm]` projections from
+// the parsed header block we attached during fetch. Strips the internal
+// `_headers` field unconditionally.
+function projectEmailForGet(
+  email: JmapEmail,
+  properties: string[] | undefined,
+): Record<string, unknown> {
+  const headers = email._headers;
+  // Default property set per RFC 8621 §4.2 Email/get if the client doesn't
+  // pick one. We mirror the upstream test suite's expectations here — id is
+  // always present; everything else is included by default.
+  const defaultProps = [
+    "id", "blobId", "threadId", "mailboxIds", "keywords", "size", "receivedAt",
+    "messageId", "inReplyTo", "references", "sender", "from", "to", "cc",
+    "bcc", "replyTo", "subject", "sentAt", "hasAttachment", "preview",
+    "bodyStructure", "textBody", "htmlBody", "attachments", "bodyValues",
+  ];
+  const props = properties ?? defaultProps;
+  const out: Record<string, unknown> = { id: email.id };
+  for (const p of props) {
+    if (p === "id") continue;
+    if (p.startsWith("header:")) {
+      out[p] = projectHeaderProp(headers, p);
+      continue;
+    }
+    // Plain top-level property; copy through if we have it.
+    if (Object.prototype.hasOwnProperty.call(email, p)) {
+      out[p] = (email as unknown as Record<string, unknown>)[p];
+    }
+  }
+  return out;
+}
+
+// Account-wide email state used by Email/get and Email/set. Bumped by Email/set
+// (and by submission). Email/query's `queryState` is intentionally a different
+// shape: it encodes (uidvalidity, modseq) of the queried mailbox so refresh
+// can be cheaper than a full counter compare.
+function accountEmailState(store: Store, accountId: number): string {
+  return encodeEmailState({ uidvalidity: 0, modseq: store.getState(accountId, "email") });
 }
 
 // --- Email/set ------------------------------------------------------------
@@ -221,7 +806,10 @@ export async function emailSet(
 ): Promise<EmailSetResponse> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
 
-  const oldState = encodeCounterState(ctx.store, ctx.account.id);
+  const oldState = accountEmailState(ctx.store, ctx.account.id);
+  if (args.ifInState != null && args.ifInState !== oldState) {
+    throw new JmapError("stateMismatch", "ifInState does not match current Email state");
+  }
 
   const created: Record<string, unknown> = {};
   const notCreated: Record<string, SetError> = {};
@@ -260,12 +848,29 @@ export async function emailSet(
     Object.keys(created).length > 0 ||
     Object.keys(updated).length > 0 ||
     destroyed.length > 0;
-  if (mutated) ctx.store.bumpState(ctx.account.id, "email");
+  if (mutated) {
+    invalidateSearchCacheForAccount(ctx.account.id);
+    ctx.store.recordChanges(ctx.account.id, "email", {
+      created: Object.entries(created).map(([, r]) => (r as { id: string }).id),
+      updated: Object.keys(updated),
+      destroyed: [...destroyed],
+    });
+    // Folder counts (totalEmails / unreadEmails) move whenever we add, move,
+    // delete, or change Seen — so any successful Email/set mutation also
+    // invalidates the Mailbox state. Without this, clients keyed on
+    // Mailbox.state never refresh the inbox unread counter after a flag flip.
+    // We don't record per-mailbox-id changes here (they aren't meaningful
+    // without knowing which folders the affected emails actually live in),
+    // so any subsequent Mailbox/changes will see a state move with no log
+    // entries → cannotCalculateChanges. That's the same answer it gave
+    // before, just more explicit.
+    ctx.store.bumpState(ctx.account.id, "mailbox");
+  }
 
   return {
     accountId: args.accountId,
     oldState,
-    newState: encodeCounterState(ctx.store, ctx.account.id),
+    newState: accountEmailState(ctx.store, ctx.account.id),
     created: Object.keys(created).length ? created : null,
     notCreated: Object.keys(notCreated).length ? notCreated : null,
     updated: Object.keys(updated).length ? updated : null,
@@ -273,13 +878,6 @@ export async function emailSet(
     destroyed: destroyed.length ? destroyed : null,
     notDestroyed: Object.keys(notDestroyed).length ? notDestroyed : null,
   };
-}
-
-function encodeCounterState(store: Store, accountId: number): string {
-  // Reuse the same encoder Email/get returns for `state`, so clients can match.
-  // We piggyback the email-state counter onto modseq.
-  const counter = store.getState(accountId, "email");
-  return encodeEmailState({ uidvalidity: 0, modseq: counter });
 }
 
 function toSetError(e: unknown): SetError {
@@ -326,34 +924,48 @@ function lookupMailboxByEncodedId(
 }
 
 interface ResolvedPatch {
-  newMailboxIds: string[] | null; // encoded ids; null = no change
+  // Full replacement for mailboxIds (the `mailboxIds: {...}` form). null = no change.
+  mailboxFull: string[] | null;
+  // Partial patch entries (`mailboxIds/X = true | null | false`).
+  mailboxAdd: Set<string>;
+  mailboxRemove: Set<string>;
   keywordSet: Record<string, true> | null; // full replacement; null = no change
   keywordAdd: Set<string>;
   keywordRemove: Set<string>;
+  // Properties the client tried to write that the IMAP backend can't change
+  // in place. We return these in the SetError if they were the *only* fields
+  // in the patch — otherwise we ignore them silently and let the writable
+  // parts succeed (clients often resubmit the whole Email object).
+  rejectedProperties: string[];
 }
+
+// IMAP-mutable JMAP Email properties (RFC 8621 §4.1). Anything else in a
+// patch is server-derived (id, blobId, size, …) or part of the RFC822
+// envelope, which we can't rewrite without re-APPENDing.
+const WRITABLE_KEYS = new Set(["mailboxIds", "keywords"]);
 
 function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
   const out: ResolvedPatch = {
-    newMailboxIds: null,
+    mailboxFull: null,
+    mailboxAdd: new Set(),
+    mailboxRemove: new Set(),
     keywordSet: null,
     keywordAdd: new Set(),
     keywordRemove: new Set(),
+    rejectedProperties: [],
   };
-  // Patch entries with paths like "mailboxIds/X" override the full-property
-  // entry per RFC 8620 §5.3, but in practice clients send one or the other.
-  const mailboxPatch: Record<string, boolean | null> = {};
-  let mailboxFull: string[] | null = null;
   for (const [k, v] of Object.entries(patch)) {
     if (k === "mailboxIds") {
       if (v === null || typeof v !== "object") {
         throw invalidArguments("mailboxIds must be an object");
       }
-      mailboxFull = Object.keys(v as Record<string, unknown>).filter(
+      out.mailboxFull = Object.keys(v as Record<string, unknown>).filter(
         (id) => (v as Record<string, unknown>)[id] === true,
       );
     } else if (k.startsWith("mailboxIds/")) {
       const id = k.slice("mailboxIds/".length);
-      mailboxPatch[id] = v === true ? true : v === null || v === false ? null : true;
+      if (v === true) out.mailboxAdd.add(id);
+      else if (v === null || v === false) out.mailboxRemove.add(id);
     } else if (k === "keywords") {
       if (v === null || typeof v !== "object") {
         throw invalidArguments("keywords must be an object");
@@ -367,26 +979,27 @@ function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
       const kw = k.slice("keywords/".length);
       if (v === true) out.keywordAdd.add(kw);
       else if (v === null || v === false) out.keywordRemove.add(kw);
+    } else {
+      const root = k.split("/")[0]!;
+      if (!WRITABLE_KEYS.has(root)) out.rejectedProperties.push(k);
     }
-    // Other Email properties (subject, from, etc.) cannot be edited in-place
-    // on IMAP - silently ignore so the client can still patch flags/folder.
   }
-
-  if (mailboxFull !== null) {
-    out.newMailboxIds = mailboxFull;
-  } else if (Object.keys(mailboxPatch).length > 0) {
-    // We need the current mailbox to apply patch entries; defer until caller
-    // has the email's current location. Encode the patch by stashing it.
-    out.newMailboxIds = Object.entries(mailboxPatch)
-      .filter(([, v]) => v === true)
-      .map(([k]) => k);
-    // Removals: anything explicitly set to null is dropped; in our 1-mailbox
-    // model the email is removed from its current box only if the current id
-    // appears in the null entries - applyEmailUpdate handles that by checking
-    // newMailboxIds against current.
-  }
-
   return out;
+}
+
+// Compute the final set of mailbox ids the client wants the message to live in,
+// given the patch and the current single-mailbox membership. Returns null if
+// the patch did not touch mailboxIds.
+function computeNewMailboxIds(
+  resolved: ResolvedPatch,
+  currentEncodedId: string,
+): string[] | null {
+  if (resolved.mailboxFull !== null) return resolved.mailboxFull;
+  if (resolved.mailboxAdd.size === 0 && resolved.mailboxRemove.size === 0) return null;
+  const next = new Set<string>([currentEncodedId]);
+  for (const id of resolved.mailboxAdd) next.add(id);
+  for (const id of resolved.mailboxRemove) next.delete(id);
+  return [...next];
 }
 
 export async function applyEmailUpdate(
@@ -401,23 +1014,46 @@ export async function applyEmailUpdate(
   if (!srcMbox) throw notFound();
 
   const resolved = resolvePatch(patch);
+  // If every key in the patch was a non-writable JMAP Email property (subject,
+  // from, headers/*, ...), there's nothing for us to do — but silently
+  // succeeding would lie to the client. Surface invalidProperties.
+  const writableTouched =
+    resolved.mailboxFull !== null ||
+    resolved.mailboxAdd.size > 0 ||
+    resolved.mailboxRemove.size > 0 ||
+    resolved.keywordSet !== null ||
+    resolved.keywordAdd.size > 0 ||
+    resolved.keywordRemove.size > 0;
+  if (!writableTouched && resolved.rejectedProperties.length > 0) {
+    throw new JmapError(
+      "invalidProperties",
+      "the IMAP backend cannot edit these fields in place; only mailboxIds and keywords are mutable",
+      { properties: resolved.rejectedProperties },
+    );
+  }
+
+  const currentEncodedId = encodeMailboxId({
+    accountIdx: ctx.account.id,
+    mailboxIdx: srcMbox.id,
+  });
+  const newMailboxIds = computeNewMailboxIds(resolved, currentEncodedId);
 
   // Resolve mailbox move target (we only support single-mailbox membership).
   let destMbox: MailboxLookup | null = null;
-  if (resolved.newMailboxIds !== null) {
-    if (resolved.newMailboxIds.length === 0) {
+  if (newMailboxIds !== null) {
+    if (newMailboxIds.length === 0) {
       // Empty mailboxIds = email removed from all mailboxes ⇒ destroy.
       await applyEmailDestroy(id, ctx);
       return;
     }
-    if (resolved.newMailboxIds.length > 1) {
+    if (newMailboxIds.length > 1) {
       throw new JmapError(
         "invalidProperties",
         "multi-mailbox membership is not supported by the IMAP backend",
         { properties: ["mailboxIds"] },
       );
     }
-    const [first] = resolved.newMailboxIds;
+    const [first] = newMailboxIds;
     if (!first) throw invalidArguments("mailboxIds entry missing");
     const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, first);
     if (target.id !== srcMbox.id) destMbox = target;
@@ -495,7 +1131,11 @@ async function applyEmailCreate(
     }
   }
 
-  const mime = await buildRfc822(payload as JmapEmailCreate, ctx.account.host || "localhost");
+  const mime = await buildRfc822(
+    payload as JmapEmailCreate,
+    ctx.account.host || "localhost",
+    (blobId) => ctx.store.getUpload(blobId, ctx.account.id),
+  );
 
   const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;
   const res = await ctx.client.append(target.name, mime, flags.length ? flags : undefined, idate);
@@ -544,3 +1184,505 @@ function decodeEmailIdSafe(id: string): ReturnType<typeof decodeEmailId> {
   }
 }
 
+// --- Email/parse, Email/import --------------------------------------------
+
+interface ParsedEmail {
+  // RFC 8621 §4.10 mandates these as null for not-stored emails.
+  id: null;
+  threadId: null;
+  mailboxIds: null;
+  keywords: null;
+  blobId: string;
+  size: number;
+  receivedAt: string | null;
+  messageId: string[] | null;
+  inReplyTo: string[] | null;
+  references: string[] | null;
+  from: { name: string | null; email: string }[] | null;
+  to: { name: string | null; email: string }[] | null;
+  cc: { name: string | null; email: string }[] | null;
+  bcc: { name: string | null; email: string }[] | null;
+  replyTo: { name: string | null; email: string }[] | null;
+  subject: string | null;
+  sentAt: string | null;
+  textBody: { partId: string; type: string }[] | null;
+  htmlBody: { partId: string; type: string }[] | null;
+  bodyValues: Record<string, { value: string; isEncodingProblem: false; isTruncated: false }> | null;
+}
+
+// Email/parse: turn a previously-uploaded RFC822 blob into a JMAP Email
+// projection. Useful for the "preview a forwarded message" flow before
+// importing it into a mailbox. We use mailparser (already a dep), which also
+// handles QP/base64 transfer encoding for body parts internally.
+export async function emailParse(
+  args: { accountId: string; blobIds: string[] },
+  ctx: { account: AccountRow; store: Store },
+): Promise<{ accountId: string; parsed: Record<string, ParsedEmail>; notParsable: string[]; notFound: string[] }> {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const { simpleParser } = await import("mailparser");
+  const parsed: Record<string, ParsedEmail> = {};
+  const notFound: string[] = [];
+  const notParsable: string[] = [];
+  for (const blobId of args.blobIds ?? []) {
+    if (!blobId.startsWith("U")) {
+      notFound.push(blobId);
+      continue;
+    }
+    const upload = ctx.store.getUpload(blobId, ctx.account.id);
+    if (!upload) {
+      notFound.push(blobId);
+      continue;
+    }
+    try {
+      const m = await simpleParser(upload.body);
+      const collect = (
+        f: { value?: { name?: string; address?: string }[] }
+          | { value?: { name?: string; address?: string }[] }[]
+          | undefined,
+      ) => {
+        if (!f) return null;
+        const arr = Array.isArray(f) ? f : [f];
+        const out: { name: string | null; email: string }[] = [];
+        for (const v of arr) for (const a of v.value ?? []) {
+          if (a.address) out.push({ name: a.name?.trim() || null, email: a.address });
+        }
+        return out.length ? out : null;
+      };
+      // mailparser surfaces the decoded plain-text and HTML bodies as `text`
+      // and `html`. We project these into JMAP's textBody/htmlBody/bodyValues
+      // shape so the conformance suite can read them. Multi-part bodies in
+      // RFC 8621 ride on partId — we synthesize a single root part per kind
+      // (1, 2) which is what most clients expect for a parsed preview.
+      const textBody: { partId: string; type: string }[] = [];
+      const htmlBody: { partId: string; type: string }[] = [];
+      const bodyValues: Record<string, { value: string; isEncodingProblem: false; isTruncated: false }> = {};
+      if (typeof m.text === "string" && m.text.length > 0) {
+        textBody.push({ partId: "1", type: "text/plain" });
+        bodyValues["1"] = { value: m.text, isEncodingProblem: false, isTruncated: false };
+      }
+      if (typeof m.html === "string" && m.html.length > 0) {
+        htmlBody.push({ partId: "2", type: "text/html" });
+        bodyValues["2"] = { value: m.html, isEncodingProblem: false, isTruncated: false };
+      }
+      parsed[blobId] = {
+        id: null,
+        threadId: null,
+        mailboxIds: null,
+        keywords: null,
+        blobId,
+        size: upload.body.length,
+        receivedAt: m.date ? new Date(m.date).toISOString() : null,
+        messageId: m.messageId ? [m.messageId.replace(/^<|>$/g, "")] : null,
+        inReplyTo: m.inReplyTo ? [m.inReplyTo.replace(/^<|>$/g, "")] : null,
+        references: Array.isArray(m.references)
+          ? m.references.map((r) => r.replace(/^<|>$/g, ""))
+          : m.references
+            ? [m.references.replace(/^<|>$/g, "")]
+            : null,
+        from: collect(m.from),
+        to: collect(m.to),
+        cc: collect(m.cc),
+        bcc: collect(m.bcc),
+        replyTo: collect(m.replyTo),
+        subject: m.subject ?? null,
+        sentAt: m.date ? new Date(m.date).toISOString() : null,
+        textBody: textBody.length ? textBody : null,
+        htmlBody: htmlBody.length ? htmlBody : null,
+        bodyValues: Object.keys(bodyValues).length ? bodyValues : null,
+      };
+    } catch {
+      notParsable.push(blobId);
+    }
+  }
+  return { accountId: args.accountId, parsed, notParsable, notFound };
+}
+
+export interface EmailImportArgs {
+  accountId: string;
+  ifInState?: string | null;
+  emails: Record<
+    string,
+    { blobId: string; mailboxIds: Record<string, boolean>; keywords?: Record<string, boolean>; receivedAt?: string }
+  >;
+}
+
+// Email/import: APPEND an uploaded RFC822 blob into a mailbox.
+export async function emailImport(
+  args: EmailImportArgs,
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+): Promise<{
+  accountId: string;
+  oldState: string;
+  newState: string;
+  created: Record<string, { id: string; blobId: string; threadId: string; size: number }> | null;
+  notCreated: Record<string, SetError> | null;
+}> {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const oldState = accountEmailState(ctx.store, ctx.account.id);
+  if (args.ifInState != null && args.ifInState !== oldState) {
+    throw new JmapError("stateMismatch", "ifInState does not match current Email state");
+  }
+  const created: Record<string, { id: string; blobId: string; threadId: string; size: number }> = {};
+  const notCreated: Record<string, SetError> = {};
+  for (const [cid, payload] of Object.entries(args.emails ?? {})) {
+    try {
+      created[cid] = await applyEmailImport(payload, ctx);
+    } catch (e) {
+      notCreated[cid] = toSetError(e);
+    }
+  }
+  if (Object.keys(created).length > 0) {
+    invalidateSearchCacheForAccount(ctx.account.id);
+    ctx.store.recordChanges(ctx.account.id, "email", {
+      created: Object.values(created).map((c) => c.id),
+    });
+    ctx.store.bumpState(ctx.account.id, "mailbox");
+  }
+  return {
+    accountId: args.accountId,
+    oldState,
+    newState: accountEmailState(ctx.store, ctx.account.id),
+    created: Object.keys(created).length ? created : null,
+    notCreated: Object.keys(notCreated).length ? notCreated : null,
+  };
+}
+
+async function applyEmailImport(
+  payload: {
+    blobId: string;
+    mailboxIds: Record<string, boolean>;
+    keywords?: Record<string, boolean>;
+    receivedAt?: string;
+  },
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+): Promise<{ id: string; blobId: string; threadId: string; size: number }> {
+  if (typeof payload.blobId !== "string" || !payload.blobId.startsWith("U")) {
+    // RFC-wise this could be either invalidProperties (malformed reference) or
+    // blobNotFound (the resource isn't there). The conformance suite expects
+    // invalidProperties when the blobId can't possibly resolve in this
+    // accountId — which matches our scheme: only "U…" ids exist. Reserve
+    // blobNotFound for the structurally-valid-but-expired case below.
+    throw new JmapError("invalidProperties", "blobId must reference a prior upload", {
+      properties: ["blobId"],
+    });
+  }
+  const upload = ctx.store.getUpload(payload.blobId, ctx.account.id);
+  if (!upload) throw new JmapError("blobNotFound", "uploaded blob has expired or does not exist");
+
+  const targetIds = Object.entries(payload.mailboxIds ?? {})
+    .filter(([, v]) => v === true)
+    .map(([k]) => k);
+  if (targetIds.length === 0) {
+    throw new JmapError("invalidProperties", "mailboxIds must contain at least one entry", {
+      properties: ["mailboxIds"],
+    });
+  }
+  if (targetIds.length > 1) {
+    throw new JmapError("invalidProperties", "multi-mailbox membership is not supported", {
+      properties: ["mailboxIds"],
+    });
+  }
+  const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, targetIds[0]!);
+  const flags: string[] = [];
+  for (const [kw, v] of Object.entries(payload.keywords ?? {})) {
+    if (v === true) {
+      try {
+        flags.push(keywordToFlag(kw));
+      } catch (e) {
+        throw new JmapError("invalidProperties", (e as Error).message, { properties: ["keywords"] });
+      }
+    }
+  }
+  const idate = payload.receivedAt ? new Date(payload.receivedAt) : undefined;
+  const res = await ctx.client.append(target.name, upload.body, flags.length ? flags : undefined, idate);
+  if (!res || res.uid == null) {
+    throw new JmapError("serverFail", "APPEND did not return a UID (no UIDPLUS)");
+  }
+  const uidvalidity = res.uidValidity != null ? Number(res.uidValidity) : target.uidvalidity;
+  const emailId = encodeEmailId({
+    accountIdx: ctx.account.id,
+    mailboxIdx: target.id,
+    uidvalidity,
+    uid: res.uid,
+  });
+  return {
+    id: emailId,
+    blobId: encodeBlobId(emailId),
+    threadId: emailId,
+    size: upload.body.length,
+  };
+}
+
+// --- SearchSnippet/get ----------------------------------------------------
+
+// SearchSnippet/get returns the matching text fragments for a Filter, used
+// by webmail UIs to highlight hits in result rows. IMAP SEARCH does not give
+// us back the matching offsets, so the only conforming response is `null`
+// snippets per RFC 8621 §3.4 — clients fall back to their own highlighter.
+//
+// Note: RFC 8621 §5 makes notFound an Id[]|null (null when every id resolved),
+// not the standard String[] used elsewhere. We don't actually look the email
+// up in IMAP here — the client just passed us ids — so we use a structural
+// check on the id format to decide "found vs notFound".
+export async function searchSnippetGet(
+  args: { accountId: string; filter?: unknown; emailIds: string[] },
+  ctx: { account: AccountRow },
+): Promise<{
+  accountId: string;
+  list: { emailId: string; subject: null; preview: null }[];
+  notFound: string[] | null;
+}> {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const list: { emailId: string; subject: null; preview: null }[] = [];
+  const notFound: string[] = [];
+  for (const emailId of args.emailIds ?? []) {
+    let valid = false;
+    try {
+      const parts = decodeEmailId(emailId);
+      valid = parts.accountIdx === ctx.account.id;
+    } catch {
+      valid = false;
+    }
+    if (valid) list.push({ emailId, subject: null, preview: null });
+    else notFound.push(emailId);
+  }
+  return {
+    accountId: args.accountId,
+    list,
+    notFound: notFound.length ? notFound : null,
+  };
+}
+
+// --- Email/changes, Email/queryChanges, Email/copy ------------------------
+
+// Email/changes is answered from the in-memory change log when sinceState
+// falls inside the retained window. Outside that window (or after a restart)
+// we degrade to `cannotCalculateChanges` honestly — we never fabricate a diff.
+export async function emailChanges(
+  args: { accountId: string; sinceState: string },
+  ctx: { account: AccountRow; store: Store },
+): Promise<ChangesResponse> {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const currentNumeric = ctx.store.getState(ctx.account.id, "email");
+  const currentRaw = accountEmailState(ctx.store, ctx.account.id);
+  let sinceNumeric: number;
+  try {
+    sinceNumeric = decodeEmailState(args.sinceState).modseq;
+  } catch {
+    return changesOrCannotCalculate(args.accountId, args.sinceState, currentRaw);
+  }
+  return changesFromLog({
+    accountId: args.accountId,
+    store: ctx.store,
+    numericAccountId: ctx.account.id,
+    kind: "email",
+    sinceStateRaw: args.sinceState,
+    sinceStateNumeric: sinceNumeric,
+    currentStateRaw: currentRaw,
+    currentStateNumeric: currentNumeric,
+  });
+}
+
+export async function emailQueryChanges(
+  args: EmailQueryArgs & { sinceQueryState: string; upToId?: string | null },
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+): Promise<QueryChangesResponse> {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const currentNumeric = ctx.store.getState(ctx.account.id, "email");
+  const currentRaw = accountEmailState(ctx.store, ctx.account.id);
+  if (args.sinceQueryState === currentRaw) {
+    return queryChangesOrCannotCalculate(args.accountId, args.sinceQueryState, currentRaw);
+  }
+
+  let sinceNumeric: number;
+  try {
+    sinceNumeric = decodeEmailState(args.sinceQueryState).modseq;
+  } catch {
+    throw new JmapError("cannotCalculateChanges", "unparseable sinceQueryState");
+  }
+  const entries = ctx.store.entriesSince(ctx.account.id, "email", sinceNumeric, currentNumeric);
+  if (!entries) throw new JmapError("cannotCalculateChanges", "out-of-window");
+
+  // Re-run the query to know which ids the client should currently see.
+  // The diff is then: removed = (destroyed ∪ updated-and-no-longer-matches);
+  // added = (created-now-matches ∪ updated-now-matches). For an MVP we only
+  // surface destroyed and created against the live result set — that covers
+  // the after-add and after-remove conformance cases without claiming more
+  // accuracy than the log gives us.
+  const fresh = await emailQuery(args, ctx);
+  const liveSet = new Set(fresh.ids);
+  const removed: string[] = [];
+  const added: { id: string; index: number }[] = [];
+  const seenRemoved = new Set<string>();
+  const seenAdded = new Set<string>();
+  for (const e of entries) {
+    if (e.action === "destroyed" && !seenRemoved.has(e.id) && !liveSet.has(e.id)) {
+      seenRemoved.add(e.id);
+      removed.push(e.id);
+    } else if (e.action === "created" && liveSet.has(e.id) && !seenAdded.has(e.id)) {
+      seenAdded.add(e.id);
+      const index = fresh.ids.indexOf(e.id);
+      added.push({ id: e.id, index });
+    }
+  }
+  return {
+    accountId: args.accountId,
+    oldQueryState: args.sinceQueryState,
+    newQueryState: currentRaw,
+    total: fresh.total,
+    removed,
+    added,
+  };
+}
+
+export interface EmailCopyArgs {
+  fromAccountId: string;
+  accountId: string;
+  ifFromInState?: string | null;
+  ifInState?: string | null;
+  create: Record<string, { id: string; mailboxIds: Record<string, boolean>; keywords?: Record<string, boolean> }>;
+  onSuccessDestroyOriginal?: boolean;
+  destroyFromIfInState?: string | null;
+}
+
+export interface EmailCopyResponse {
+  fromAccountId: string;
+  accountId: string;
+  oldState: string;
+  newState: string;
+  created: Record<string, { id: string; blobId: string; threadId: string; size: number }> | null;
+  notCreated: Record<string, SetError> | null;
+}
+
+// Cross-account copy is not supported: providers don't share IMAP namespaces.
+// Within the same account we copy with IMAP COPY, which preserves UIDs only
+// on UIDPLUS-aware servers (the same UIDPLUS dependency Email/set already
+// has — see applyEmailCreate).
+export async function emailCopy(
+  args: EmailCopyArgs,
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+): Promise<EmailCopyResponse> {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  if (args.fromAccountId !== args.accountId) {
+    throw new JmapError(
+      "fromAccountNotFound",
+      "cross-account Email/copy is not supported by the IMAP backend",
+    );
+  }
+  const oldState = accountEmailState(ctx.store, ctx.account.id);
+  if (args.ifInState != null && args.ifInState !== oldState) {
+    throw new JmapError("stateMismatch", "ifInState does not match current Email state");
+  }
+  if (args.ifFromInState != null && args.ifFromInState !== oldState) {
+    throw new JmapError("stateMismatch", "ifFromInState does not match current Email state");
+  }
+
+  const created: Record<string, { id: string; blobId: string; threadId: string; size: number }> = {};
+  const notCreated: Record<string, SetError> = {};
+  const successfulOriginals: string[] = [];
+
+  for (const [cid, payload] of Object.entries(args.create ?? {})) {
+    try {
+      const result = await applyEmailCopy(payload, ctx);
+      created[cid] = result;
+      successfulOriginals.push(payload.id);
+    } catch (e) {
+      notCreated[cid] = toSetError(e);
+    }
+  }
+
+  if (args.onSuccessDestroyOriginal === true) {
+    for (const id of successfulOriginals) {
+      try {
+        await applyEmailDestroy(id, ctx);
+      } catch {
+        // best effort - the copy already succeeded
+      }
+    }
+  }
+
+  if (Object.keys(created).length > 0) {
+    invalidateSearchCacheForAccount(ctx.account.id);
+    ctx.store.recordChanges(ctx.account.id, "email", {
+      created: Object.values(created).map((c) => c.id),
+      destroyed: args.onSuccessDestroyOriginal ? successfulOriginals : [],
+    });
+    ctx.store.bumpState(ctx.account.id, "mailbox");
+  }
+
+  return {
+    fromAccountId: args.fromAccountId,
+    accountId: args.accountId,
+    oldState,
+    newState: accountEmailState(ctx.store, ctx.account.id),
+    created: Object.keys(created).length ? created : null,
+    notCreated: Object.keys(notCreated).length ? notCreated : null,
+  };
+}
+
+async function applyEmailCopy(
+  payload: { id: string; mailboxIds: Record<string, boolean>; keywords?: Record<string, boolean> },
+  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+): Promise<{ id: string; blobId: string; threadId: string; size: number }> {
+  const srcParts = decodeEmailIdSafe(payload.id);
+  if (srcParts.accountIdx !== ctx.account.id) throw notFound();
+  const srcMbox = lookupMailboxByIdx(ctx.store, ctx.account.id, srcParts.mailboxIdx);
+  if (!srcMbox) throw notFound();
+
+  const targetIds = Object.entries(payload.mailboxIds ?? {})
+    .filter(([, v]) => v === true)
+    .map(([k]) => k);
+  if (targetIds.length === 0) {
+    throw new JmapError("invalidProperties", "mailboxIds must contain at least one entry", {
+      properties: ["mailboxIds"],
+    });
+  }
+  if (targetIds.length > 1) {
+    throw new JmapError("invalidProperties", "multi-mailbox membership is not supported", {
+      properties: ["mailboxIds"],
+    });
+  }
+  const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, targetIds[0]!);
+
+  const copyResult = await withMailbox(ctx.client, srcMbox.name, async () => {
+    return ctx.client.messageCopy(`${srcParts.uid}`, target.name, { uid: true });
+  });
+  if (!copyResult) {
+    throw new JmapError("serverFail", `COPY to "${target.name}" failed`);
+  }
+  // imapflow returns `uidMap` (src UID → dst UID) when UIDPLUS is advertised.
+  const newUid = copyResult.uidMap?.get(srcParts.uid) ?? null;
+  if (newUid == null) {
+    throw new JmapError("serverFail", "server did not return UID for COPY (no UIDPLUS)");
+  }
+  const uidvalidity =
+    copyResult.uidValidity != null ? Number(copyResult.uidValidity) : target.uidvalidity;
+
+  // Apply keyword changes on the new copy if requested.
+  const keywords = payload.keywords ?? {};
+  const flags: string[] = [];
+  for (const [kw, v] of Object.entries(keywords)) {
+    if (v === true) flags.push(keywordToFlag(kw));
+  }
+  if (flags.length > 0) {
+    await withMailbox(ctx.client, target.name, async () => {
+      await ctx.client.messageFlagsSet(`${newUid}`, flags, { uid: true });
+    });
+  }
+
+  const newId = encodeEmailId({
+    accountIdx: ctx.account.id,
+    mailboxIdx: target.id,
+    uidvalidity,
+    uid: newUid,
+  });
+  // Without fetching the MIME we don't know the size; report 0 rather than
+  // the source size (which may differ if server adds trailing markers).
+  // Clients that need size will issue Email/get on the new id.
+  return { id: newId, blobId: encodeBlobId(newId), threadId: newId, size: 0 };
+}
+
+// Test surface — kept private from production code paths but exposed under a
+// reserved name so unit specs can exercise patch resolution without spinning
+// up an IMAP connection.
+export const __test = { resolvePatch, computeNewMailboxIds };

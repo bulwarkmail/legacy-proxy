@@ -14,6 +14,8 @@
 //   same request. The server replaces it with the actual server-assigned
 //   id.
 
+import { JmapError } from "./errors.js";
+
 export interface ResultRef {
   resultOf: string;
   name: string;
@@ -56,16 +58,39 @@ function resolveArgsInner(
   const o = args as Record<string, Json>;
   const out: Record<string, Json> = {};
   for (const [k, v] of Object.entries(o)) {
+    // Nested `#tempId` KEYS resolve to a previously-created server id (RFC
+    // 8621 §7.2). Top-level `#`-keys are reserved for result references and
+    // get the structured-ref handling below.
+    let outKey = k;
+    if (!topLevel && k.startsWith("#") && createdIds) {
+      const real = createdIds.get(k.slice(1));
+      if (real !== undefined) outKey = real;
+    }
     if (topLevel && k.startsWith("#")) {
       const ref = v as ResultRef;
       const r = prior[ref.resultOf];
-      if (!r) throw new Error(`invalidResultReference: missing call ${ref.resultOf}`);
-      if (r.name !== ref.name) {
-        throw new Error(`invalidResultReference: ${ref.resultOf} produced ${r.name}, not ${ref.name}`);
+      if (!r) {
+        throw new JmapError(
+          "invalidResultReference",
+          `no prior call with id "${ref.resultOf}"`,
+        );
       }
-      out[k.slice(1)] = jsonPointer(r.result, ref.path);
+      if (r.name !== ref.name) {
+        throw new JmapError(
+          "invalidResultReference",
+          `call "${ref.resultOf}" produced "${r.name}", not "${ref.name}"`,
+        );
+      }
+      const resolved = jsonPointer(r.result, ref.path);
+      if (resolved === undefined) {
+        throw new JmapError(
+          "invalidResultReference",
+          `path "${ref.path}" did not resolve in call "${ref.resultOf}"`,
+        );
+      }
+      out[k.slice(1)] = resolved;
     } else {
-      out[k] = resolveArgsInner(v, prior, createdIds, false);
+      out[outKey] = resolveArgsInner(v, prior, createdIds, false);
     }
   }
   return out;
@@ -86,24 +111,36 @@ export function harvestCreatedIds(into: CreatedIds, methodName: string, result: 
 }
 
 export function jsonPointer(input: Json, pointer: string): Json {
+  // RFC 8620 §3.1.7 extends JSON Pointer with `*` — when the pointer reaches an
+  // array, `*` means "for each element, apply the rest of the pointer, and
+  // concatenate the resulting arrays". Without this, chained back-refs like
+  // `path: "/list/*/id"` (Email/query → Email/get) silently return undefined.
   if (pointer === "" || pointer === "/") return input;
   const parts = pointer.replace(/^\//, "").split("/").map(unescape);
-  let here: Json = input;
-  for (const seg of parts) {
-    if (seg === "*" && Array.isArray(here)) {
-      here = here;
-      continue;
+  return walk(input, parts, 0);
+}
+
+function walk(here: Json, parts: string[], i: number): Json {
+  if (i >= parts.length) return here;
+  const seg = parts[i]!;
+  if (seg === "*") {
+    if (!Array.isArray(here)) return undefined;
+    if (i === parts.length - 1) return here;
+    const out: Json[] = [];
+    for (const el of here) {
+      const got = walk(el, parts, i + 1);
+      if (Array.isArray(got)) out.push(...got);
+      else if (got !== undefined) out.push(got);
     }
-    if (Array.isArray(here)) {
-      if (seg === "*") continue;
-      here = here[Number(seg)];
-    } else if (here && typeof here === "object") {
-      here = (here as Record<string, Json>)[seg];
-    } else {
-      return undefined;
-    }
+    return out;
   }
-  return here;
+  if (Array.isArray(here)) {
+    return walk(here[Number(seg)], parts, i + 1);
+  }
+  if (here && typeof here === "object") {
+    return walk((here as Record<string, Json>)[seg], parts, i + 1);
+  }
+  return undefined;
 }
 
 function unescape(s: string): string {

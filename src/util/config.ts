@@ -51,9 +51,9 @@ export function loadConfig(): AppConfig {
   const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
   fs.mkdirSync(dataDir, { recursive: true });
 
-  const providersFile = process.env.PROVIDERS_FILE;
+  const providersFile = process.env.PROVIDERS_FILE ?? path.join(process.cwd(), "providers.json");
   let providers: Record<string, ProviderConfig> = {};
-  if (providersFile && fs.existsSync(providersFile)) {
+  if (fs.existsSync(providersFile)) {
     providers = JSON.parse(fs.readFileSync(providersFile, "utf8"));
   }
 

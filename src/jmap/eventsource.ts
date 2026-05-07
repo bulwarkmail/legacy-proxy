@@ -1,20 +1,38 @@
 import type { FastifyReply } from "fastify";
 import type { AccountRow } from "../state/store.js";
 
-export interface SsePayload {
+// RFC 8620 §7.3 StateChange. Same shape the relay forwards to FCM/Web Push,
+// the webmail's SSE listener parses on the wire, and the polling fallback
+// synthesises locally when EventSource isn't available — so we mirror it
+// exactly. `@type` lets clients distinguish StateChange from PushVerification
+// when they're multiplexed on the same channel.
+export interface StateChange {
+  "@type": "StateChange";
   changed: Record<string, Record<string, string>>;
 }
 
-export class EventSourceHub {
-  private clients = new Map<number, Set<FastifyReply>>();
+interface Subscriber {
+  reply: FastifyReply;
+  types: Set<string> | null;
+  closeAfter: boolean;
+  ping: NodeJS.Timeout;
+}
 
-  add(account: AccountRow, reply: FastifyReply, origin: string | null, pingSec = 30) {
+export class EventSourceHub {
+  private clients = new Map<number, Set<Subscriber>>();
+
+  add(
+    account: AccountRow,
+    reply: FastifyReply,
+    origin: string | null,
+    opts: { types?: string[] | null; closeAfter?: boolean; pingSec?: number } = {},
+  ): void {
+    const pingSec = opts.pingSec ?? 30;
     let set = this.clients.get(account.id);
     if (!set) {
       set = new Set();
       this.clients.set(account.id, set);
     }
-    set.add(reply);
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
     reply.raw.setHeader("Connection", "keep-alive");
@@ -25,17 +43,66 @@ export class EventSourceHub {
       reply.raw.setHeader("Vary", "Origin");
     }
     reply.raw.write(`: connected\n\n`);
-    const ping = setInterval(() => reply.raw.write(`: ping\n\n`), pingSec * 1000);
+    const ping = setInterval(() => {
+      try {
+        reply.raw.write(`: ping\n\n`);
+      } catch {
+        // Connection torn down; the close handler below will clean up.
+      }
+    }, pingSec * 1000);
+
+    const sub: Subscriber = {
+      reply,
+      types: opts.types && opts.types.length > 0 ? new Set(opts.types) : null,
+      closeAfter: opts.closeAfter ?? false,
+      ping,
+    };
+    set.add(sub);
+
     reply.raw.on("close", () => {
-      clearInterval(ping);
-      set?.delete(reply);
+      clearInterval(sub.ping);
+      const accountSet = this.clients.get(account.id);
+      accountSet?.delete(sub);
+      if (accountSet && accountSet.size === 0) this.clients.delete(account.id);
     });
   }
 
-  publish(account: AccountRow, payload: SsePayload) {
+  publish(account: AccountRow, change: StateChange): void {
     const set = this.clients.get(account.id);
     if (!set) return;
-    const data = `event: state\ndata: ${JSON.stringify(payload)}\n\n`;
-    for (const r of set) r.raw.write(data);
+    // Per §7.3 the wire format is `event: state\ndata: <json>\n\n`. Inline the
+    // JSON since most StateChange payloads are tiny.
+    for (const sub of set) {
+      const filtered = sub.types ? filterByTypes(change, sub.types) : change;
+      if (Object.keys(filtered.changed).length === 0) continue;
+      const data = `event: state\ndata: ${JSON.stringify(filtered)}\n\n`;
+      try {
+        sub.reply.raw.write(data);
+      } catch {
+        continue;
+      }
+      if (sub.closeAfter) {
+        try {
+          sub.reply.raw.end();
+        } catch {
+          // ignore
+        }
+      }
+    }
   }
+}
+
+// Drop accounts whose changed-types are all outside the subscriber's filter.
+// We keep the original account ids and rebuild only the per-account map so a
+// future multi-account session sees only the slices it asked for.
+function filterByTypes(change: StateChange, types: Set<string>): StateChange {
+  const out: Record<string, Record<string, string>> = {};
+  for (const [accountId, perType] of Object.entries(change.changed)) {
+    const slice: Record<string, string> = {};
+    for (const [t, state] of Object.entries(perType)) {
+      if (types.has(t)) slice[t] = state;
+    }
+    if (Object.keys(slice).length > 0) out[accountId] = slice;
+  }
+  return { "@type": "StateChange", changed: out };
 }

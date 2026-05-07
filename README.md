@@ -16,25 +16,45 @@ Submission, ManageSieve.
 v0.1. Working:
 
 - JMAP `Session` with the full capability table
-- Batched `methodCalls`, back-references (`#ref`)
-- `Mailbox/get`
-- `Email/get`, `Email/query`, `Email/set` (create drafts, flag/mailbox updates, destroy)
-- `EmailSubmission/get|query|changes|set`
-- `Identity/get`
-- `VacationResponse/get|set`
-- `ContactCard/get|query|set` via CardDAV
-- IMAP via imapflow, per-account connection pool
+- Batched `methodCalls`, back-references (`#ref`, including `*` wildcard)
+- `Mailbox/get|query|queryChanges|changes|set` (folder create/rename/delete/subscribe)
+- `Email/get|query|set|changes|queryChanges|copy|parse|import`
+- `EmailSubmission/get|query|changes|set` (recent submissions cached for `/get`)
+- `Thread/get|changes` (degenerate one-message-per-thread until we add an index)
+- `SearchSnippet/get` (returns null snippets — IMAP doesn't surface match offsets)
+- `Identity/get|set|changes` (name, replyTo, signatures persisted in SQLite)
+- `VacationResponse/get|set|changes` (full body, dates, htmlBody round-tripped via Sieve)
+- `AddressBook/get|changes`, `ContactCard/get|query|changes|queryChanges` via CardDAV
+- `PushSubscription/get|set` (stub: empty list, creates rejected — no webhook delivery yet)
+- File upload at `/jmap/upload/{accountId}/`, advertised via `uploadUrl`
+- IMAP via imapflow, single connection per account
 - ManageSieve (RFC 5804), used by `VacationResponse`
 - SMTP submission (nodemailer)
 - Auth: PLAIN, LOGIN, XOAUTH2. HMAC session tokens. AES-256-GCM vault
 - better-sqlite3 state store
-- EventSource transport (SSE endpoint, ping keepalive)
+- EventSource endpoint (connect + keepalive ping; no change events yet)
 - Docker image + compose files (prod, integration)
-- 28 unit tests, jmap-test-suite runner
+- Vitest unit suite, jmap-test-suite runner
 
-Not done yet: `Email/copy`, `Email/import`, `Thread/get`, IMAP IDLE -> SSE
-publishing (the SSE endpoint exists but never emits state changes),
-WebSocket transport (advertised in the Session capability, no handler yet).
+Not done yet:
+
+- IMAP IDLE → SSE publishing: the EventSource endpoint accepts connections
+  but never emits change events.
+- WebSocket transport: `@fastify/websocket` is installed but no `/jmap/ws`
+  handler is registered.
+- `*/changes` and `Email/queryChanges` return `cannotCalculateChanges` whenever
+  the state has moved (no CONDSTORE-backed log yet). Listed in the compliance
+  allowlist.
+- `ContactCard/set` and `AddressBook/set` return `forbidden` — CardDAV writes
+  (MKCOL/PUT/DELETE) aren't implemented.
+- Multi-mailbox membership: messages can live in exactly one IMAP folder.
+- Attachments in `Email/set { create }`: the upload endpoint exists but the
+  MIME builder doesn't yet pull attachment blobs into the message body.
+  Use `Email/import` for that path today.
+
+Sort: only `receivedAt` is advertised and supported (IMAP without SORT can
+only deliver UID order). `hasAttachment` filter is rejected for the same
+reason.
 
 ## Quickstart
 
