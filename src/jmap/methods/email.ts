@@ -336,6 +336,35 @@ function compareHits(a: SortableHit, b: SortableHit, sort: SortSpec[]): number {
 
 // Enrich UIDs with whatever metadata the requested sort needs. Non-receivedAt
 // sorts FETCH envelope/size/flags from IMAP — one batched FETCH per mailbox.
+// Compress a sorted array of UIDs into IMAP sequence-set ranges, e.g.
+// [1,2,3,5,6,9] -> "1:3,5:6,9". Cuts command length dramatically for large,
+// mostly-contiguous mailboxes compared to a flat comma-joined list.
+function compressUidsToRanges(sortedUids: number[]): string {
+  if (sortedUids.length === 0) return "";
+  const parts: string[] = [];
+  let start = sortedUids[0]!;
+  let prev = sortedUids[0]!;
+  for (let i = 1; i <= sortedUids.length; i++) {
+    const cur = sortedUids[i];
+    if (cur !== undefined && cur === prev + 1) {
+      prev = cur;
+      continue;
+    }
+    parts.push(start === prev ? `${start}` : `${start}:${prev}`);
+    if (cur === undefined) break;
+    start = cur;
+    prev = cur;
+  }
+  return parts.join(",");
+}
+
+// Max UIDs per FETCH command. Kept conservative because some IMAP servers
+// (observed with Kerio Connect and MDaemon) enforce stricter command-line
+// length limits than Dovecot/Gmail; a single unbatched FETCH over a large
+// mailbox (thousands of UIDs) can be rejected or drop the connection outright,
+// which previously surfaced to JMAP clients as a silently empty result.
+const FETCH_BATCH_SIZE = 200;
+
 async function fetchSortMetadata(
   client: ImapFlow,
   uids: number[],
@@ -343,23 +372,27 @@ async function fetchSortMetadata(
 ): Promise<Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>> {
   const out = new Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>();
   if (uids.length === 0) return out;
-  const range = uids.join(",");
   const query = needsFetch
     ? { uid: true, internalDate: true, size: true, envelope: true, flags: true }
     : { uid: true, internalDate: true };
-  for await (const msg of client.fetch(range, query, { uid: true })) {
-    const uid = Number(msg.uid);
-    out.set(uid, {
-      receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
-      size: typeof msg.size === "number" ? msg.size : undefined,
-      from: pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from),
-      to: pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to),
-      subject: (msg.envelope as { subject?: string } | undefined)?.subject,
-      sentAt: (msg.envelope as { date?: Date | string } | undefined)?.date
-        ? new Date((msg.envelope as { date: Date | string }).date).getTime()
-        : 0,
-      flags: msg.flags ? new Set(msg.flags) : undefined,
-    });
+  const sorted = uids.slice().sort((a, b) => a - b);
+  for (let i = 0; i < sorted.length; i += FETCH_BATCH_SIZE) {
+    const batch = sorted.slice(i, i + FETCH_BATCH_SIZE);
+    const range = compressUidsToRanges(batch);
+    for await (const msg of client.fetch(range, query, { uid: true })) {
+      const uid = Number(msg.uid);
+      out.set(uid, {
+        receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
+        size: typeof msg.size === "number" ? msg.size : undefined,
+        from: pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from),
+        to: pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to),
+        subject: (msg.envelope as { subject?: string } | undefined)?.subject,
+        sentAt: (msg.envelope as { date?: Date | string } | undefined)?.date
+          ? new Date((msg.envelope as { date: Date | string }).date).getTime()
+          : 0,
+        flags: msg.flags ? new Set(msg.flags) : undefined,
+      });
+    }
   }
   return out;
 }
@@ -404,13 +437,17 @@ async function postFilterByHasAttachment(
     if (uidByEid.size === 0) continue;
     try {
       await withMailbox(ctx.client, row.name, async () => {
-        const range = [...uidByEid.keys()].join(",");
-        for await (const msg of ctx.client.fetch(range, { uid: true, bodyStructure: true }, { uid: true })) {
-          const uid = Number(msg.uid);
-          const eid = uidByEid.get(uid);
-          if (!eid) continue;
-          const has = bodyStructureHasAttachment(msg.bodyStructure);
-          if (has === want) keep.add(eid);
+        const sortedUids = [...uidByEid.keys()].sort((a, b) => a - b);
+        for (let i = 0; i < sortedUids.length; i += FETCH_BATCH_SIZE) {
+          const batch = sortedUids.slice(i, i + FETCH_BATCH_SIZE);
+          const range = compressUidsToRanges(batch);
+          for await (const msg of ctx.client.fetch(range, { uid: true, bodyStructure: true }, { uid: true })) {
+            const uid = Number(msg.uid);
+            const eid = uidByEid.get(uid);
+            if (!eid) continue;
+            const has = bodyStructureHasAttachment(msg.bodyStructure);
+            if (has === want) keep.add(eid);
+          }
         }
       });
     } catch {
