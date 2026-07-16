@@ -1,6 +1,6 @@
 {
   "name": "legacy-proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "AGPL-3.0-only",
   "description": "IMAP/SMTP/ManageSieve to JMAP gateway. Speaks JMAP for Mail (RFC 8620 / 8621) on the front, IMAP4rev1 + Submission + ManageSieve on the back, so any JMAP client can talk to a legacy mailserver.",
