@@ -25,6 +25,10 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          # The default binfmt "latest" image carries an old QEMU that crashes
+          # modern Node/V8 with SIGILL during the emulated arm64 npm install.
+          image: tonistiigi/binfmt:qemu-v10.2.3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
