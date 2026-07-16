@@ -30,6 +30,10 @@ export interface MailboxRow {
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
+-- NORMAL is the recommended pairing with WAL: fsync on checkpoint instead of
+-- on every transaction. The change log and mailbox upserts write on every
+-- mutation, so FULL's per-txn fsync is measurable on slow disks.
+PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS account (
@@ -59,20 +63,51 @@ CREATE TABLE IF NOT EXISTS mailbox (
   UNIQUE (account_id, name)
 );
 
-CREATE TABLE IF NOT EXISTS email (
-  account_id   INTEGER NOT NULL,
-  mailbox_id   INTEGER NOT NULL REFERENCES mailbox(id) ON DELETE CASCADE,
-  uid          INTEGER NOT NULL,
-  modseq       INTEGER NOT NULL DEFAULT 0,
-  message_id   TEXT,
-  thread_root  TEXT,
-  size         INTEGER NOT NULL DEFAULT 0,
-  internaldate INTEGER NOT NULL DEFAULT 0,
-  flags        TEXT NOT NULL DEFAULT '',
+-- Replaced by email_cache below; was never written to.
+DROP TABLE IF EXISTS email;
+
+-- Immutable per-message metadata, keyed by (mailbox, uid) and stamped with the
+-- uidvalidity it was fetched under. IMAP guarantees message content never
+-- changes for a given (uidvalidity, uid), so rows never go stale — they are
+-- only purged when the uidvalidity rolls or the message is expunged.
+--
+-- Two writers fill it at different depths:
+--   - the thread scan inserts minimal rows (thread_id, internaldate) for every
+--     message in the account;
+--   - Email/get upserts the full projection source (envelope, bodystructure,
+--     raw header block, preview) for messages it actually served.
+-- Flags are deliberately NOT cached: they're the one mutable attribute.
+CREATE TABLE IF NOT EXISTS email_cache (
+  account_id    INTEGER NOT NULL,
+  mailbox_id    INTEGER NOT NULL REFERENCES mailbox(id) ON DELETE CASCADE,
+  uidvalidity   INTEGER NOT NULL,
+  uid           INTEGER NOT NULL,
+  thread_id     TEXT,
+  internaldate  INTEGER NOT NULL DEFAULT 0,
+  size          INTEGER,
+  envelope      TEXT,
+  bodystructure TEXT,
+  headers_raw   BLOB,
+  headers_full  INTEGER NOT NULL DEFAULT 0,
+  preview       TEXT,
+  created_at    INTEGER NOT NULL,
   PRIMARY KEY (account_id, mailbox_id, uid)
 );
-CREATE INDEX IF NOT EXISTS email_msgid_idx  ON email(message_id);
-CREATE INDEX IF NOT EXISTS email_thread_idx ON email(thread_root);
+CREATE INDEX IF NOT EXISTS email_cache_thread_idx ON email_cache(account_id, thread_id);
+
+-- Bookkeeping for the incremental thread scan: the (uidvalidity, uidnext,
+-- messages) triple observed on the last SELECT of each folder. When all three
+-- still match, no message was added or expunged since, so the cached rows are
+-- complete and current without any FETCH.
+CREATE TABLE IF NOT EXISTS mailbox_scan (
+  account_id  INTEGER NOT NULL,
+  mailbox_id  INTEGER NOT NULL REFERENCES mailbox(id) ON DELETE CASCADE,
+  uidvalidity INTEGER NOT NULL,
+  uidnext     INTEGER NOT NULL,
+  messages    INTEGER NOT NULL,
+  scanned_at  INTEGER NOT NULL,
+  PRIMARY KEY (account_id, mailbox_id)
+);
 
 CREATE TABLE IF NOT EXISTS state_log (
   account_id INTEGER NOT NULL,
@@ -458,6 +493,137 @@ export class Store {
       .run(cutoff);
   }
 
+  // --- email_cache -----------------------------------------------------
+
+  // SQLite caps bound parameters (999 in older builds); chunk IN lists.
+  private static readonly IN_CHUNK = 500;
+
+  getEmailCacheRows(
+    accountId: number,
+    mailboxId: number,
+    uidvalidity: number,
+    uids: number[],
+  ): Map<number, EmailCacheRow> {
+    const out = new Map<number, EmailCacheRow>();
+    for (let i = 0; i < uids.length; i += Store.IN_CHUNK) {
+      const chunk = uids.slice(i, i + Store.IN_CHUNK);
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM email_cache
+           WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ?
+           AND uid IN (${chunk.map(() => "?").join(",")})`,
+        )
+        .all(accountId, mailboxId, uidvalidity, ...chunk) as EmailCacheRow[];
+      for (const r of rows) out.set(r.uid, r);
+    }
+    return out;
+  }
+
+  // Upsert semantics: a minimal row (thread scan) must never null out a full
+  // row (Email/get) and vice versa, so every nullable column keeps whichever
+  // side has data — incoming value wins when non-null.
+  upsertEmailCacheRows(rows: EmailCacheUpsert[]): void {
+    if (rows.length === 0) return;
+    const stmt = this.db.prepare(
+      `INSERT INTO email_cache(
+         account_id, mailbox_id, uidvalidity, uid, thread_id, internaldate,
+         size, envelope, bodystructure, headers_raw, headers_full, preview, created_at
+       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(account_id, mailbox_id, uid) DO UPDATE SET
+         uidvalidity   = excluded.uidvalidity,
+         thread_id     = COALESCE(excluded.thread_id, thread_id),
+         internaldate  = MAX(excluded.internaldate, internaldate),
+         size          = COALESCE(excluded.size, size),
+         envelope      = COALESCE(excluded.envelope, envelope),
+         bodystructure = COALESCE(excluded.bodystructure, bodystructure),
+         headers_raw   = CASE WHEN excluded.headers_full >= headers_full AND excluded.headers_raw IS NOT NULL
+                              THEN excluded.headers_raw ELSE headers_raw END,
+         headers_full  = MAX(excluded.headers_full, headers_full),
+         preview       = COALESCE(excluded.preview, preview)`,
+    );
+    const now = Date.now();
+    const txn = this.db.transaction((items: EmailCacheUpsert[]) => {
+      for (const r of items) {
+        stmt.run(
+          r.accountId, r.mailboxId, r.uidvalidity, r.uid,
+          r.threadId ?? null, r.internaldate ?? 0, r.size ?? null,
+          r.envelope ?? null, r.bodystructure ?? null, r.headersRaw ?? null,
+          r.headersFull ? 1 : 0, r.preview ?? null, now,
+        );
+      }
+    });
+    txn(rows);
+  }
+
+  setEmailCachePreview(accountId: number, mailboxId: number, uid: number, preview: string): void {
+    this.db
+      .prepare(`UPDATE email_cache SET preview = ? WHERE account_id = ? AND mailbox_id = ? AND uid = ?`)
+      .run(preview, accountId, mailboxId, uid);
+  }
+
+  // uidvalidity rolled: every cached row for the folder is garbage.
+  purgeEmailCacheMailbox(accountId: number, mailboxId: number): void {
+    this.db
+      .prepare(`DELETE FROM email_cache WHERE account_id = ? AND mailbox_id = ?`)
+      .run(accountId, mailboxId);
+    this.db
+      .prepare(`DELETE FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
+      .run(accountId, mailboxId);
+  }
+
+  getEmailCacheUids(accountId: number, mailboxId: number): number[] {
+    const rows = this.db
+      .prepare(`SELECT uid FROM email_cache WHERE account_id = ? AND mailbox_id = ?`)
+      .all(accountId, mailboxId) as { uid: number }[];
+    return rows.map((r) => r.uid);
+  }
+
+  deleteEmailCacheUids(accountId: number, mailboxId: number, uids: number[]): void {
+    if (uids.length === 0) return;
+    const txn = this.db.transaction((all: number[]) => {
+      for (let i = 0; i < all.length; i += Store.IN_CHUNK) {
+        const chunk = all.slice(i, i + Store.IN_CHUNK);
+        this.db
+          .prepare(
+            `DELETE FROM email_cache WHERE account_id = ? AND mailbox_id = ?
+             AND uid IN (${chunk.map(() => "?").join(",")})`,
+          )
+          .run(accountId, mailboxId, ...chunk);
+      }
+    });
+    txn(uids);
+  }
+
+  // Everything the thread index needs, account-wide, ordered by receivedAt
+  // ascending (the RFC 8621 §3 thread member order).
+  getThreadIndexRows(accountId: number): ThreadIndexRow[] {
+    return this.db
+      .prepare(
+        `SELECT mailbox_id, uidvalidity, uid, thread_id, internaldate
+         FROM email_cache WHERE account_id = ? AND thread_id IS NOT NULL
+         ORDER BY internaldate ASC, uid ASC`,
+      )
+      .all(accountId) as ThreadIndexRow[];
+  }
+
+  getMailboxScan(accountId: number, mailboxId: number): MailboxScanRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
+      .get(accountId, mailboxId) as MailboxScanRow | undefined;
+  }
+
+  putMailboxScan(row: MailboxScanRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO mailbox_scan(account_id, mailbox_id, uidvalidity, uidnext, messages, scanned_at)
+         VALUES(?,?,?,?,?,?)
+         ON CONFLICT(account_id, mailbox_id) DO UPDATE SET
+           uidvalidity = excluded.uidvalidity, uidnext = excluded.uidnext,
+           messages = excluded.messages, scanned_at = excluded.scanned_at`,
+      )
+      .run(row.account_id, row.mailbox_id, row.uidvalidity, row.uidnext, row.messages, row.scanned_at);
+  }
+
   putIdentitySettings(accountId: number, s: IdentitySettings): void {
     const replyJson = s.replyTo ? JSON.stringify(s.replyTo) : null;
     this.db
@@ -473,6 +639,54 @@ export class Store {
       )
       .run(accountId, s.displayName, replyJson, s.textSignature, s.htmlSignature, Date.now());
   }
+}
+
+export interface EmailCacheRow {
+  account_id: number;
+  mailbox_id: number;
+  uidvalidity: number;
+  uid: number;
+  thread_id: string | null;
+  internaldate: number;
+  size: number | null;
+  envelope: string | null;
+  bodystructure: string | null;
+  headers_raw: Buffer | null;
+  headers_full: number;
+  preview: string | null;
+  created_at: number;
+}
+
+export interface EmailCacheUpsert {
+  accountId: number;
+  mailboxId: number;
+  uidvalidity: number;
+  uid: number;
+  threadId?: string | null;
+  internaldate?: number;
+  size?: number | null;
+  envelope?: string | null;
+  bodystructure?: string | null;
+  headersRaw?: Buffer | null;
+  headersFull?: boolean;
+  preview?: string | null;
+}
+
+export interface ThreadIndexRow {
+  mailbox_id: number;
+  uidvalidity: number;
+  uid: number;
+  thread_id: string;
+  internaldate: number;
+}
+
+export interface MailboxScanRow {
+  account_id: number;
+  mailbox_id: number;
+  uidvalidity: number;
+  uidnext: number;
+  messages: number;
+  scanned_at: number;
 }
 
 export interface ChangeLogEntry {

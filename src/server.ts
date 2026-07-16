@@ -1,11 +1,12 @@
 import crypto from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import compress from "@fastify/compress";
 import { loadConfig } from "./util/config.js";
 import { log } from "./util/log.js";
 import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
-import { resolveProvider } from "./auth/providers.js";
+import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import { makeSession, signSession, verifySession } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
@@ -48,6 +49,10 @@ const app = Fastify({
 });
 
 await app.register(cors, { origin: true });
+// JMAP responses with bodyValues are large, highly compressible JSON —
+// hundreds of KB shrink to tens. The SSE route is unaffected: it writes to
+// reply.raw directly, bypassing the onSend hook this plugin uses.
+await app.register(compress, { global: true, threshold: 1024 });
 
 app.get("/healthz", async () => ({ ok: true }));
 
@@ -61,7 +66,7 @@ app.post("/api/login", async (req, reply) => {
   };
   if (!body?.username) return reply.code(400).send({ error: "username required" });
 
-  const providerName = body.provider ?? cfg.defaultProvider;
+  const providerName = resolveProviderName(cfg, { explicit: body.provider, username: body.username });
   const provider = resolveProvider(cfg, providerName);
   const creds: Credentials = {
     mech: body.mech ?? (body.accessToken ? "XOAUTH2" : "PLAIN"),
@@ -71,9 +76,9 @@ app.post("/api/login", async (req, reply) => {
   };
 
   // verify by opening an IMAP session once
+  let probe;
   try {
-    const probe = await openImap({ provider, creds });
-    await probe.logout();
+    probe = await openImap({ provider, creds });
   } catch (e) {
     return reply.code(401).send({ error: "auth failed", detail: (e as Error).message });
   }
@@ -87,6 +92,9 @@ app.post("/api/login", async (req, reply) => {
     username: body.username,
     vault,
   });
+  // Reuse the probe as the account's pooled connection instead of logging out
+  // and paying a second TCP+TLS+LOGIN when the client's first JMAP call lands.
+  pool.adopt(account, probe);
   const token = signSession(cfg.sessionHmacKey, makeSession({ accountSlug: slug, username: body.username }));
   return { token, accountId: String(account.id), apiUrl: `${cfg.publicUrl}/jmap` };
 });
@@ -201,7 +209,9 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
       .get(emailParts.mailboxIdx, account.id) as { id: number; name: string } | undefined;
     if (!mbox) return reply.code(404).send({ error: "mailbox gone" });
 
-    const client = await pool.getForAccount(account);
+    // Downloads can hold the socket for the duration of a large attachment;
+    // the bulk connection keeps them from blocking interactive JMAP calls.
+    const client = await pool.getForAccount(account, "bulk");
     try {
       const buf = await withMailbox(client, mbox.name, async () => {
         if (parsed.partId) {
@@ -329,13 +339,13 @@ async function authn(req: {
     const username = decoded.slice(0, colon);
     const password = decoded.slice(colon + 1);
 
-    const providerName = cfg.defaultProvider;
+    const providerName = resolveProviderName(cfg, { username });
     const provider = resolveProvider(cfg, providerName);
     const creds: Credentials = { mech: "PLAIN", username, password };
 
+    let probe;
     try {
-      const probe = await openImap({ provider, creds });
-      await probe.logout();
+      probe = await openImap({ provider, creds });
     } catch (e) {
       log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
       return null;
@@ -348,6 +358,9 @@ async function authn(req: {
       username,
       vault,
     });
+    // Keep the validated connection: the JMAP request this auth is for will
+    // need one immediately.
+    pool.adopt(account, probe);
     basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
     return account;
   }

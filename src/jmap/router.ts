@@ -191,21 +191,21 @@ export function makeMethodTable(): Record<string, Handler> {
     },
     "Email/query": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
-      return emailQuery(a as never, { account: c.account, client, store: c.store });
+      return emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool });
     },
     "Email/get": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
-      return emailGet(a as never, { account: c.account, client, store: c.store });
+      return emailGet(a as never, { account: c.account, client, store: c.store, pool: c.pool });
     },
     "Email/set": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
-      return emailSet(a as never, { account: c.account, client, store: c.store });
+      return emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool });
     },
     "Email/changes": async (a, c) =>
       emailChanges(a as never, { account: c.account, store: c.store }),
     "Email/queryChanges": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
-      return emailQueryChanges(a as never, { account: c.account, client, store: c.store });
+      return emailQueryChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool });
     },
     "Email/copy": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
@@ -221,11 +221,11 @@ export function makeMethodTable(): Record<string, Handler> {
       searchSnippetGet(a as never, { account: c.account }),
     "Thread/get": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
-      return threadGet(a as never, { account: c.account, client, store: c.store });
+      return threadGet(a as never, { account: c.account, client, store: c.store, pool: c.pool });
     },
     "Thread/changes": async (a, c) => {
       const client = await c.pool.getForAccount(c.account);
-      return threadChanges(a as never, { account: c.account, client, store: c.store });
+      return threadChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool });
     },
     "PushSubscription/get": async (a, c) =>
       pushSubscriptionGet(a as never, { account: c.account, store: c.store, dispatcher: c.dispatcher }),

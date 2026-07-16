@@ -2,6 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 
 export interface ProviderConfig {
+  /**
+   * Email domains served by this provider. When a client authenticates with a
+   * username in the form of an email address, the proxy maps the domain part to
+   * this provider (RFC 8620 §2.2 uses the same domain-as-routing-key idea for
+   * service autodiscovery). Lets one proxy front many IMAP backends without the
+   * client having to name the provider explicitly.
+   */
+  domains?: string[];
   imap: { host: string; port: number; secure?: boolean; starttls?: boolean };
   smtp: { host: string; port: number; secure?: boolean; starttls?: boolean };
   sieve: { host: string; port: number; secure?: boolean; starttls?: boolean } | null;

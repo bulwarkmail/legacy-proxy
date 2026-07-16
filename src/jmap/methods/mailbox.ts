@@ -169,6 +169,54 @@ function invalidateListCache(accountId: number): void {
   listCache.delete(accountId);
 }
 
+// Targeted alternative to a full LIST+STATUS sweep: after an Email mutation we
+// know exactly which folders changed counts, so STATUS just those, update the
+// DB rows, and re-stamp the cached list with the (already bumped) mailbox
+// state so the next Mailbox/get is served from memory with fresh counts.
+// On any failure the cache entry is dropped — the next Mailbox/get falls back
+// to the full refresh.
+export async function refreshMailboxCounts(
+  client: ImapFlow,
+  account: AccountRow,
+  store: Store,
+  mailboxIdxs: number[],
+): Promise<void> {
+  const entry = listCache.get(account.id);
+  if (mailboxIdxs.length === 0) {
+    // We know something mutated but not where; be conservative.
+    invalidateListCache(account.id);
+    return;
+  }
+  try {
+    const updateCounts = store.db.prepare(
+      `UPDATE mailbox SET total = ?, unread = ? WHERE id = ? AND account_id = ?`,
+    );
+    for (const idx of mailboxIdxs) {
+      const row = store.db
+        .prepare(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
+        .get(idx, account.id) as { id: number; name: string } | undefined;
+      if (!row) continue;
+      const st = await client.status(row.name, { messages: true, unseen: true });
+      const total = st.messages ?? 0;
+      const unread = st.unseen ?? 0;
+      updateCounts.run(total, unread, idx, account.id);
+      if (entry) {
+        const encId = encodeMailboxId({ accountIdx: account.id, mailboxIdx: idx });
+        const mb = entry.list.find((m) => m.id === encId);
+        if (mb) {
+          mb.totalEmails = total;
+          mb.unreadEmails = unread;
+          mb.totalThreads = total;
+          mb.unreadThreads = unread;
+        }
+      }
+    }
+    if (entry) entry.state = store.getState(account.id, "mailbox");
+  } catch {
+    invalidateListCache(account.id);
+  }
+}
+
 function leafName(path: string): string {
   const idx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("."));
   return idx >= 0 ? path.slice(idx + 1) : path;

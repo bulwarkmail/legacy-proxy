@@ -22,6 +22,7 @@
     "test:all": "npm run test && npm run test:integration && npm run test:compliance"
   },
   "dependencies": {
+    "@fastify/compress": "^9.1.0",
     "@fastify/cors": "^10.0.1",
     "@fastify/websocket": "^11.0.1",
     "better-sqlite3": "^11.5.0",

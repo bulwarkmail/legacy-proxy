@@ -1,12 +1,13 @@
 import type { ImapFlow } from "imapflow";
-import type { AccountRow, Store } from "../../state/store.js";
+import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
+import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
-import { listMailboxes } from "./mailbox.js";
+import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
@@ -20,6 +21,15 @@ import {
   type QueryChangesResponse,
 } from "./_shared.js";
 import { decodeCounterState, decodeEmailState } from "../../state/states.js";
+
+// Shared handler context. `pool` is optional (unit tests construct contexts
+// without one); when present, long-running scans ride the bulk connection.
+interface MailCtx {
+  account: AccountRow;
+  client: ImapFlow;
+  store: Store;
+  pool?: ImapPool;
+}
 
 export interface EmailQueryArgs {
   accountId: string;
@@ -194,7 +204,7 @@ function findInMailboxOtherThan(filter: Filter): string[] | null {
 
 export async function emailQuery(
   args: EmailQueryArgs,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<{
   accountId: string;
   queryState: string;
@@ -239,7 +249,9 @@ export async function emailQuery(
 
   const noneKw = findNoneInThreadHaveKeyword(filter);
   if (noneKw) {
-    const indexed = await buildThreadIndex(ctx);
+    // Flags are mutable, so the index only carries them on request — this
+    // filter is the one consumer that needs them.
+    const indexed = await buildThreadIndex(ctx, { withFlags: true });
     let imapFlag: string;
     try {
       imapFlag = keywordToFlag(noneKw);
@@ -343,11 +355,12 @@ async function fetchSortMetadata(
 ): Promise<Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>> {
   const out = new Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>();
   if (uids.length === 0) return out;
-  const range = uids.join(",");
   const query = needsFetch
     ? { uid: true, internalDate: true, size: true, envelope: true, flags: true }
     : { uid: true, internalDate: true };
-  for await (const msg of client.fetch(range, query, { uid: true })) {
+  // Pass the array, not a joined string: imapflow compresses number[] into
+  // range syntax (1:5000), keeping the command line bounded on huge folders.
+  for await (const msg of client.fetch(uids, query, { uid: true })) {
     const uid = Number(msg.uid);
     out.set(uid, {
       receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
@@ -374,7 +387,7 @@ function pickFirstAddr(addrs: { address?: string }[] | undefined): string | unde
 // fine for v1 — clients that page narrowly stay snappy; the slow path is
 // only triggered when the filter explicitly asks for hasAttachment.
 async function postFilterByHasAttachment(
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
   ids: string[],
   want: boolean,
 ): Promise<string[]> {
@@ -395,23 +408,52 @@ async function postFilterByHasAttachment(
       .get(mailboxIdx, ctx.account.id) as { id: number; name: string } | undefined;
     if (!row) continue;
     const uidByEid = new Map<number, string>();
+    let uidvalidity = 0;
     for (const id of gids) {
       try {
-        const uid = decodeEmailId(id).uid;
-        uidByEid.set(uid, id);
+        const parts = decodeEmailId(id);
+        uidByEid.set(parts.uid, id);
+        uidvalidity = parts.uidvalidity;
       } catch { /* skip */ }
     }
     if (uidByEid.size === 0) continue;
+
+    // BODYSTRUCTURE is immutable — serve from the cache and only FETCH the
+    // gaps (persisting them, so repeat hasAttachment filters are IMAP-free).
+    const cachedRows = ctx.store.getEmailCacheRows(
+      ctx.account.id, mailboxIdx, uidvalidity, [...uidByEid.keys()],
+    );
+    const missingUids: number[] = [];
+    for (const [uid, eid] of uidByEid) {
+      const cached = cachedRows.get(uid);
+      if (cached?.bodystructure != null) {
+        try {
+          const has = bodyStructureHasAttachment(JSON.parse(cached.bodystructure));
+          if (has === want) keep.add(eid);
+          continue;
+        } catch { /* corrupt row: refetch */ }
+      }
+      missingUids.push(uid);
+    }
+    if (missingUids.length === 0) continue;
     try {
       await withMailbox(ctx.client, row.name, async () => {
-        const range = [...uidByEid.keys()].join(",");
-        for await (const msg of ctx.client.fetch(range, { uid: true, bodyStructure: true }, { uid: true })) {
+        const upserts: EmailCacheUpsert[] = [];
+        for await (const msg of ctx.client.fetch(missingUids, { uid: true, bodyStructure: true }, { uid: true })) {
           const uid = Number(msg.uid);
           const eid = uidByEid.get(uid);
           if (!eid) continue;
           const has = bodyStructureHasAttachment(msg.bodyStructure);
           if (has === want) keep.add(eid);
+          upserts.push({
+            accountId: ctx.account.id,
+            mailboxId: mailboxIdx,
+            uidvalidity,
+            uid,
+            bodystructure: JSON.stringify(msg.bodyStructure ?? null),
+          });
         }
+        ctx.store.upsertEmailCacheRows(upserts);
       });
     } catch {
       // Skip folders we can't open; their candidates fall out of the filter.
@@ -446,7 +488,7 @@ function bodyStructureHasAttachment(bs: unknown): boolean {
 }
 
 async function emailQuerySingleMailboxFull(
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
   filter: Filter,
   imapFilter: ReturnType<typeof compileFilter>,
   inMailbox: string,
@@ -484,7 +526,18 @@ async function emailQuerySingleMailboxFull(
       pruneSearchCache();
     }
     let orderedUids: number[];
-    if (needsFetch || sort.length > 0) {
+    // Fast path: a pure receivedAt sort (or no sort) is UID order in a single
+    // mailbox — SEARCH already returned UIDs ascending, so no FETCH at all.
+    // Virtually every client sends `[{property:"receivedAt",isAscending:false}]`,
+    // so this is the path folder listing takes.
+    const pureReceivedAt =
+      sort.length === 0 || (sort.length === 1 && sort[0]!.property === "receivedAt");
+    if (pureReceivedAt) {
+      // Explicit comparator: RFC 8620 defaults isAscending to true. No
+      // comparator at all: keep the legacy newest-first default.
+      const uidAscending = sort.length > 0 ? sort[0]!.isAscending !== false : ascending;
+      orderedUids = uidAscending ? uids : uids.slice().reverse();
+    } else {
       const meta = await fetchSortMetadata(ctx.client, uids, needsFetch);
       const hits: SortableHit[] = uids.map((uid) => ({
         mailboxIdx: m.mailboxIdx,
@@ -492,13 +545,8 @@ async function emailQuerySingleMailboxFull(
         uid,
         ...meta.get(uid),
       }));
-      const effectiveSort: SortSpec[] = sort.length ? sort : [{ property: "receivedAt", isAscending: false }];
-      hits.sort((a, b) => compareHits(a, b, effectiveSort));
+      hits.sort((a, b) => compareHits(a, b, sort));
       orderedUids = hits.map((h) => h.uid);
-    } else {
-      // Legacy fast path: UID order ≈ append order ≈ receivedAt order. Used
-      // only when the client passed no sort at all.
-      orderedUids = ascending ? uids : uids.slice().reverse();
     }
     const orderedIds = orderedUids.map((uid) =>
       encodeEmailId({ accountIdx: ctx.account.id, mailboxIdx: m.mailboxIdx, uidvalidity, uid }),
@@ -529,7 +577,7 @@ async function emailQuerySingleMailboxFull(
 // scans on huge accounts a future optimisation would be to do a coarse sort by
 // per-folder UID descending and only fetch the slice.
 async function emailQueryAccountWideFull(
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
   filter: Filter,
   imapFilter: ReturnType<typeof compileFilter>,
   sort: SortSpec[],
@@ -560,6 +608,10 @@ async function emailQueryAccountWideFull(
   for (const m of all) {
     const idx = decodeMailboxId(m.id).mailboxIdx;
     if (excludedIdxs.has(idx)) continue;
+    // An empty folder can't contribute matches; skip the SELECT + SEARCH
+    // round trips. The count comes from the cached LIST STATUS (≤30s stale,
+    // the same window the search cache already tolerates).
+    if (m.totalEmails === 0) continue;
     const row = rowById.get(idx);
     if (!row) continue;
 
@@ -590,7 +642,44 @@ async function emailQueryAccountWideFull(
         }
         if (uids.length === 0) return;
 
-        const meta = await fetchSortMetadata(ctx.client, uids, needsFetch);
+        // Cross-folder merge needs receivedAt for every hit. Prefer the
+        // cached internaldate (populated by the thread scan and Email/get) —
+        // for warm accounts this drops the FETCH entirely. Sorts on other
+        // properties still need the live envelope/size/flags FETCH.
+        const meta = new Map<
+          number,
+          { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }
+        >();
+        let toFetch = uids;
+        if (!needsFetch) {
+          const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, uidvalidity, uids);
+          toFetch = [];
+          for (const uid of uids) {
+            const row = cachedRows.get(uid);
+            if (row && row.internaldate > 0) meta.set(uid, { receivedAt: row.internaldate });
+            else toFetch.push(uid);
+          }
+        }
+        if (toFetch.length > 0) {
+          const fetched = await fetchSortMetadata(ctx.client, toFetch, needsFetch);
+          for (const [uid, m2] of fetched) meta.set(uid, m2);
+          if (!needsFetch) {
+            // Remember the dates so the next account-wide query is FETCH-free.
+            const upserts: EmailCacheUpsert[] = [];
+            for (const [uid, m2] of fetched) {
+              if (m2.receivedAt) {
+                upserts.push({
+                  accountId: ctx.account.id,
+                  mailboxId: idx,
+                  uidvalidity,
+                  uid,
+                  internaldate: m2.receivedAt,
+                });
+              }
+            }
+            ctx.store.upsertEmailCacheRows(upserts);
+          }
+        }
         for (const uid of uids) {
           const m2 = meta.get(uid);
           hits.push({ mailboxIdx: idx, uidvalidity, uid, ...m2 });
@@ -636,7 +725,7 @@ export async function emailGet(
     fetchAllBodyValues?: boolean;
     maxBodyValueBytes?: number;
   },
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<{ accountId: string; state: string; list: Record<string, unknown>[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const list: JmapEmail[] = [];
@@ -646,12 +735,18 @@ export async function emailGet(
   // list views and saves one IMAP round trip per Email/get page.
   const wantsPreview =
     args.properties === undefined || args.properties.includes("preview");
+  // Only `header:*` projections need the complete header block; everything
+  // else (references, threading) is covered by the threading-field subset,
+  // which is a fraction of the bytes on modern messages.
+  const needsFullHeaders =
+    args.properties?.some((p) => p.startsWith("header:")) ?? false;
   const bodyOpts = {
     fetchTextBodyValues: args.fetchTextBodyValues,
     fetchHTMLBodyValues: args.fetchHTMLBodyValues,
     fetchAllBodyValues: args.fetchAllBodyValues,
     maxBodyValueBytes: args.maxBodyValueBytes,
     wantsPreview,
+    needsFullHeaders,
   };
 
   // Group ids by mailbox so we can do one SELECT + one batched FETCH per
@@ -707,7 +802,7 @@ export async function emailGet(
         subscribed: 0,
         last_seen: 0,
       } as never;
-      return fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts);
+      return fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts, ctx.store);
     });
     for (const e of group.entries) {
       const meta = fetched.get(e.uid);
@@ -802,7 +897,7 @@ export interface EmailSetResponse {
 
 export async function emailSet(
   args: EmailSetArgs,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<EmailSetResponse> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
 
@@ -818,31 +913,20 @@ export async function emailSet(
   const destroyed: string[] = [];
   const notDestroyed: Record<string, SetError> = {};
 
+  const touchedMailboxes = new Set<number>();
+
   for (const [cid, payload] of Object.entries(args.create ?? {})) {
     try {
-      created[cid] = await applyEmailCreate(payload as Record<string, unknown>, ctx);
+      const res = await applyEmailCreate(payload as Record<string, unknown>, ctx);
+      created[cid] = res;
+      try { touchedMailboxes.add(decodeEmailId(res.id).mailboxIdx); } catch { /* opaque id */ }
     } catch (e) {
       notCreated[cid] = toSetError(e);
     }
   }
 
-  for (const [id, patch] of Object.entries(args.update ?? {})) {
-    try {
-      await applyEmailUpdate(id, patch as Record<string, unknown>, ctx);
-      updated[id] = null;
-    } catch (e) {
-      notUpdated[id] = toSetError(e);
-    }
-  }
-
-  for (const id of args.destroy ?? []) {
-    try {
-      await applyEmailDestroy(id, ctx);
-      destroyed.push(id);
-    } catch (e) {
-      notDestroyed[id] = toSetError(e);
-    }
-  }
+  await applyEmailUpdatesBatched(args.update ?? {}, ctx, { updated, notUpdated, touchedMailboxes });
+  await applyEmailDestroysBatched(args.destroy ?? [], ctx, { destroyed, notDestroyed, touchedMailboxes });
 
   const mutated =
     Object.keys(created).length > 0 ||
@@ -865,6 +949,9 @@ export async function emailSet(
     // entries → cannotCalculateChanges. That's the same answer it gave
     // before, just more explicit.
     ctx.store.bumpState(ctx.account.id, "mailbox");
+    // Refresh counts for just the folders this mutation touched (one STATUS
+    // each) so the next Mailbox/get doesn't pay a full LIST+STATUS sweep.
+    await refreshMailboxCounts(ctx.client, ctx.account, ctx.store, [...touchedMailboxes]).catch(() => {});
   }
 
   return {
@@ -1002,10 +1089,200 @@ function computeNewMailboxIds(
   return [...next];
 }
 
+interface UpdateOp {
+  id: string;
+  patch: Record<string, unknown>;
+  uid: number;
+  srcMbox: MailboxLookup;
+  resolved: ResolvedPatch;
+  destMbox: MailboxLookup | null;
+}
+
+// Identical flag/move operations against the same source mailbox share one
+// IMAP command: "mark 200 as read" is a single UID STORE instead of 200.
+function updateOpSignature(op: UpdateOp): string {
+  return JSON.stringify({
+    set: op.resolved.keywordSet ? Object.keys(op.resolved.keywordSet).sort() : null,
+    add: [...op.resolved.keywordAdd].sort(),
+    rem: [...op.resolved.keywordRemove].sort(),
+    dest: op.destMbox?.id ?? null,
+  });
+}
+
+async function applyEmailUpdatesBatched(
+  updates: Record<string, Record<string, unknown>>,
+  ctx: MailCtx,
+  out: {
+    updated: Record<string, unknown | null>;
+    notUpdated: Record<string, SetError>;
+    touchedMailboxes: Set<number>;
+  },
+): Promise<void> {
+  const groups = new Map<string, UpdateOp[]>();
+  for (const [id, patch] of Object.entries(updates)) {
+    // Per-id validation mirrors applyEmailUpdate; anything invalid fails just
+    // that id, exactly as the sequential path did.
+    try {
+      const parts = decodeEmailIdSafe(id);
+      if (parts.accountIdx !== ctx.account.id) throw notFound();
+      const srcMbox = lookupMailboxByIdx(ctx.store, ctx.account.id, parts.mailboxIdx);
+      if (!srcMbox) throw notFound();
+      const resolved = resolvePatch(patch as Record<string, unknown>);
+      const writableTouched =
+        resolved.mailboxFull !== null ||
+        resolved.mailboxAdd.size > 0 ||
+        resolved.mailboxRemove.size > 0 ||
+        resolved.keywordSet !== null ||
+        resolved.keywordAdd.size > 0 ||
+        resolved.keywordRemove.size > 0;
+      if (!writableTouched && resolved.rejectedProperties.length > 0) {
+        throw new JmapError(
+          "invalidProperties",
+          "the IMAP backend cannot edit these fields in place; only mailboxIds and keywords are mutable",
+          { properties: resolved.rejectedProperties },
+        );
+      }
+      const currentEncodedId = encodeMailboxId({
+        accountIdx: ctx.account.id,
+        mailboxIdx: srcMbox.id,
+      });
+      const newMailboxIds = computeNewMailboxIds(resolved, currentEncodedId);
+      let destMbox: MailboxLookup | null = null;
+      if (newMailboxIds !== null) {
+        if (newMailboxIds.length === 0) {
+          // Empty mailboxIds = removed from all mailboxes ⇒ destroy. Rare;
+          // apply individually.
+          await applyEmailDestroy(id, ctx);
+          out.updated[id] = null;
+          out.touchedMailboxes.add(srcMbox.id);
+          continue;
+        }
+        if (newMailboxIds.length > 1) {
+          throw new JmapError(
+            "invalidProperties",
+            "multi-mailbox membership is not supported by the IMAP backend",
+            { properties: ["mailboxIds"] },
+          );
+        }
+        const [first] = newMailboxIds;
+        if (!first) throw invalidArguments("mailboxIds entry missing");
+        const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, first);
+        if (target.id !== srcMbox.id) destMbox = target;
+      }
+      const op: UpdateOp = { id, patch: patch as Record<string, unknown>, uid: parts.uid, srcMbox, resolved, destMbox };
+      const key = `${srcMbox.id}|${updateOpSignature(op)}`;
+      const arr = groups.get(key) ?? [];
+      arr.push(op);
+      groups.set(key, arr);
+    } catch (e) {
+      out.notUpdated[id] = toSetError(e);
+    }
+  }
+
+  for (const ops of groups.values()) {
+    const { srcMbox, resolved, destMbox } = ops[0]!;
+    const uids = ops.map((o) => o.uid);
+    try {
+      await withMailbox(ctx.client, srcMbox.name, async () => {
+        // Flag changes precede the move: after MOVE the source UIDs are gone.
+        if (resolved.keywordSet !== null) {
+          const flags = Object.keys(resolved.keywordSet).map(keywordToFlag);
+          await ctx.client.messageFlagsSet(uids, flags, { uid: true });
+        } else {
+          if (resolved.keywordAdd.size > 0) {
+            const flags = [...resolved.keywordAdd].map(keywordToFlag);
+            await ctx.client.messageFlagsAdd(uids, flags, { uid: true });
+          }
+          if (resolved.keywordRemove.size > 0) {
+            const flags = [...resolved.keywordRemove].map(keywordToFlag);
+            await ctx.client.messageFlagsRemove(uids, flags, { uid: true });
+          }
+        }
+        if (destMbox) {
+          const moved = await ctx.client.messageMove(uids, destMbox.name, { uid: true });
+          if (!moved) {
+            throw new JmapError("serverFail", `MOVE to "${destMbox.name}" failed`);
+          }
+        }
+      });
+      if (destMbox) {
+        // Source rows are gone; the copies in destMbox have new UIDs that the
+        // next scan / Email/get will cache under their own ids.
+        ctx.store.deleteEmailCacheUids(ctx.account.id, srcMbox.id, uids);
+      }
+      for (const op of ops) out.updated[op.id] = null;
+      out.touchedMailboxes.add(srcMbox.id);
+      if (destMbox) out.touchedMailboxes.add(destMbox.id);
+    } catch {
+      // The batched command failed as a unit — retry each id individually so
+      // per-id success/error reporting stays exact.
+      for (const op of ops) {
+        try {
+          await applyEmailUpdate(op.id, op.patch, ctx);
+          out.updated[op.id] = null;
+          out.touchedMailboxes.add(op.srcMbox.id);
+          if (op.destMbox) out.touchedMailboxes.add(op.destMbox.id);
+        } catch (e) {
+          out.notUpdated[op.id] = toSetError(e);
+        }
+      }
+    }
+  }
+}
+
+async function applyEmailDestroysBatched(
+  ids: string[],
+  ctx: MailCtx,
+  out: {
+    destroyed: string[];
+    notDestroyed: Record<string, SetError>;
+    touchedMailboxes: Set<number>;
+  },
+): Promise<void> {
+  const groups = new Map<number, { mbox: MailboxLookup; entries: { id: string; uid: number }[] }>();
+  for (const id of ids) {
+    try {
+      const parts = decodeEmailIdSafe(id);
+      if (parts.accountIdx !== ctx.account.id) throw notFound();
+      const mbox = lookupMailboxByIdx(ctx.store, ctx.account.id, parts.mailboxIdx);
+      if (!mbox) throw notFound();
+      let g = groups.get(mbox.id);
+      if (!g) {
+        g = { mbox, entries: [] };
+        groups.set(mbox.id, g);
+      }
+      g.entries.push({ id, uid: parts.uid });
+    } catch (e) {
+      out.notDestroyed[id] = toSetError(e);
+    }
+  }
+  for (const g of groups.values()) {
+    const uids = g.entries.map((e) => e.uid);
+    try {
+      await withMailbox(ctx.client, g.mbox.name, async () => {
+        await ctx.client.messageDelete(uids, { uid: true });
+      });
+      ctx.store.deleteEmailCacheUids(ctx.account.id, g.mbox.id, uids);
+      for (const e of g.entries) out.destroyed.push(e.id);
+      out.touchedMailboxes.add(g.mbox.id);
+    } catch {
+      for (const e of g.entries) {
+        try {
+          await applyEmailDestroy(e.id, ctx);
+          out.destroyed.push(e.id);
+          out.touchedMailboxes.add(g.mbox.id);
+        } catch (err) {
+          out.notDestroyed[e.id] = toSetError(err);
+        }
+      }
+    }
+  }
+}
+
 export async function applyEmailUpdate(
   id: string,
   patch: Record<string, unknown>,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<void> {
   const parts = decodeEmailIdSafe(id);
   if (parts.accountIdx !== ctx.account.id) throw notFound();
@@ -1093,7 +1370,7 @@ interface CreatedEmailResult {
 
 async function applyEmailCreate(
   payload: Record<string, unknown>,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<CreatedEmailResult> {
   // Resolve target mailbox (single-membership only).
   const mailboxIds = payload.mailboxIds;
@@ -1165,7 +1442,7 @@ async function applyEmailCreate(
 
 async function applyEmailDestroy(
   id: string,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<void> {
   const parts = decodeEmailIdSafe(id);
   if (parts.accountIdx !== ctx.account.id) throw notFound();
@@ -1182,6 +1459,18 @@ function decodeEmailIdSafe(id: string): ReturnType<typeof decodeEmailId> {
   } catch {
     throw notFound();
   }
+}
+
+// Distinct mailbox indexes referenced by a set of email ids; undecodable ids
+// are skipped (they can't correspond to a folder we track anyway).
+function mailboxIdxsOf(emailIds: string[]): number[] {
+  const out = new Set<number>();
+  for (const id of emailIds) {
+    try {
+      out.add(decodeEmailId(id).mailboxIdx);
+    } catch { /* opaque id */ }
+  }
+  return [...out];
 }
 
 // --- Email/parse, Email/import --------------------------------------------
@@ -1309,7 +1598,7 @@ export interface EmailImportArgs {
 // Email/import: APPEND an uploaded RFC822 blob into a mailbox.
 export async function emailImport(
   args: EmailImportArgs,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<{
   accountId: string;
   oldState: string;
@@ -1337,6 +1626,7 @@ export async function emailImport(
       created: Object.values(created).map((c) => c.id),
     });
     ctx.store.bumpState(ctx.account.id, "mailbox");
+    await refreshMailboxCounts(ctx.client, ctx.account, ctx.store, mailboxIdxsOf(Object.values(created).map((c) => c.id))).catch(() => {});
   }
   return {
     accountId: args.accountId,
@@ -1354,7 +1644,7 @@ async function applyEmailImport(
     keywords?: Record<string, boolean>;
     receivedAt?: string;
   },
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<{ id: string; blobId: string; threadId: string; size: number }> {
   if (typeof payload.blobId !== "string" || !payload.blobId.startsWith("U")) {
     // RFC-wise this could be either invalidProperties (malformed reference) or
@@ -1485,7 +1775,7 @@ export async function emailChanges(
 
 export async function emailQueryChanges(
   args: EmailQueryArgs & { sinceQueryState: string; upToId?: string | null },
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<QueryChangesResponse> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const currentNumeric = ctx.store.getState(ctx.account.id, "email");
@@ -1560,7 +1850,7 @@ export interface EmailCopyResponse {
 // has — see applyEmailCreate).
 export async function emailCopy(
   args: EmailCopyArgs,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<EmailCopyResponse> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   if (args.fromAccountId !== args.accountId) {
@@ -1608,6 +1898,11 @@ export async function emailCopy(
       destroyed: args.onSuccessDestroyOriginal ? successfulOriginals : [],
     });
     ctx.store.bumpState(ctx.account.id, "mailbox");
+    const touched = mailboxIdxsOf([
+      ...Object.values(created).map((c) => c.id),
+      ...(args.onSuccessDestroyOriginal ? successfulOriginals : []),
+    ]);
+    await refreshMailboxCounts(ctx.client, ctx.account, ctx.store, touched).catch(() => {});
   }
 
   return {
@@ -1622,7 +1917,7 @@ export async function emailCopy(
 
 async function applyEmailCopy(
   payload: { id: string; mailboxIds: Record<string, boolean>; keywords?: Record<string, boolean> },
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: MailCtx,
 ): Promise<{ id: string; blobId: string; threadId: string; size: number }> {
   const srcParts = decodeEmailIdSafe(payload.id);
   if (srcParts.accountIdx !== ctx.account.id) throw notFound();

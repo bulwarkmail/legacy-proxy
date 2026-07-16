@@ -10,7 +10,6 @@ import { log } from "../util/log.js";
 interface PoolEntry {
   client: ImapFlow;
   lastUsed: number;
-  busy: number;
 }
 
 // Skip the sanity-NOOP if the connection was used within this window.
@@ -20,16 +19,26 @@ interface PoolEntry {
 // seconds, so we only NOOP after a meaningful idle gap.
 const NOOP_FRESHNESS_MS = 30_000;
 
+// Two connections per account, by role:
+//   - "interactive": JMAP method calls (the latency-sensitive path).
+//   - "bulk": blob downloads and thread-index scans — operations that can
+//     hold the socket for seconds. Splitting them keeps a 20 MB attachment
+//     download or a first-time account scan from freezing every other
+//     request for the account, since imapflow serializes commands per
+//     connection.
+export type PoolRole = "interactive" | "bulk";
+
 export class ImapPool {
-  private entries = new Map<number, PoolEntry>();
+  private entries = new Map<string, PoolEntry>();
 
   constructor(
     private cfg: AppConfig,
     private store: Store,
   ) {}
 
-  async getForAccount(account: AccountRow): Promise<ImapFlow> {
-    const existing = this.entries.get(account.id);
+  async getForAccount(account: AccountRow, role: PoolRole = "interactive"): Promise<ImapFlow> {
+    const key = `${account.id}:${role}`;
+    const existing = this.entries.get(key);
     if (existing && existing.client.usable) {
       const idleMs = Date.now() - existing.lastUsed;
       existing.lastUsed = Date.now();
@@ -38,22 +47,40 @@ export class ImapPool {
         await existing.client.noop();
         return existing.client;
       } catch {
-        this.entries.delete(account.id);
+        this.entries.delete(key);
       }
     }
     const provider = resolveProvider(this.cfg, account.kind);
     const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
     const client = await openImap({ provider, creds });
+    this.attach(account, key, client);
+    return client;
+  }
+
+  // Hand a live, already-authenticated connection to the pool. The auth paths
+  // open a probe connection to validate credentials; adopting it saves the
+  // immediately-following JMAP request from paying a second TCP+TLS+LOGIN
+  // handshake. If the slot is already occupied the probe is logged out.
+  adopt(account: AccountRow, client: ImapFlow): void {
+    const key = `${account.id}:interactive`;
+    const existing = this.entries.get(key);
+    if (existing && existing.client.usable) {
+      client.logout().catch(() => {});
+      return;
+    }
+    this.attach(account, key, client);
+  }
+
+  private attach(account: AccountRow, key: string, client: ImapFlow): void {
     client.on("close", () => {
-      log.warn({ account: account.slug }, "imap connection closed");
-      this.entries.delete(account.id);
+      log.warn({ account: account.slug, key }, "imap connection closed");
+      this.entries.delete(key);
     });
     client.on("error", (err: Error) => {
-      log.warn({ account: account.slug, err: err.message }, "imap connection error");
-      this.entries.delete(account.id);
+      log.warn({ account: account.slug, key, err: err.message }, "imap connection error");
+      this.entries.delete(key);
     });
-    this.entries.set(account.id, { client, lastUsed: Date.now(), busy: 0 });
-    return client;
+    this.entries.set(key, { client, lastUsed: Date.now() });
   }
 
   async closeAll(): Promise<void> {
