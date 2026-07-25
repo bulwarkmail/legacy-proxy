@@ -242,7 +242,7 @@ Give each provider a `domains` array to enable step 2:
 
 See `providers.two-servers.example.json` for a full two-provider catalogue.
 If two backends share one email domain, that domain can only map to a single
-provider — use the explicit `/api/login` `provider` field for the exception.
+provider. Use the explicit `/api/login` `provider` field for the exception.
 
 ### Gmail
 
