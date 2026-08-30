@@ -304,6 +304,129 @@ const METHOD_CAPABILITY: Record<string, string> = {
   "PushSubscription/get": "urn:ietf:params:jmap:core",
   "PushSubscription/set": "urn:ietf:params:jmap:core",
 };
+// Methods that only read. A run of these, none of which references an earlier
+// call, can be executed together instead of one after another.
+//
+// RFC 8620 §3.2 has the server process calls in order, and for anything that
+// mutates -- or that reads what a mutation just wrote -- that ordering is
+// load-bearing, so those still run alone and act as barriers. For independent
+// reads the observable result is identical either way, and the win is real:
+// a typical envelope mixes IMAP-backed calls with ones that talk to CardDAV
+// over HTTP or ManageSieve over TCP, and serialising them meant every request
+// paid the sum of three unrelated transports' latency instead of the maximum.
+const PARALLEL_SAFE_METHODS = new Set([
+  "Core/echo",
+  "Quota/get",
+  "Mailbox/get",
+  "Mailbox/query",
+  "Mailbox/queryChanges",
+  "Mailbox/changes",
+  "Email/get",
+  "Email/query",
+  "Email/changes",
+  "Email/queryChanges",
+  "Email/parse",
+  "SearchSnippet/get",
+  "Thread/get",
+  "Thread/changes",
+  "Identity/get",
+  "Identity/changes",
+  "EmailSubmission/get",
+  "EmailSubmission/query",
+  "EmailSubmission/changes",
+  "VacationResponse/get",
+  "VacationResponse/changes",
+  "AddressBook/get",
+  "AddressBook/changes",
+  "ContactCard/get",
+  "ContactCard/query",
+  "ContactCard/changes",
+  "ContactCard/queryChanges",
+  "PushSubscription/get",
+]);
+
+// Ceiling on how many calls from one envelope run at once. The interactive
+// IMAP pool is the real constraint -- fanning out wider than it just parks
+// callers inside the pool -- and it keeps one client from opening a burst of
+// work against a shared server.
+const MAX_PARALLEL_CALLS = 4;
+
+/**
+ * True when a call's arguments carry no dependency on an earlier call in the
+ * same request: no top-level `#` result reference (RFC 8620 §3.7) and no
+ * `#name` creation reference (§5.3) anywhere inside.
+ *
+ * Deliberately conservative -- a literal string that merely starts with "#"
+ * is treated as a reference. Being wrong that way costs a little parallelism;
+ * being wrong the other way would reorder a dependency.
+ */
+export function hasCrossCallReference(args: unknown): boolean {
+  if (typeof args === "string") return args.length > 1 && args.startsWith("#");
+  if (args == null || typeof args !== "object") return false;
+  if (Array.isArray(args)) return args.some(hasCrossCallReference);
+  for (const [k, v] of Object.entries(args as Record<string, unknown>)) {
+    if (k.startsWith("#")) return true;
+    if (hasCrossCallReference(v)) return true;
+  }
+  return false;
+}
+
+function isParallelSafe(call: MethodCall): boolean {
+  const [name, rawArgs] = call;
+  return PARALLEL_SAFE_METHODS.has(name) && !hasCrossCallReference(rawArgs);
+}
+
+interface CallOutcome {
+  name: string;
+  result: unknown;
+  sideResponses: MethodCall[] | null;
+}
+
+/** Run one method call, turning any throw into its JMAP error response. */
+async function runCall(
+  call: MethodCall,
+  prior: Record<string, { name: string; result: unknown }>,
+  createdIds: CreatedIds,
+  using: Set<string>,
+  ctx: Ctx,
+): Promise<CallOutcome> {
+  const [name, rawArgs, callId] = call;
+  const t0 = Date.now();
+  try {
+    const args = resolveArgs(rawArgs, prior, createdIds) as Record<string, unknown>;
+    const handler = TABLE[name];
+    if (!handler) throw unknownMethod(name);
+    const requiredCap = METHOD_CAPABILITY[name];
+    if (requiredCap && !using.has(requiredCap)) {
+      // The capability gate is treated as unknownMethod per RFC 8620 §3.6.1,
+      // not invalidArguments, because the method "doesn't exist" relative
+      // to the negotiated capability set.
+      throw unknownMethod(name);
+    }
+    const result = await handler(args, ctx);
+    const ms = Date.now() - t0;
+    if (ms >= 250) log.info({ method: name, callId, ms }, "jmap method slow");
+
+    // RFC 8621 §7.3: EmailSubmission/set's `onSuccessUpdateEmail` /
+    // `onSuccessDestroyEmail` produce an implicit Email/set response alongside
+    // the primary one. Handlers attach those via a Symbol-keyed side channel
+    // so we don't pollute the on-the-wire result shape.
+    const side = (result as { [SIDE_RESPONSES]?: MethodCall[] } | null)?.[SIDE_RESPONSES];
+    if (side && Array.isArray(side) && side.length > 0) {
+      delete (result as { [SIDE_RESPONSES]?: unknown })[SIDE_RESPONSES];
+      return { name, result, sideResponses: side };
+    }
+    return { name, result, sideResponses: null };
+  } catch (e) {
+    const ms = Date.now() - t0;
+    log.warn({ method: name, callId, ms, err: (e as Error).message }, "jmap method error");
+    const result =
+      e instanceof JmapError
+        ? e.toMethodError()
+        : { type: "serverFail", description: (e as Error).message };
+    return { name: "error", result, sideResponses: null };
+  }
+}
 
 export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<ResponseEnvelope> {
   if (!Array.isArray(env.methodCalls)) throw invalidArguments("methodCalls must be an array");
@@ -320,54 +443,46 @@ export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<Response
     if (typeof v === "string") createdIds.set(k, v);
   }
 
-  for (const call of env.methodCalls) {
-    const [name, rawArgs, callId] = call;
-    let result: unknown;
-    let respName = name;
-    const t0 = Date.now();
-    try {
-      const args = resolveArgs(rawArgs, prior, createdIds) as Record<string, unknown>;
-      const handler = TABLE[name];
-      if (!handler) throw unknownMethod(name);
-      const requiredCap = METHOD_CAPABILITY[name];
-      if (requiredCap && !using.has(requiredCap)) {
-        // The capability gate is treated as unknownMethod per RFC 8620 §3.6.1,
-        // not invalidArguments, because the method "doesn't exist" relative
-        // to the negotiated capability set.
-        throw unknownMethod(name);
-      }
-      result = await handler(args, ctx);
-      harvestCreatedIds(createdIds, name, result);
-      const ms = Date.now() - t0;
-      if (ms >= 250) log.info({ method: name, callId, ms }, "jmap method slow");
-      // RFC 8621 §7.3: EmailSubmission/set's `onSuccessUpdateEmail` /
-      // `onSuccessDestroyEmail` produce an implicit Email/set response
-      // alongside the primary one. Handlers attach those via a Symbol-keyed
-      // side channel so we don't pollute the on-the-wire result shape.
-      const sideResponses = (result as { [SIDE_RESPONSES]?: MethodCall[] } | null)?.[SIDE_RESPONSES];
-      if (sideResponses && Array.isArray(sideResponses) && sideResponses.length > 0) {
-        delete (result as { [SIDE_RESPONSES]?: unknown })[SIDE_RESPONSES];
-        responses.push([name, result as Record<string, unknown>, callId]);
-        prior[callId] = { name, result };
-        for (const side of sideResponses) {
-          // Fill in the parent's call id when the handler left a placeholder.
-          const sideCall: MethodCall = [side[0], side[1], side[2] || callId];
-          responses.push(sideCall);
-        }
-        continue;
-      }
-    } catch (e) {
-      const ms = Date.now() - t0;
-      log.warn({ method: name, callId, ms, err: (e as Error).message }, "jmap method error");
-      respName = "error";
-      if (e instanceof JmapError) {
-        result = e.toMethodError();
-      } else {
-        result = { type: "serverFail", description: (e as Error).message };
-      }
+  const record = (call: MethodCall, outcome: CallOutcome): void => {
+    const callId = call[2];
+    harvestCreatedIds(createdIds, outcome.name, outcome.result);
+    responses.push([outcome.name, outcome.result as Record<string, unknown>, callId]);
+    prior[callId] = { name: outcome.name, result: outcome.result };
+    for (const side of outcome.sideResponses ?? []) {
+      // Fill in the parent's call id when the handler left a placeholder.
+      responses.push([side[0], side[1], side[2] || callId]);
     }
-    responses.push([respName, result as Record<string, unknown>, callId]);
-    prior[callId] = { name: respName, result };
+  };
+
+  const calls = env.methodCalls;
+  let i = 0;
+  while (i < calls.length) {
+    // A run of independent reads goes out together; anything else runs alone
+    // and, by running alone, acts as a barrier for what follows.
+    let end = i;
+    while (
+      end < calls.length &&
+      end - i < MAX_PARALLEL_CALLS &&
+      isParallelSafe(calls[end]!)
+    ) {
+      end++;
+    }
+
+    if (end - i > 1) {
+      const group = calls.slice(i, end);
+      const outcomes = await Promise.all(
+        group.map((call) => runCall(call, prior, createdIds, using, ctx)),
+      );
+      // Responses are appended in the client's original order regardless of
+      // which call finished first.
+      for (let k = 0; k < group.length; k++) record(group[k]!, outcomes[k]!);
+      i = end;
+      continue;
+    }
+
+    const call = calls[i]!;
+    record(call, await runCall(call, prior, createdIds, using, ctx));
+    i++;
   }
 
   const createdIdsOut: Record<string, string> = {};
