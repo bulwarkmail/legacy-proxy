@@ -39,21 +39,77 @@ export interface VCardResource {
   data: string;
 }
 
+// A JMAP client constructs a fresh CardDavClient per method call, and every
+// contacts method starts by walking the discovery chain: .well-known redirects
+// -> DAV root -> current-user-principal -> addressbook-home-set. That is up to
+// four sequential PROPFINDs before any useful work, repeated on AddressBook/get,
+// ContactCard/query and ContactCard/get alike.
+//
+// Both hops are stable for the lifetime of an account, so memoise them per
+// (origin, username) across client instances. The long TTL is a safety valve
+// for a server that gets reconfigured under us, not a correctness mechanism.
+interface DiscoveryEntry {
+  principal?: string;
+  home?: string;
+  at: number;
+}
+const discoveryCache = new Map<string, DiscoveryEntry>();
+const DISCOVERY_TTL_MS = 60 * 60_000;
+
+// The address-book list is a single Depth:1 PROPFIND, but the same JMAP
+// envelope typically asks for it three or four times over. Cache it briefly.
+// Correctness comes from invalidation, not the TTL: every write this client
+// issues drops the entry (a PUT changes the book's ctag, which feeds the JMAP
+// state string), so the re-read the mutating paths do after a change still
+// sees the server's new truth.
+interface BookListEntry {
+  books: AddressBookInfo[];
+  at: number;
+}
+const bookListCache = new Map<string, BookListEntry>();
+const BOOK_LIST_TTL_MS = 15_000;
+
+// HTTP methods that only read. Anything else invalidates the cached book list.
+const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
+
+/**
+ * Drop every memoised discovery result and book list. Production code never
+ * needs this — a given account keeps talking to the same server — but tests
+ * stand up a fresh fake DAV server per case behind the same (origin, user)
+ * identity, so they must clear what the previous case cached.
+ */
+export function resetCardDavCaches(): void {
+  discoveryCache.clear();
+  bookListCache.clear();
+}
+
+function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
+  if (!entry) return null;
+  if (Date.now() - entry.at >= ttl) return null;
+  return entry;
+}
+
 export class CardDavClient {
   private readonly opts: CardDavOpts;
   private readonly origin: string;
   private readonly authHeader: string;
+  /** Cache identity: same server, same user => same discovery + book list. */
+  private readonly cacheKey: string;
 
   constructor(opts: CardDavOpts) {
     this.opts = opts;
     const proto = opts.secure ? "https" : "http";
     this.origin = `${proto}://${opts.host}:${opts.port}`;
     this.authHeader = buildAuth(opts.creds);
+    this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}`;
   }
 
   /** Find the principal URL via /.well-known/carddav (RFC 6764 §6). */
   async discoverPrincipal(): Promise<string> {
     if (this.opts.principalPath) return this.opts.principalPath;
+
+    const cached = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
+    if (cached?.principal) return cached.principal;
 
     const start = this.opts.basePath ?? "/.well-known/carddav";
     // 1. follow redirects from .well-known to the DAV root.
@@ -63,19 +119,33 @@ export class CardDavClient {
     const xml = await this.propfind(root, 0, [
       "DAV:current-user-principal",
     ]);
-    const principal = pickHref(xml, "current-user-principal");
-    if (principal) return principal;
-    return root;
+    const principal = pickHref(xml, "current-user-principal") ?? root;
+    this.rememberDiscovery({ principal });
+    return principal;
   }
 
   /** From the principal URL, locate the addressbook-home-set (slash-terminated). */
   async addressBookHome(): Promise<string> {
+    const cached = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
+    if (cached?.home) return cached.home;
+
     const principal = await this.discoverPrincipal();
     const homeXml = await this.propfind(principal, 0, [
       "urn:ietf:params:xml:ns:carddav addressbook-home-set",
     ]);
-    const home = pickHref(homeXml, "addressbook-home-set") ?? principal;
-    return home.endsWith("/") ? home : home + "/";
+    const found = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    const home = found.endsWith("/") ? found : found + "/";
+    this.rememberDiscovery({ home });
+    return home;
+  }
+
+  private rememberDiscovery(patch: { principal?: string; home?: string }): void {
+    const existing = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
+    discoveryCache.set(this.cacheKey, {
+      principal: patch.principal ?? existing?.principal,
+      home: patch.home ?? existing?.home,
+      at: existing?.at ?? Date.now(),
+    });
   }
 
   /**
@@ -83,6 +153,9 @@ export class CardDavClient {
    * every addressbook collection beneath it.
    */
   async listAddressBooks(): Promise<AddressBookInfo[]> {
+    const cached = freshEntry(bookListCache.get(this.cacheKey), BOOK_LIST_TTL_MS);
+    if (cached) return cached.books;
+
     const home = await this.addressBookHome();
 
     const xml = await this.propfind(home, 1, [
@@ -106,6 +179,7 @@ export class CardDavClient {
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
       });
     }
+    bookListCache.set(this.cacheKey, { books, at: Date.now() });
     return books;
   }
 
@@ -245,6 +319,11 @@ export class CardDavClient {
     headers: Record<string, string> = {},
   ): Promise<Response> {
     const url = absolutise(this.origin, path);
+    // Any write invalidates the cached book list before it is issued: a PUT or
+    // DELETE moves the collection's ctag (and so its JMAP state), and MKCOL /
+    // PROPPATCH change the set itself. Dropping it up front rather than after
+    // means a write that fails midway can't leave a stale list behind.
+    if (!READ_METHODS.has(method.toUpperCase())) bookListCache.delete(this.cacheKey);
     const res = await fetch(url, {
       method,
       headers: { Authorization: this.authHeader, ...headers },

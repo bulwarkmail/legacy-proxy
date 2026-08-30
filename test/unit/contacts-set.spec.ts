@@ -15,6 +15,7 @@ import {
 } from "../../src/jmap/methods/contacts.js";
 import type { AccountRow } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
+import { resetCardDavCaches } from "../../src/carddav/client.js";
 
 // -- fake CardDAV server ------------------------------------------------------
 
@@ -233,6 +234,9 @@ const ALICE = [
 let dav: FakeDav;
 
 beforeEach(() => {
+  // Each case gets a fresh server behind the same origin+user, so the client's
+  // cross-instance discovery/book caches must be cleared with it.
+  resetCardDavCaches();
   dav = new FakeDav();
   vi.stubGlobal(
     "fetch",
@@ -247,6 +251,37 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("CardDAV request caching", () => {
+  it("discovers the principal and home set once across calls", async () => {
+    dav.addBook("default", "Default", [["alice.vcf", ALICE]]);
+
+    await addressBookGet({ accountId: "7", ids: null }, ctx);
+    const discoveryPaths = (p: string) => p === "/" || p === PRINCIPAL;
+    const firstPass = dav.calls.filter((c) => c.method === "PROPFIND" && discoveryPaths(c.path)).length;
+    expect(firstPass).toBeGreaterThan(0);
+
+    // A second contacts call on the same account must not re-walk discovery.
+    await addressBookGet({ accountId: "7", ids: null }, ctx);
+    const secondPass = dav.calls.filter((c) => c.method === "PROPFIND" && discoveryPaths(c.path)).length;
+    expect(secondPass).toBe(firstPass);
+  });
+
+  it("re-lists address books after a write invalidates the cache", async () => {
+    dav.addBook("default", "Default", [["alice.vcf", ALICE]]);
+    const { bookId, cardIds } = await ids();
+    const listsBefore = dav.calls.filter((c) => c.method === "PROPFIND" && c.path === HOME).length;
+
+    // A read served from cache adds no PROPFIND on the home set...
+    await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(dav.calls.filter((c) => c.method === "PROPFIND" && c.path === HOME).length).toBe(listsBefore);
+
+    // ...but a destroy must, so the returned state reflects the new ctag.
+    await contactCardSet({ accountId: "7", destroy: [cardIds[0]!] }, ctx);
+    expect(dav.calls.filter((c) => c.method === "PROPFIND" && c.path === HOME).length).toBeGreaterThan(listsBefore);
+    expect(bookId).toBeTruthy();
+  });
 });
 
 async function ids(): Promise<{ bookId: string; cardIds: string[] }> {
