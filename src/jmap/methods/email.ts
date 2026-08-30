@@ -9,6 +9,7 @@ import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilt
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
 import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
+import { mapWithConcurrency } from "../../util/concurrency.js";
 import { projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
@@ -576,6 +577,11 @@ async function emailQuerySingleMailboxFull(
 // way to honor `receivedAt` ordering without a server-side index. For unfiltered
 // scans on huge accounts a future optimisation would be to do a coarse sort by
 // per-folder UID descending and only fetch the slice.
+// How many folders an account-wide query scans at once. The bulk pool is the
+// real ceiling; going one above it keeps a worker queued so a freed
+// connection is picked up immediately rather than sitting idle.
+const ACCOUNT_SCAN_CONCURRENCY = 3;
+
 async function emailQueryAccountWideFull(
   ctx: MailCtx,
   filter: Filter,
@@ -603,99 +609,124 @@ async function emailQueryAccountWideFull(
     .all(ctx.account.id) as MboxRow[];
   const rowById = new Map(rows.map((r) => [r.id, r] as const));
 
-  const hits: SortableHit[] = [];
-  // Iterate in the same order listMailboxes returns; deterministic for tests.
+  // Each folder is an independent SELECT + SEARCH (+ maybe FETCH). Walking
+  // them one at a time made an account-wide query cost the sum of every
+  // folder's round trips; imapflow serialises commands per socket, so the
+  // only way to overlap them is to give each folder its own connection.
+  // They ride the bulk role -- this is the long scan that role exists for --
+  // and the pool bounds how many actually go out at once.
+  //
+  // Each folder's hits are collected separately and concatenated in
+  // listMailboxes order, so the merge below sees exactly the input it saw
+  // when this ran serially. The result is identical, only sooner.
+  const targets: Array<{ idx: number; row: MboxRow }> = [];
   for (const m of all) {
     const idx = decodeMailboxId(m.id).mailboxIdx;
     if (excludedIdxs.has(idx)) continue;
     // An empty folder can't contribute matches; skip the SELECT + SEARCH
-    // round trips. The count comes from the cached LIST STATUS (≤30s stale,
+    // round trips. The count comes from the cached LIST STATUS (<=30s stale,
     // the same window the search cache already tolerates).
     if (m.totalEmails === 0) continue;
     const row = rowById.get(idx);
     if (!row) continue;
+    targets.push({ idx, row });
+  }
 
-    try {
-      await withMailbox(ctx.client, row.name, async () => {
-        const status =
-          ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
-        const uidvalidity = Number(
-          (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
-        );
-        const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
+  const scanFolder = async (idx: number, row: MboxRow, client: ImapFlow): Promise<SortableHit[]> => {
+    const found: SortableHit[] = [];
+    await withMailbox(client, row.name, async () => {
+      const status =
+        client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
+      const uidvalidity = Number(
+        (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
+      );
+      const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
 
-        const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
-        let uids: number[] | null = null;
-        const cached = searchCache.get(cacheKey);
-        if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
-          uids = cached.uids;
-        }
-        if (!uids) {
-          const searchResult = await ctx.client.search(imapFilter, { uid: true });
-          uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
-          searchCache.set(cacheKey, {
-            uids,
-            modseq,
-            expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
-          });
-          pruneSearchCache();
-        }
-        if (uids.length === 0) return;
+      const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
+      let uids: number[] | null = null;
+      const cached = searchCache.get(cacheKey);
+      if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+        uids = cached.uids;
+      }
+      if (!uids) {
+        const searchResult = await client.search(imapFilter, { uid: true });
+        uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+        searchCache.set(cacheKey, {
+          uids,
+          modseq,
+          expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
+        });
+        pruneSearchCache();
+      }
+      if (uids.length === 0) return;
 
-        // Cross-folder merge needs receivedAt for every hit. Prefer the
-        // cached internaldate (populated by the thread scan and Email/get) —
-        // for warm accounts this drops the FETCH entirely. Sorts on other
-        // properties still need the live envelope/size/flags FETCH.
-        const meta = new Map<
-          number,
-          { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }
-        >();
-        let toFetch = uids;
-        if (!needsFetch) {
-          const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, uidvalidity, uids);
-          toFetch = [];
-          for (const uid of uids) {
-            const row = cachedRows.get(uid);
-            if (row && row.internaldate > 0) meta.set(uid, { receivedAt: row.internaldate });
-            else toFetch.push(uid);
-          }
-        }
-        if (toFetch.length > 0) {
-          const fetched = await fetchSortMetadata(ctx.client, toFetch, needsFetch);
-          for (const [uid, m2] of fetched) meta.set(uid, m2);
-          if (!needsFetch) {
-            // Remember the dates so the next account-wide query is FETCH-free.
-            const upserts: EmailCacheUpsert[] = [];
-            for (const [uid, m2] of fetched) {
-              if (m2.receivedAt) {
-                upserts.push({
-                  accountId: ctx.account.id,
-                  mailboxId: idx,
-                  uidvalidity,
-                  uid,
-                  internaldate: m2.receivedAt,
-                });
-              }
-            }
-            ctx.store.upsertEmailCacheRows(upserts);
-          }
-        }
+      // Cross-folder merge needs receivedAt for every hit. Prefer the
+      // cached internaldate (populated by the thread scan and Email/get) —
+      // for warm accounts this drops the FETCH entirely. Sorts on other
+      // properties still need the live envelope/size/flags FETCH.
+      const meta = new Map<
+        number,
+        { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }
+      >();
+      let toFetch = uids;
+      if (!needsFetch) {
+        const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, uidvalidity, uids);
+        toFetch = [];
         for (const uid of uids) {
-          const m2 = meta.get(uid);
-          hits.push({ mailboxIdx: idx, uidvalidity, uid, ...m2 });
+          const row = cachedRows.get(uid);
+          if (row && row.internaldate > 0) meta.set(uid, { receivedAt: row.internaldate });
+          else toFetch.push(uid);
         }
-      });
+      }
+      if (toFetch.length > 0) {
+        const fetched = await fetchSortMetadata(client, toFetch, needsFetch);
+        for (const [uid, m2] of fetched) meta.set(uid, m2);
+        if (!needsFetch) {
+          // Remember the dates so the next account-wide query is FETCH-free.
+          const upserts: EmailCacheUpsert[] = [];
+          for (const [uid, m2] of fetched) {
+            if (m2.receivedAt) {
+              upserts.push({
+                accountId: ctx.account.id,
+                mailboxId: idx,
+                uidvalidity,
+                uid,
+                internaldate: m2.receivedAt,
+              });
+            }
+          }
+          ctx.store.upsertEmailCacheRows(upserts);
+        }
+      }
+      for (const uid of uids) {
+        const m2 = meta.get(uid);
+        found.push({ mailboxIdx: idx, uidvalidity, uid, ...m2 });
+      }
+    });
+    return found;
+  };
+
+  const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+    try {
+      // Unit-test contexts are built without a pool; fall back to the
+      // request's own connection, which reproduces the old serial walk.
+      if (!ctx.pool) return await scanFolder(t.idx, t.row, ctx.client);
+      return await ctx.pool.withConnection(ctx.account, "bulk", (client) =>
+        scanFolder(t.idx, t.row, client),
+      );
     } catch (e) {
       // A folder can disappear between LIST and SELECT (concurrent mutation),
       // and the DB may carry rows for folders the server no longer reports.
-      // Skip rather than fail the whole query — pinned-mailbox queries still
+      // Skip rather than fail the whole query - pinned-mailbox queries still
       // surface mailbox errors loudly.
       log.warn(
-        { mailbox: row.name, err: (e as Error).message },
+        { mailbox: t.row.name, err: (e as Error).message },
         "account-wide Email/query: skipping mailbox",
       );
+      return [] as SortableHit[];
     }
-  }
+  });
+  const hits: SortableHit[] = perFolder.flat();
 
   const effectiveSort: SortSpec[] = sort.length
     ? sort
