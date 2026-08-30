@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { Transform, pipeline, type Readable } from "node:stream";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import compress from "@fastify/compress";
@@ -152,6 +153,14 @@ app.post("/jmap", async (req, reply) => {
   }
 });
 
+// Blob cache bounds. Parts above the per-blob cap stream straight through
+// without being cached -- they are the ones streaming exists for, and holding
+// one in memory to write it to SQLite would undo that. The total cap keeps the
+// database file bounded; the TTL keeps a deleted message's parts from lingering.
+const BLOB_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const BLOB_CACHE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+const BLOB_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
+
 app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
   "/jmap/download/:accountId/:blobId/:type/:name",
   async (req, reply) => {
@@ -199,6 +208,17 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
       .get(emailParts.mailboxIdx, account.id) as { id: number; name: string } | undefined;
     if (!mbox) return reply.code(404).send({ error: "mailbox gone" });
 
+    // A blobId names an immutable (mailbox, uidvalidity, uid, part) tuple, so
+    // a cached body is always current. Serving it here skips the IMAP round
+    // trip *and* the mailbox lock entirely -- which is what makes re-opening a
+    // message with inline images feel instant.
+    const cachedBlob = store.getCachedBlob(req.params.blobId, account.id);
+    if (cachedBlob) {
+      reply.header("Content-Type", allowedType ?? cachedBlob.ctype ?? "application/octet-stream");
+      reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      return reply.send(cachedBlob.body);
+    }
+
     // Downloads can hold the socket for the duration of a large attachment;
     // the bulk connection keeps them from blocking interactive JMAP calls.
     const client = await pool.getForAccount(account, "bulk");
@@ -230,29 +250,64 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
         return reply.code(404).send({ error: "blob not found" });
       }
 
-      const body = dl.content as import("node:stream").Readable;
-      let drained = false;
-      body.once("end", () => {
-        drained = true;
-      });
-      body.once("close", () => {
-        release();
-        // Closed without ending: the HTTP client hung up while the server was
-        // still writing the literal, so this connection is parked mid-FETCH
-        // and no later command on it would parse. Drop it -- the pool dials a
-        // fresh one on the next request.
-        if (!drained) {
-          body.destroy();
-          client.close();
-        }
-      });
-
       const contentType = parsed.partId
         ? dl.meta?.contentType ?? "application/octet-stream"
         : "message/rfc822";
+
+      const source = dl.content as Readable;
+
+      // Tee through a Transform rather than a "data" listener: attaching one
+      // would switch the source to flowing mode immediately, and the compress
+      // plugin's async onSend hook means fastify does not attach its pipe in
+      // the same tick -- chunks emitted in between would be lost. A Transform
+      // only pulls when the consumer pulls, so nothing can slip past.
+      //
+      // Small parts are collected on the way through and cached; once a part
+      // grows past the cap we drop what we have and let the rest stream by,
+      // which is the case streaming exists for in the first place.
+      let collected: Buffer[] | null = [];
+      let collectedBytes = 0;
+      const tee = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          if (collected) {
+            collectedBytes += chunk.length;
+            if (collectedBytes > BLOB_CACHE_MAX_BYTES) collected = null;
+            else collected.push(chunk);
+          }
+          cb(null, chunk);
+        },
+      });
+
+      pipeline(source, tee, (err) => {
+        release();
+        if (err) {
+          // Either IMAP failed mid-literal or the HTTP client hung up while
+          // the server was still writing one. Either way this connection is
+          // parked mid-FETCH and no later command on it would parse, so drop
+          // it; the pool dials a fresh one on the next request.
+          log.warn({ err: err.message }, "download stream aborted; recycling connection");
+          client.close();
+          return;
+        }
+        if (!collected) return;
+        try {
+          store.putCachedBlob({
+            id: req.params.blobId,
+            accountId: account.id,
+            ctype: contentType,
+            body: Buffer.concat(collected),
+            ttlMs: BLOB_CACHE_TTL_MS,
+          });
+          store.pruneBlobCache(BLOB_CACHE_MAX_TOTAL_BYTES);
+        } catch (cacheErr) {
+          // Caching is best-effort; a failure here must not fail the download.
+          log.warn({ err: (cacheErr as Error).message }, "blob cache write failed");
+        }
+      });
+
       reply.header("Content-Type", allowedType ?? contentType);
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
-      return reply.send(body);
+      return reply.send(tee);
     } catch (e) {
       release();
       log.error({ err: (e as Error).message }, "download error");

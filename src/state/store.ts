@@ -323,6 +323,56 @@ export class Store {
     };
   }
 
+  // -- blob cache ---------------------------------------------------------
+  //
+  // Email-backed blob bodies keyed by their blobId. A blobId encodes
+  // (mailbox, uidvalidity, uid, partId), and IMAP guarantees the bytes behind
+  // that tuple never change, so a hit is always current -- `expires` bounds
+  // disk use, not correctness. Re-opening a message with inline images is the
+  // case this exists for: the same few parts are fetched over and over.
+
+  getCachedBlob(id: string, accountId: number): { ctype: string | null; body: Buffer } | null {
+    const row = this.db
+      .prepare(`SELECT ctype, body FROM blob_cache WHERE id = ? AND account_id = ? AND expires > ?`)
+      .get(id, accountId, Date.now()) as { ctype: string | null; body: Buffer } | undefined;
+    return row ?? null;
+  }
+
+  putCachedBlob(p: {
+    id: string;
+    accountId: number;
+    ctype: string | null;
+    body: Buffer;
+    ttlMs: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO blob_cache(id, account_id, ctype, size, body, expires)
+         VALUES(?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET ctype=excluded.ctype, size=excluded.size,
+                                       body=excluded.body, expires=excluded.expires`,
+      )
+      .run(p.id, p.accountId, p.ctype, p.body.length, p.body, Date.now() + p.ttlMs);
+  }
+
+  /** Drop expired blobs, and the oldest rows once the cache exceeds `maxBytes`. */
+  pruneBlobCache(maxBytes: number): void {
+    this.db.prepare(`DELETE FROM blob_cache WHERE expires <= ?`).run(Date.now());
+    const total = (
+      this.db.prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM blob_cache`).get() as { n: number }
+    ).n;
+    if (total <= maxBytes) return;
+    // Evict soonest-to-expire first; for a fixed TTL that is insertion order.
+    this.db
+      .prepare(
+        `DELETE FROM blob_cache WHERE id IN (
+           SELECT id FROM blob_cache ORDER BY expires ASC
+           LIMIT MAX(1, (SELECT COUNT(*) FROM blob_cache) / 4)
+         )`,
+      )
+      .run();
+  }
+
   putUpload(p: { id: string; accountId: number; ctype: string; body: Buffer }): void {
     this.db
       .prepare(
