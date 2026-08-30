@@ -160,7 +160,6 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     if (req.params.accountId !== String(account.id)) return reply.code(404).send({ error: "not found" });
 
     const { decodeBlobId, decodeEmailId } = await import("./mapping/ids.js");
-    const { withMailbox } = await import("./imap/client.js");
 
     // RFC 8620 §6.2: clients pass a desired Content-Type via the {type} URL
     // template variable. Honor it (after a sanity check) so the test suite's
@@ -203,26 +202,59 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     // Downloads can hold the socket for the duration of a large attachment;
     // the bulk connection keeps them from blocking interactive JMAP calls.
     const client = await pool.getForAccount(account, "bulk");
+
+    // Stream rather than buffer. Collecting the whole part first meant the
+    // client saw no bytes until the entire IMAP transfer finished, so a 20 MB
+    // attachment paid its full download time as time-to-first-byte and its
+    // full size as proxy memory. Piping straight through overlaps the two
+    // transfers and bounds what we hold.
+    //
+    // The mailbox lock therefore has to outlive this handler: it is released
+    // when the body stream closes, not when the route returns.
+    const lock = await client.getMailboxLock(mbox.name);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      lock.release();
+    };
+
     try {
-      const buf = await withMailbox(client, mbox.name, async () => {
-        if (parsed.partId) {
-          const dl = await client.download(`${emailParts.uid}`, parsed.partId, { uid: true });
-          if (!dl) return null;
-          const chunks: Buffer[] = [];
-          for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
-          return { body: Buffer.concat(chunks), contentType: dl.meta?.contentType ?? "application/octet-stream" };
-        }
-        const dl = await client.download(`${emailParts.uid}`, undefined, { uid: true });
-        if (!dl) return null;
-        const chunks: Buffer[] = [];
-        for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
-        return { body: Buffer.concat(chunks), contentType: "message/rfc822" };
+      const dl = await client.download(
+        `${emailParts.uid}`,
+        parsed.partId ?? undefined,
+        { uid: true },
+      );
+      if (!dl) {
+        release();
+        return reply.code(404).send({ error: "blob not found" });
+      }
+
+      const body = dl.content as import("node:stream").Readable;
+      let drained = false;
+      body.once("end", () => {
+        drained = true;
       });
-      if (!buf) return reply.code(404).send({ error: "blob not found" });
-      reply.header("Content-Type", allowedType ?? buf.contentType);
+      body.once("close", () => {
+        release();
+        // Closed without ending: the HTTP client hung up while the server was
+        // still writing the literal, so this connection is parked mid-FETCH
+        // and no later command on it would parse. Drop it -- the pool dials a
+        // fresh one on the next request.
+        if (!drained) {
+          body.destroy();
+          client.close();
+        }
+      });
+
+      const contentType = parsed.partId
+        ? dl.meta?.contentType ?? "application/octet-stream"
+        : "message/rfc822";
+      reply.header("Content-Type", allowedType ?? contentType);
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
-      return reply.send(buf.body);
+      return reply.send(body);
     } catch (e) {
+      release();
       log.error({ err: (e as Error).message }, "download error");
       return reply.code(502).send({ error: "download failed" });
     }
