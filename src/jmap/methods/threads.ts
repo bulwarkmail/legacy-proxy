@@ -189,8 +189,8 @@ export async function buildThreadIndex(
   try {
 
     const all = await listMailboxes(client, ctx.account, ctx.store);
-    const rows = ctx.store.db
-      .prepare(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
+    const rows = ctx.store
+      .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
       .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
     const rowById = new Map(rows.map((r) => [r.id, r] as const));
 

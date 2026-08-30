@@ -1,6 +1,6 @@
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { Database as DB } from "better-sqlite3";
+import type { Database as DB, Statement } from "better-sqlite3";
 
 export interface AccountRow {
   id: number;
@@ -180,9 +180,29 @@ CREATE INDEX IF NOT EXISTS push_sub_account_idx ON push_subscription(account_id)
 export class Store {
   readonly db: DB;
 
+  // better-sqlite3 compiles SQL on every `prepare()`, and the request path
+  // prepares the same handful of mailbox lookups over and over -- once per
+  // Email/get group, once per folder in a refresh loop. Memoise by SQL text so
+  // each statement is compiled once for the life of the process.
+  //
+  // Safe because no call site uses `.iterate()`: a statement may not be
+  // re-entered while an iterator over it is open, but `.get()`, `.all()` and
+  // `.run()` can be reused freely.
+  private stmts = new Map<string, Statement>();
+
   constructor(dataDir: string) {
     this.db = new Database(path.join(dataDir, "proxy.db"));
     this.db.exec(SCHEMA);
+  }
+
+  /** Prepared statement for `sql`, compiled once and cached. */
+  prep(sql: string): Statement {
+    let stmt = this.stmts.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.stmts.set(sql, stmt);
+    }
+    return stmt;
   }
 
   close(): void {
@@ -191,22 +211,22 @@ export class Store {
 
   upsertAccount(p: { slug: string; kind: string; host: string; username: string; vault: Buffer }): AccountRow {
     const now = Date.now();
-    const stmt = this.db.prepare(
+    const stmt = this.prep(
       `INSERT INTO account(slug, kind, host, username, vault, created_at)
        VALUES(?,?,?,?,?,?)
        ON CONFLICT(slug) DO UPDATE SET kind=excluded.kind, host=excluded.host,
          username=excluded.username, vault=excluded.vault`,
     );
     stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now);
-    return this.db.prepare(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
+    return this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
   }
 
   getAccount(slug: string): AccountRow | undefined {
-    return this.db.prepare(`SELECT * FROM account WHERE slug = ?`).get(slug) as AccountRow | undefined;
+    return this.prep(`SELECT * FROM account WHERE slug = ?`).get(slug) as AccountRow | undefined;
   }
 
   getAccountById(id: number): AccountRow | undefined {
-    return this.db.prepare(`SELECT * FROM account WHERE id = ?`).get(id) as AccountRow | undefined;
+    return this.prep(`SELECT * FROM account WHERE id = ?`).get(id) as AccountRow | undefined;
   }
 
   // In-memory change log. Each entry records a single id-level mutation
@@ -263,12 +283,10 @@ export class Store {
   }
 
   bumpState(accountId: number, kind: string): number {
-    const row = this.db
-      .prepare(`SELECT state FROM state_log WHERE account_id = ? AND kind = ?`)
+    const row = this.prep(`SELECT state FROM state_log WHERE account_id = ? AND kind = ?`)
       .get(accountId, kind) as { state: number } | undefined;
     const next = (row?.state ?? 0) + 1;
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO state_log(account_id, kind, state, at) VALUES(?,?,?,?)
          ON CONFLICT(account_id, kind) DO UPDATE SET state = excluded.state, at = excluded.at`,
       )
@@ -287,15 +305,13 @@ export class Store {
   private stateListener?: (accountId: number, kind: string, state: number) => void;
 
   getState(accountId: number, kind: string): number {
-    const row = this.db
-      .prepare(`SELECT state FROM state_log WHERE account_id = ? AND kind = ?`)
+    const row = this.prep(`SELECT state FROM state_log WHERE account_id = ? AND kind = ?`)
       .get(accountId, kind) as { state: number } | undefined;
     return row?.state ?? 0;
   }
 
   getIdentitySettings(accountId: number): IdentitySettings {
-    const row = this.db
-      .prepare(
+    const row = this.prep(
         `SELECT display_name, reply_to, text_signature, html_signature FROM identity_settings WHERE account_id = ?`,
       )
       .get(accountId) as
@@ -332,8 +348,7 @@ export class Store {
   // case this exists for: the same few parts are fetched over and over.
 
   getCachedBlob(id: string, accountId: number): { ctype: string | null; body: Buffer } | null {
-    const row = this.db
-      .prepare(`SELECT ctype, body FROM blob_cache WHERE id = ? AND account_id = ? AND expires > ?`)
+    const row = this.prep(`SELECT ctype, body FROM blob_cache WHERE id = ? AND account_id = ? AND expires > ?`)
       .get(id, accountId, Date.now()) as { ctype: string | null; body: Buffer } | undefined;
     return row ?? null;
   }
@@ -345,8 +360,7 @@ export class Store {
     body: Buffer;
     ttlMs: number;
   }): void {
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO blob_cache(id, account_id, ctype, size, body, expires)
          VALUES(?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET ctype=excluded.ctype, size=excluded.size,
@@ -357,14 +371,13 @@ export class Store {
 
   /** Drop expired blobs, and the oldest rows once the cache exceeds `maxBytes`. */
   pruneBlobCache(maxBytes: number): void {
-    this.db.prepare(`DELETE FROM blob_cache WHERE expires <= ?`).run(Date.now());
+    this.prep(`DELETE FROM blob_cache WHERE expires <= ?`).run(Date.now());
     const total = (
-      this.db.prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM blob_cache`).get() as { n: number }
+      this.prep(`SELECT COALESCE(SUM(size), 0) AS n FROM blob_cache`).get() as { n: number }
     ).n;
     if (total <= maxBytes) return;
     // Evict soonest-to-expire first; for a fixed TTL that is insertion order.
-    this.db
-      .prepare(
+    this.prep(
         `DELETE FROM blob_cache WHERE id IN (
            SELECT id FROM blob_cache ORDER BY expires ASC
            LIMIT MAX(1, (SELECT COUNT(*) FROM blob_cache) / 4)
@@ -374,8 +387,7 @@ export class Store {
   }
 
   putUpload(p: { id: string; accountId: number; ctype: string; body: Buffer }): void {
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO upload(id, account_id, ctype, size, body, created_at)
          VALUES(?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET ctype=excluded.ctype, size=excluded.size, body=excluded.body, created_at=excluded.created_at`,
@@ -384,8 +396,7 @@ export class Store {
   }
 
   getUpload(id: string, accountId: number): { ctype: string; body: Buffer } | null {
-    const row = this.db
-      .prepare(`SELECT ctype, body FROM upload WHERE id = ? AND account_id = ?`)
+    const row = this.prep(`SELECT ctype, body FROM upload WHERE id = ? AND account_id = ?`)
       .get(id, accountId) as { ctype: string; body: Buffer } | undefined;
     return row ?? null;
   }
@@ -395,7 +406,7 @@ export class Store {
   // timer (we don't want a background loop in this process yet).
   pruneUploads(olderThanMs: number): void {
     const cutoff = Date.now() - olderThanMs;
-    this.db.prepare(`DELETE FROM upload WHERE created_at < ?`).run(cutoff);
+    this.prep(`DELETE FROM upload WHERE created_at < ?`).run(cutoff);
   }
 
   // Update the cached path/parent for a mailbox after an IMAP RENAME. The
@@ -403,14 +414,12 @@ export class Store {
   // conflict — it can't tell a rename from a name reuse — so callers that
   // know they renamed must announce it here.
   updateMailboxPath(accountId: number, mailboxId: number, newName: string, newParentId: number | null): void {
-    this.db
-      .prepare(`UPDATE mailbox SET name = ?, parent_id = ? WHERE id = ? AND account_id = ?`)
+    this.prep(`UPDATE mailbox SET name = ?, parent_id = ? WHERE id = ? AND account_id = ?`)
       .run(newName, newParentId, mailboxId, accountId);
   }
 
   putMailboxSortOrder(accountId: number, mailboxId: number, sortOrder: number): void {
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO mailbox_sort_order(account_id, mailbox_id, sort_order)
          VALUES(?,?,?)
          ON CONFLICT(account_id, mailbox_id) DO UPDATE SET sort_order = excluded.sort_order`,
@@ -419,15 +428,13 @@ export class Store {
   }
 
   getMailboxSortOrders(accountId: number): Map<number, number> {
-    const rows = this.db
-      .prepare(`SELECT mailbox_id, sort_order FROM mailbox_sort_order WHERE account_id = ?`)
+    const rows = this.prep(`SELECT mailbox_id, sort_order FROM mailbox_sort_order WHERE account_id = ?`)
       .all(accountId) as { mailbox_id: number; sort_order: number }[];
     return new Map(rows.map((r) => [r.mailbox_id, r.sort_order]));
   }
 
   insertPushSubscription(row: PushSubscriptionRow): void {
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO push_subscription(
            id, account_id, device_client_id, url, types,
            expires, verification_code, verified, created_at, last_push_at
@@ -448,15 +455,13 @@ export class Store {
   }
 
   getPushSubscription(id: string, accountId: number): PushSubscriptionRow | null {
-    const r = this.db
-      .prepare(`SELECT * FROM push_subscription WHERE id = ? AND account_id = ?`)
+    const r = this.prep(`SELECT * FROM push_subscription WHERE id = ? AND account_id = ?`)
       .get(id, accountId) as PushRowRaw | undefined;
     return r ? rowToPushSub(r) : null;
   }
 
   listPushSubscriptions(accountId: number): PushSubscriptionRow[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM push_subscription WHERE account_id = ? ORDER BY created_at`)
+    const rows = this.prep(`SELECT * FROM push_subscription WHERE account_id = ? ORDER BY created_at`)
       .all(accountId) as PushRowRaw[];
     return rows.map(rowToPushSub);
   }
@@ -467,8 +472,7 @@ export class Store {
   // mid-flight without needing an explicit cache invalidation.
   activePushSubscriptions(accountId: number): PushSubscriptionRow[] {
     const now = Date.now();
-    const rows = this.db
-      .prepare(
+    const rows = this.prep(
         `SELECT * FROM push_subscription
          WHERE account_id = ? AND verified = 1
          AND (expires IS NULL OR expires > ?)`,
@@ -482,8 +486,7 @@ export class Store {
   // to recompute who needs a connection held open.
   accountsWithActivePushSubs(): number[] {
     const now = Date.now();
-    const rows = this.db
-      .prepare(
+    const rows = this.prep(
         `SELECT DISTINCT account_id FROM push_subscription
          WHERE verified = 1 AND (expires IS NULL OR expires > ?)`,
       )
@@ -520,15 +523,13 @@ export class Store {
     }
     if (fields.length === 0) return true;
     values.push(id, accountId);
-    const res = this.db
-      .prepare(`UPDATE push_subscription SET ${fields.join(", ")} WHERE id = ? AND account_id = ?`)
+    const res = this.prep(`UPDATE push_subscription SET ${fields.join(", ")} WHERE id = ? AND account_id = ?`)
       .run(...values);
     return res.changes > 0;
   }
 
   destroyPushSubscription(id: string, accountId: number): boolean {
-    const res = this.db
-      .prepare(`DELETE FROM push_subscription WHERE id = ? AND account_id = ?`)
+    const res = this.prep(`DELETE FROM push_subscription WHERE id = ? AND account_id = ?`)
       .run(id, accountId);
     return res.changes > 0;
   }
@@ -538,8 +539,7 @@ export class Store {
   // doesn't grow unboundedly. Active verified subs are untouched.
   pruneStalePushSubscriptions(maxUnverifiedAgeMs: number): void {
     const cutoff = Date.now() - maxUnverifiedAgeMs;
-    this.db
-      .prepare(`DELETE FROM push_subscription WHERE verified = 0 AND created_at < ?`)
+    this.prep(`DELETE FROM push_subscription WHERE verified = 0 AND created_at < ?`)
       .run(cutoff);
   }
 
@@ -557,8 +557,7 @@ export class Store {
     const out = new Map<number, EmailCacheRow>();
     for (let i = 0; i < uids.length; i += Store.IN_CHUNK) {
       const chunk = uids.slice(i, i + Store.IN_CHUNK);
-      const rows = this.db
-        .prepare(
+      const rows = this.prep(
           `SELECT * FROM email_cache
            WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ?
            AND uid IN (${chunk.map(() => "?").join(",")})`,
@@ -574,7 +573,7 @@ export class Store {
   // side has data — incoming value wins when non-null.
   upsertEmailCacheRows(rows: EmailCacheUpsert[]): void {
     if (rows.length === 0) return;
-    const stmt = this.db.prepare(
+    const stmt = this.prep(
       `INSERT INTO email_cache(
          account_id, mailbox_id, uidvalidity, uid, thread_id, internaldate,
          size, envelope, bodystructure, headers_raw, headers_full, preview, created_at
@@ -606,24 +605,20 @@ export class Store {
   }
 
   setEmailCachePreview(accountId: number, mailboxId: number, uid: number, preview: string): void {
-    this.db
-      .prepare(`UPDATE email_cache SET preview = ? WHERE account_id = ? AND mailbox_id = ? AND uid = ?`)
+    this.prep(`UPDATE email_cache SET preview = ? WHERE account_id = ? AND mailbox_id = ? AND uid = ?`)
       .run(preview, accountId, mailboxId, uid);
   }
 
   // uidvalidity rolled: every cached row for the folder is garbage.
   purgeEmailCacheMailbox(accountId: number, mailboxId: number): void {
-    this.db
-      .prepare(`DELETE FROM email_cache WHERE account_id = ? AND mailbox_id = ?`)
+    this.prep(`DELETE FROM email_cache WHERE account_id = ? AND mailbox_id = ?`)
       .run(accountId, mailboxId);
-    this.db
-      .prepare(`DELETE FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
+    this.prep(`DELETE FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
       .run(accountId, mailboxId);
   }
 
   getEmailCacheUids(accountId: number, mailboxId: number): number[] {
-    const rows = this.db
-      .prepare(`SELECT uid FROM email_cache WHERE account_id = ? AND mailbox_id = ?`)
+    const rows = this.prep(`SELECT uid FROM email_cache WHERE account_id = ? AND mailbox_id = ?`)
       .all(accountId, mailboxId) as { uid: number }[];
     return rows.map((r) => r.uid);
   }
@@ -633,8 +628,7 @@ export class Store {
     const txn = this.db.transaction((all: number[]) => {
       for (let i = 0; i < all.length; i += Store.IN_CHUNK) {
         const chunk = all.slice(i, i + Store.IN_CHUNK);
-        this.db
-          .prepare(
+        this.prep(
             `DELETE FROM email_cache WHERE account_id = ? AND mailbox_id = ?
              AND uid IN (${chunk.map(() => "?").join(",")})`,
           )
@@ -647,8 +641,7 @@ export class Store {
   // Everything the thread index needs, account-wide, ordered by receivedAt
   // ascending (the RFC 8621 §3 thread member order).
   getThreadIndexRows(accountId: number): ThreadIndexRow[] {
-    return this.db
-      .prepare(
+    return this.prep(
         `SELECT mailbox_id, uidvalidity, uid, thread_id, internaldate
          FROM email_cache WHERE account_id = ? AND thread_id IS NOT NULL
          ORDER BY internaldate ASC, uid ASC`,
@@ -657,14 +650,12 @@ export class Store {
   }
 
   getMailboxScan(accountId: number, mailboxId: number): MailboxScanRow | undefined {
-    return this.db
-      .prepare(`SELECT * FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
+    return this.prep(`SELECT * FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
       .get(accountId, mailboxId) as MailboxScanRow | undefined;
   }
 
   putMailboxScan(row: MailboxScanRow): void {
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO mailbox_scan(account_id, mailbox_id, uidvalidity, uidnext, messages, scanned_at)
          VALUES(?,?,?,?,?,?)
          ON CONFLICT(account_id, mailbox_id) DO UPDATE SET
@@ -676,8 +667,7 @@ export class Store {
 
   putIdentitySettings(accountId: number, s: IdentitySettings): void {
     const replyJson = s.replyTo ? JSON.stringify(s.replyTo) : null;
-    this.db
-      .prepare(
+    this.prep(
         `INSERT INTO identity_settings(account_id, display_name, reply_to, text_signature, html_signature, updated_at)
          VALUES(?,?,?,?,?,?)
          ON CONFLICT(account_id) DO UPDATE SET

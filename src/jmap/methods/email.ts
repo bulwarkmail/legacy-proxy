@@ -403,8 +403,8 @@ async function postFilterByHasAttachment(
   }
   const keep = new Set<string>();
   for (const [mailboxIdx, gids] of groups) {
-    const row = ctx.store.db
-      .prepare(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
+    const row = ctx.store
+      .prep(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
       .get(mailboxIdx, ctx.account.id) as { id: number; name: string } | undefined;
     if (!row) continue;
     const uidByEid = new Map<number, string>();
@@ -497,8 +497,8 @@ async function emailQuerySingleMailboxFull(
   needsFetch: boolean,
 ): Promise<{ ids: string[]; queryState: string }> {
   const m = decodeMailboxId(inMailbox);
-  const mboxRow = ctx.store.db
-    .prepare(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
+  const mboxRow = ctx.store
+    .prep(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
     .get(m.mailboxIdx, ctx.account.id) as { name: string; uidvalidity: number } | undefined;
   if (!mboxRow) throw invalidArguments("unknown mailbox");
 
@@ -598,8 +598,8 @@ async function emailQueryAccountWideFull(
 
   const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
   type MboxRow = { id: number; name: string; uidvalidity: number };
-  const rows = ctx.store.db
-    .prepare(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
+  const rows = ctx.store
+    .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
     .all(ctx.account.id) as MboxRow[];
   const rowById = new Map(rows.map((r) => [r.id, r] as const));
 
@@ -771,8 +771,8 @@ export async function emailGet(
   }
 
   for (const group of groups.values()) {
-    const mboxRow = ctx.store.db
-      .prepare(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
+    const mboxRow = ctx.store
+      .prep(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
       .get(group.mailboxIdx, ctx.account.id) as
       | { id: number; name: string; uidvalidity: number; highest_modseq: number }
       | undefined;
@@ -977,8 +977,8 @@ function lookupMailboxByIdx(
   accountId: number,
   mailboxIdx: number,
 ): MailboxLookup | null {
-  const row = store.db
-    .prepare(`SELECT id, name, uidvalidity FROM mailbox WHERE id = ? AND account_id = ?`)
+  const row = store
+    .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE id = ? AND account_id = ?`)
     .get(mailboxIdx, accountId) as MailboxLookup | undefined;
   return row ?? null;
 }

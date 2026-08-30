@@ -203,8 +203,8 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     } catch {
       return reply.code(404).send({ error: "blob not found" });
     }
-    const mbox = store.db
-      .prepare(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
+    const mbox = store
+      .prep(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
       .get(emailParts.mailboxIdx, account.id) as { id: number; name: string } | undefined;
     if (!mbox) return reply.code(404).send({ error: "mailbox gone" });
 

@@ -70,7 +70,7 @@ export async function listMailboxes(
   const list = await client.list({ statusQuery: { messages: true, unseen: true } });
   const idByPath = new Map<string, number>();
 
-  const upsert = store.db.prepare(
+  const upsert = store.prep(
     `INSERT INTO mailbox(account_id, name, parent_id, delim, role, special_use,
                          uidvalidity, highest_modseq, total, unread, subscribed, last_seen)
      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
@@ -111,17 +111,17 @@ export async function listMailboxes(
   // calls) — and the duplicate-name guard would then reject legitimate
   // recreations of a name.
   const livePaths = new Set(list.map((it) => it.path));
-  const stale = store.db
-    .prepare(`SELECT id, name FROM mailbox WHERE account_id = ?`)
+  const stale = store
+    .prep(`SELECT id, name FROM mailbox WHERE account_id = ?`)
     .all(account.id) as Array<{ id: number; name: string }>;
-  const delMbox = store.db.prepare(`DELETE FROM mailbox WHERE id = ? AND account_id = ?`);
+  const delMbox = store.prep(`DELETE FROM mailbox WHERE id = ? AND account_id = ?`);
   const delTxn = store.db.transaction((victims: typeof stale) => {
     for (const v of victims) if (!livePaths.has(v.name)) delMbox.run(v.id, account.id);
   });
   delTxn(stale);
 
-  const rows = store.db
-    .prepare(`SELECT * FROM mailbox WHERE account_id = ?`)
+  const rows = store
+    .prep(`SELECT * FROM mailbox WHERE account_id = ?`)
     .all(account.id) as Array<{
     id: number;
     name: string;
@@ -188,12 +188,12 @@ export async function refreshMailboxCounts(
     return;
   }
   try {
-    const updateCounts = store.db.prepare(
+    const updateCounts = store.prep(
       `UPDATE mailbox SET total = ?, unread = ? WHERE id = ? AND account_id = ?`,
     );
     for (const idx of mailboxIdxs) {
-      const row = store.db
-        .prepare(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
+      const row = store
+        .prep(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
         .get(idx, account.id) as { id: number; name: string } | undefined;
       if (!row) continue;
       const st = await client.status(row.name, { messages: true, unseen: true });
@@ -510,8 +510,8 @@ interface MailboxRowLite {
 }
 
 function lookupMailboxRow(store: Store, accountId: number, mailboxIdx: number): MailboxRowLite | null {
-  const row = store.db
-    .prepare(`SELECT id, name, parent_id, delim, role, subscribed FROM mailbox WHERE id = ? AND account_id = ?`)
+  const row = store
+    .prep(`SELECT id, name, parent_id, delim, role, subscribed FROM mailbox WHERE id = ? AND account_id = ?`)
     .get(mailboxIdx, accountId) as MailboxRowLite | undefined;
   return row ?? null;
 }
@@ -542,8 +542,8 @@ async function applyMailboxCreate(
     parentPath = parent.name;
   } else {
     // Use any existing mailbox's delimiter as the personal-namespace separator.
-    const any = ctx.store.db
-      .prepare(`SELECT delim FROM mailbox WHERE account_id = ? LIMIT 1`)
+    const any = ctx.store
+      .prep(`SELECT delim FROM mailbox WHERE account_id = ? LIMIT 1`)
       .get(ctx.account.id) as { delim: string } | undefined;
     if (any?.delim) delim = any.delim;
   }
@@ -552,8 +552,8 @@ async function applyMailboxCreate(
   // RFC 8621 §2.5: reject duplicate (parent, name). The proxy's cache was
   // refreshed at the top of mailboxSet, so a hit here means the name really
   // does exist on the server (no race with an external client).
-  const existing = ctx.store.db
-    .prepare(`SELECT id FROM mailbox WHERE account_id = ? AND name = ?`)
+  const existing = ctx.store
+    .prep(`SELECT id FROM mailbox WHERE account_id = ? AND name = ?`)
     .get(ctx.account.id, fullPath) as { id: number } | undefined;
   if (existing) {
     throw new JmapError("alreadyExists", `mailbox "${fullPath}" already exists`, {
@@ -576,8 +576,8 @@ async function applyMailboxCreate(
   // Repopulate the cache so the new row gets an id we can return.
   invalidateListCache(ctx.account.id);
   const all = await listMailboxes(ctx.client, ctx.account, ctx.store, { force: true });
-  const newRow = ctx.store.db
-    .prepare(`SELECT id FROM mailbox WHERE account_id = ? AND name = ?`)
+  const newRow = ctx.store
+    .prep(`SELECT id FROM mailbox WHERE account_id = ? AND name = ?`)
     .get(ctx.account.id, fullPath) as { id: number } | undefined;
   if (!newRow) {
     throw new JmapError("serverFail", "mailbox created but not visible in LIST");
@@ -699,16 +699,16 @@ async function applyMailboxDestroy(
   if (!row) throw notFound();
   // §2.5: refuse if the mailbox has child mailboxes — `onDestroyRemoveEmails`
   // covers messages, not the descendant tree.
-  const child = ctx.store.db
-    .prepare(`SELECT id FROM mailbox WHERE parent_id = ? LIMIT 1`)
+  const child = ctx.store
+    .prep(`SELECT id FROM mailbox WHERE parent_id = ? LIMIT 1`)
     .get(row.id) as { id: number } | undefined;
   if (child) {
     throw new JmapError("mailboxHasChild", "mailbox has descendant mailboxes");
   }
   if (!removeEmails) {
     // Best-effort emptiness check from the cached counter.
-    const cnt = ctx.store.db
-      .prepare(`SELECT total FROM mailbox WHERE id = ?`)
+    const cnt = ctx.store
+      .prep(`SELECT total FROM mailbox WHERE id = ?`)
       .get(row.id) as { total: number } | undefined;
     if (cnt && cnt.total > 0) {
       throw new JmapError("mailboxHasEmail", "mailbox is not empty");
