@@ -61,8 +61,8 @@ JMAP method coverage:
 | EmailSubmission   | `get`, `query`, `changes`, `set` (with `onSuccessUpdateEmail` / `onSuccessDestroyEmail`) |
 | VacationResponse  | `get`, `set`, `changes` (full body + dates round-tripped through Sieve)  |
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
-| AddressBook       | `get`, `changes` (read-only via CardDAV)                             |
-| ContactCard       | `get`, `query`, `queryChanges`, `changes` (read-only via CardDAV)    |
+| AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
+| ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -97,7 +97,15 @@ Backends:
   per account in a request-path pool (separate from the IDLE socket).
 - ManageSieve (RFC 5804) for the vacation autoresponder.
 - SMTP Submission via nodemailer.
-- CardDAV (RFC 6352) read path for AddressBook and ContactCard.
+- CardDAV (RFC 6352) for AddressBook and ContactCard. Reads are live
+  PROPFIND / `addressbook-multiget`; writes are `PUT` with `If-None-Match: *`
+  (create) or `If-Match` (update), `DELETE`, extended `MKCOL` (RFC 5689) and
+  `PROPPATCH`. Cards are re-serialised as vCard 4.0 on update; properties the
+  JSContact projection doesn't model (PHOTO, IMPP, X-*, …) are carried over
+  untouched.
+  A CardDAV account with no collections at all (a fresh Radicale user, for
+  example) gets a `Contacts` address book created on the first
+  `ContactCard/set`.
 
 Auth and storage:
 
@@ -126,8 +134,16 @@ Sort and filter:
 
 - WebSocket transport (`@fastify/websocket` is in the deps tree but no `/jmap/ws`
   handler is registered, so the capability is not advertised).
-- `ContactCard/set` and `AddressBook/set` return `forbidden`. CardDAV writes
-  (MKCOL / PUT / DELETE) are not wired up.
+- CardDAV cards live in exactly one collection, so `ContactCard/set` rejects
+  `addressBookIds` changes (moving a card between books) with
+  `invalidProperties`. `AddressBook/set` only persists `name` and
+  `description`; `isDefault`, `sortOrder`, `isSubscribed` and `color` have no
+  CardDAV equivalent and are accepted but ignored. No sharing (`shareWith`).
+- The JSContact ⇄ vCard translation covers name, nicknames, emails, phones,
+  organisations, titles, addresses, notes, links, anniversaries, kind and
+  group members. Other JSContact properties sent on create (media,
+  onlineServices, …) are dropped; on update the corresponding vCard lines
+  are preserved as-is.
 - Multi-mailbox membership: an Email lives in exactly one IMAP folder. JMAP
   operations that try to add or remove a mailbox membership treat the move as
   a copy + expunge, which produces a new id rather than preserving the old

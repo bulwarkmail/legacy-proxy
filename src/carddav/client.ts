@@ -1,8 +1,9 @@
 // Minimal CardDAV client (RFC 6352). Implements just what we need to back
 // JMAP for Contacts (RFC 9610): discover the user's address books, list the
-// vCards in each, and fetch them in batches. We do not implement the change
-// feed (sync-collection) yet; address-book state is computed from a content
-// hash of each book's resources.
+// vCards in each, fetch them in batches, and write them back (PUT / DELETE
+// on resources, extended MKCOL / PROPPATCH / DELETE on collections). We do
+// not implement the change feed (sync-collection) yet; address-book state is
+// computed from a content hash of each book's resources.
 //
 // We avoid a heavyweight WebDAV/XML library; the protocol surface we touch
 // is small enough to hand-parse with a regex-based extractor that only looks
@@ -11,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import { log } from "../util/log.js";
 
 export interface CardDavOpts {
   host: string;
@@ -66,16 +68,22 @@ export class CardDavClient {
     return root;
   }
 
-  /**
-   * From a principal URL, locate the addressbook-home-set, then enumerate
-   * every addressbook collection beneath it.
-   */
-  async listAddressBooks(): Promise<AddressBookInfo[]> {
+  /** From the principal URL, locate the addressbook-home-set (slash-terminated). */
+  async addressBookHome(): Promise<string> {
     const principal = await this.discoverPrincipal();
     const homeXml = await this.propfind(principal, 0, [
       "urn:ietf:params:xml:ns:carddav addressbook-home-set",
     ]);
     const home = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    return home.endsWith("/") ? home : home + "/";
+  }
+
+  /**
+   * From a principal URL, locate the addressbook-home-set, then enumerate
+   * every addressbook collection beneath it.
+   */
+  async listAddressBooks(): Promise<AddressBookInfo[]> {
+    const home = await this.addressBookHome();
 
     const xml = await this.propfind(home, 1, [
       "DAV:resourcetype",
@@ -140,7 +148,111 @@ export class CardDavClient {
     return out;
   }
 
+  // -- writes ---------------------------------------------------------------
+
+  /**
+   * Store a vCard. `ifMatch` guards an update against concurrent edits
+   * (RFC 7232 §3.1); without it we send `If-None-Match: *` so a create can
+   * never clobber an existing resource. Returns the new ETag when the server
+   * offers one.
+   */
+  async putResource(
+    href: string,
+    vcard: string,
+    opts: { ifMatch?: string | null } = {},
+  ): Promise<{ etag: string | null }> {
+    const headers: Record<string, string> = { "Content-Type": "text/vcard; charset=utf-8" };
+    if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+    else headers["If-None-Match"] = "*";
+    const res = await this.raw("PUT", href, vcard, headers);
+    if (res.status === 412) throw new CardDavConflict(href);
+    if (!res.ok) throw await httpError("PUT", href, res);
+    return { etag: res.headers.get("etag") };
+  }
+
+  /** Delete a vCard resource (or an address-book collection). Missing is fine. */
+  async deleteResource(href: string, opts: { ifMatch?: string | null } = {}): Promise<void> {
+    const headers: Record<string, string> = {};
+    if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+    const res = await this.raw("DELETE", href, null, headers);
+    if (res.status === 412) throw new CardDavConflict(href);
+    if (!res.ok && res.status !== 404) throw await httpError("DELETE", href, res);
+  }
+
+  /**
+   * Create an address-book collection via extended MKCOL (RFC 5689), which
+   * lets us set the resourcetype and display name in one round trip. Radicale,
+   * Stalwart, Baikal, SOGo and Apple's server all accept this form.
+   */
+  async makeAddressBook(
+    href: string,
+    props: { displayName: string; description?: string | null },
+  ): Promise<void> {
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:mkcol xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">\n` +
+      `  <D:set><D:prop>\n` +
+      `    <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>\n` +
+      `    <D:displayname>${escapeXml(props.displayName)}</D:displayname>\n` +
+      (props.description ? `    <C:addressbook-description>${escapeXml(props.description)}</C:addressbook-description>\n` : "") +
+      `  </D:prop></D:set>\n` +
+      `</D:mkcol>`;
+    const res = await this.raw("MKCOL", href, body, { "Content-Type": "application/xml; charset=utf-8" });
+    if (res.status === 405) throw new CardDavConflict(href); // already exists
+    if (!res.ok) throw await httpError("MKCOL", href, res);
+    // 207 from an extended MKCOL means some property failed to set.
+    if (res.status === 207) {
+      const text = await res.text();
+      if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
+        throw new Error(`CardDAV MKCOL ${href} → property failure: ${text.slice(0, 200)}`);
+      }
+    }
+  }
+
+  /** PROPPATCH displayname / addressbook-description on a collection. */
+  async updateAddressBookProps(
+    href: string,
+    props: { displayName?: string; description?: string | null },
+  ): Promise<void> {
+    const set: string[] = [];
+    const remove: string[] = [];
+    if (props.displayName !== undefined) set.push(`<D:displayname>${escapeXml(props.displayName)}</D:displayname>`);
+    if (props.description !== undefined) {
+      if (props.description) set.push(`<C:addressbook-description>${escapeXml(props.description)}</C:addressbook-description>`);
+      else remove.push(`<C:addressbook-description/>`);
+    }
+    if (set.length === 0 && remove.length === 0) return;
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">\n` +
+      (set.length ? `  <D:set><D:prop>${set.join("")}</D:prop></D:set>\n` : "") +
+      (remove.length ? `  <D:remove><D:prop>${remove.join("")}</D:prop></D:remove>\n` : "") +
+      `</D:propertyupdate>`;
+    const res = await this.raw("PROPPATCH", href, body, { "Content-Type": "application/xml; charset=utf-8" });
+    if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
+    const text = await res.text();
+    if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
+      throw new Error(`CardDAV PROPPATCH ${href} → property failure: ${text.slice(0, 200)}`);
+    }
+  }
+
   // -- low-level ----------------------------------------------------------
+
+  private async raw(
+    method: string,
+    path: string,
+    body: string | null,
+    headers: Record<string, string> = {},
+  ): Promise<Response> {
+    const url = absolutise(this.origin, path);
+    const res = await fetch(url, {
+      method,
+      headers: { Authorization: this.authHeader, ...headers },
+      ...(body === null ? {} : { body }),
+    });
+    log.debug({ method, url, status: res.status }, "carddav request");
+    return res;
+  }
 
   private async followToCollection(path: string): Promise<string> {
     let url = absolutise(this.origin, path);
@@ -151,6 +263,7 @@ export class CardDavClient {
         body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
         redirect: "manual",
       });
+      log.debug({ url, status: res.status }, "carddav discovery probe");
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
@@ -170,8 +283,8 @@ export class CardDavClient {
   private async propfind(path: string, depth: 0 | 1, props: string[]): Promise<string> {
     const ns = collectNamespaces(props);
     const propXml = props.map((p) => {
-      const [nsUri, name] = p.includes(" ") ? p.split(" ") : ["DAV:", p];
-      const prefix = ns.prefix(nsUri!);
+      const [nsUri, name] = splitProp(p);
+      const prefix = ns.prefix(nsUri);
       return `<${prefix}:${name}/>`;
     }).join("");
 
@@ -189,22 +302,26 @@ export class CardDavClient {
     body: string,
     extra: Record<string, string> = {},
   ): Promise<string> {
-    const url = absolutise(this.origin, path);
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: this.authHeader,
-        "Content-Type": "application/xml; charset=utf-8",
-        ...extra,
-      },
-      body,
+    const res = await this.raw(method, path, body, {
+      "Content-Type": "application/xml; charset=utf-8",
+      ...extra,
     });
-    if (!res.ok && res.status !== 207) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
-    }
+    if (!res.ok && res.status !== 207) throw await httpError(method, path, res);
     return await res.text();
   }
+}
+
+/** Thrown on 412 (If-Match / If-None-Match failed) or 405 on MKCOL (exists). */
+export class CardDavConflict extends Error {
+  constructor(readonly href: string) {
+    super(`CardDAV conflict on ${href}`);
+  }
+}
+
+async function httpError(method: string, path: string, res: Response): Promise<Error> {
+  const text = await res.text().catch(() => "");
+  log.warn({ method, path, status: res.status }, "carddav request failed");
+  return new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
 }
 
 // -----------------------------------------------------------------------
@@ -246,6 +363,23 @@ function escapeXml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/**
+ * Property spec → [namespace URI, local name]. Accepts `"<uri> <name>"`,
+ * the shorthand `"DAV:<name>"`, or a bare name (DAV: namespace).
+ *
+ * The shorthand used to be emitted verbatim as `<D:DAV:resourcetype/>` —
+ * malformed XML that lenient servers (Stalwart) ignore by answering allprop,
+ * but strict ones (Radicale) reject outright.
+ */
+export function splitProp(p: string): [string, string] {
+  if (p.includes(" ")) {
+    const idx = p.indexOf(" ");
+    return [p.slice(0, idx), p.slice(idx + 1).trim()];
+  }
+  if (p.startsWith("DAV:")) return ["DAV:", p.slice(4)];
+  return ["DAV:", p];
+}
+
 function collectNamespaces(props: string[]): { prefix(uri: string): string; declarations(): string } {
   const map = new Map<string, string>([
     ["DAV:", "D"],
@@ -253,9 +387,8 @@ function collectNamespaces(props: string[]): { prefix(uri: string): string; decl
     ["http://calendarserver.org/ns/", "CS"],
   ]);
   for (const p of props) {
-    if (!p.includes(" ")) continue;
-    const [uri] = p.split(" ");
-    if (uri && !map.has(uri)) map.set(uri, `n${map.size}`);
+    const [uri] = splitProp(p);
+    if (!map.has(uri)) map.set(uri, `n${map.size}`);
   }
   return {
     prefix: (uri: string) => map.get(uri) ?? "D",

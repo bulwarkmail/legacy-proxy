@@ -10,6 +10,7 @@ import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import { makeSession, signSession, verifySession } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
+import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { openImap } from "./imap/client.js";
@@ -119,16 +120,6 @@ app.get("/jmap/session", async (req, reply) => {
   }
   return buildSession(cfg, account, provider);
 });
-
-// Capabilities advertised on the Session resource. We reject HTTP-level any
-// request that lists a `using` value we don't recognise (RFC 8620 §3.6.1).
-const KNOWN_CAPABILITIES = new Set([
-  "urn:ietf:params:jmap:core",
-  "urn:ietf:params:jmap:mail",
-  "urn:ietf:params:jmap:submission",
-  "urn:ietf:params:jmap:vacationresponse",
-  "urn:bulwark:params:jmap:sieve",
-]);
 
 app.post("/jmap", async (req, reply) => {
   const account = await authn(req);
