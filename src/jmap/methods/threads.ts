@@ -182,85 +182,91 @@ export async function buildThreadIndex(
   }
 
   // Long scans ride the bulk connection so they don't queue behind (or hold
-  // up) interactive method calls sharing the request-path connection.
-  const client = ctx.pool ? await ctx.pool.getForAccount(ctx.account, "bulk") : ctx.client;
+  // up) interactive method calls sharing the request-path connection. The
+  // lease is held for the whole scan and returned however this exits.
+  const lease = ctx.pool ? await ctx.pool.acquire(ctx.account, "bulk") : null;
+  const client = lease ? lease.client : ctx.client;
+  try {
 
-  const all = await listMailboxes(client, ctx.account, ctx.store);
-  const rows = ctx.store.db
-    .prepare(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
-    .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
-  const rowById = new Map(rows.map((r) => [r.id, r] as const));
+    const all = await listMailboxes(client, ctx.account, ctx.store);
+    const rows = ctx.store.db
+      .prepare(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
+      .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
+    const rowById = new Map(rows.map((r) => [r.id, r] as const));
 
-  const flagsByEmail = new Map<string, Set<string>>();
-  for (const m of all) {
-    const mailboxIdx = decodeMailboxId(m.id).mailboxIdx;
-    const row = rowById.get(mailboxIdx);
-    if (!row) continue;
-    // Skip folders that are empty and known-empty: no SELECT round trip. The
-    // mailbox list carries STATUS counts (≤30s stale, same as before).
-    const scan = ctx.store.getMailboxScan(ctx.account.id, mailboxIdx);
-    if (m.totalEmails === 0 && (scan?.messages ?? 0) === 0) continue;
-    try {
-      await withMailbox(client, row.name, async () => {
-        await syncMailboxScan(client, ctx.account, mailboxIdx, ctx.store);
-        if (wantFlags) {
-          const mb = client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
-          const uidvalidity = Number(
-            (mb as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
-          );
-          const exists = Number((mb as { exists?: number } | null)?.exists ?? 0);
-          if (exists > 0) {
-            for await (const msg of client.fetch("1:*", { uid: true, flags: true }, { uid: true })) {
-              if (msg.uid == null) continue;
-              const eid = encodeEmailId({
-                accountIdx: ctx.account.id,
-                mailboxIdx,
-                uidvalidity,
-                uid: msg.uid,
-              });
-              flagsByEmail.set(eid, msg.flags ? new Set(msg.flags) : new Set());
+    const flagsByEmail = new Map<string, Set<string>>();
+    for (const m of all) {
+      const mailboxIdx = decodeMailboxId(m.id).mailboxIdx;
+      const row = rowById.get(mailboxIdx);
+      if (!row) continue;
+      // Skip folders that are empty and known-empty: no SELECT round trip. The
+      // mailbox list carries STATUS counts (≤30s stale, same as before).
+      const scan = ctx.store.getMailboxScan(ctx.account.id, mailboxIdx);
+      if (m.totalEmails === 0 && (scan?.messages ?? 0) === 0) continue;
+      try {
+        await withMailbox(client, row.name, async () => {
+          await syncMailboxScan(client, ctx.account, mailboxIdx, ctx.store);
+          if (wantFlags) {
+            const mb = client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
+            const uidvalidity = Number(
+              (mb as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
+            );
+            const exists = Number((mb as { exists?: number } | null)?.exists ?? 0);
+            if (exists > 0) {
+              for await (const msg of client.fetch("1:*", { uid: true, flags: true }, { uid: true })) {
+                if (msg.uid == null) continue;
+                const eid = encodeEmailId({
+                  accountIdx: ctx.account.id,
+                  mailboxIdx,
+                  uidvalidity,
+                  uid: msg.uid,
+                });
+                flagsByEmail.set(eid, msg.flags ? new Set(msg.flags) : new Set());
+              }
             }
           }
-        }
+        });
+      } catch (e) {
+        // Skip folders we can't open; the index just won't include them.
+        log.warn(
+          { mailbox: row.name, err: (e as Error).message },
+          "thread scan: skipping mailbox",
+        );
+      }
+    }
+
+    const index: ThreadIndex = {
+      members: new Map(),
+      byEmail: new Map(),
+      flagsByEmail,
+    };
+    // Rows come back ordered by internaldate ascending (RFC 8621 §3 order).
+    for (const r of ctx.store.getThreadIndexRows(ctx.account.id)) {
+      const eid = encodeEmailId({
+        accountIdx: ctx.account.id,
+        mailboxIdx: r.mailbox_id,
+        uidvalidity: r.uidvalidity,
+        uid: r.uid,
       });
-    } catch (e) {
-      // Skip folders we can't open; the index just won't include them.
-      log.warn(
-        { mailbox: row.name, err: (e as Error).message },
-        "thread scan: skipping mailbox",
-      );
+      let arr = index.members.get(r.thread_id);
+      if (!arr) {
+        arr = [];
+        index.members.set(r.thread_id, arr);
+      }
+      arr.push(eid);
+      index.byEmail.set(eid, r.thread_id);
     }
-  }
 
-  const index: ThreadIndex = {
-    members: new Map(),
-    byEmail: new Map(),
-    flagsByEmail,
-  };
-  // Rows come back ordered by internaldate ascending (RFC 8621 §3 order).
-  for (const r of ctx.store.getThreadIndexRows(ctx.account.id)) {
-    const eid = encodeEmailId({
-      accountIdx: ctx.account.id,
-      mailboxIdx: r.mailbox_id,
-      uidvalidity: r.uidvalidity,
-      uid: r.uid,
+    indexCache.set(ctx.account.id, {
+      expiresAt: now + INDEX_TTL_MS,
+      emailState: curState,
+      hasFlags: wantFlags,
+      index,
     });
-    let arr = index.members.get(r.thread_id);
-    if (!arr) {
-      arr = [];
-      index.members.set(r.thread_id, arr);
-    }
-    arr.push(eid);
-    index.byEmail.set(eid, r.thread_id);
+    return index;
+  } finally {
+    lease?.release();
   }
-
-  indexCache.set(ctx.account.id, {
-    expiresAt: now + INDEX_TTL_MS,
-    emailState: curState,
-    hasFlags: wantFlags,
-    index,
-  });
-  return index;
 }
 
 export async function threadGet(

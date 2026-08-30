@@ -221,22 +221,25 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
 
     // Downloads can hold the socket for the duration of a large attachment;
     // the bulk connection keeps them from blocking interactive JMAP calls.
-    const client = await pool.getForAccount(account, "bulk");
-
+    //
     // Stream rather than buffer. Collecting the whole part first meant the
     // client saw no bytes until the entire IMAP transfer finished, so a 20 MB
     // attachment paid its full download time as time-to-first-byte and its
     // full size as proxy memory. Piping straight through overlaps the two
     // transfers and bounds what we hold.
     //
-    // The mailbox lock therefore has to outlive this handler: it is released
-    // when the body stream closes, not when the route returns.
+    // Both the pooled connection and the mailbox lock therefore outlive this
+    // handler: they are given back when the body stream ends, not when the
+    // route returns.
+    const lease = await pool.acquire(account, "bulk");
+    const client = lease.client;
     const lock = await client.getMailboxLock(mbox.name);
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
       lock.release();
+      lease.release();
     };
 
     try {

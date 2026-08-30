@@ -171,62 +171,62 @@ export function makeMethodTable(): Record<string, Handler> {
       const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
       return contactCardQueryChanges(a as never, { account: c.account, provider, creds });
     },
-    "Mailbox/get": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return mailboxGet(a as never, { account: c.account, client, store: c.store });
-    },
-    "Mailbox/query": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return mailboxQuery(a as never, { account: c.account, client, store: c.store });
-    },
-    "Mailbox/queryChanges": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return mailboxQueryChanges(a as never, { account: c.account, client, store: c.store });
-    },
+    "Mailbox/get": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        mailboxGet(a as never, { account: c.account, client, store: c.store }),
+      ),
+    "Mailbox/query": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        mailboxQuery(a as never, { account: c.account, client, store: c.store }),
+      ),
+    "Mailbox/queryChanges": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        mailboxQueryChanges(a as never, { account: c.account, client, store: c.store }),
+      ),
     "Mailbox/changes": async (a, c) =>
       mailboxChanges(a as never, { account: c.account, store: c.store }),
-    "Mailbox/set": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return mailboxSet(a as never, { account: c.account, client, store: c.store });
-    },
-    "Email/query": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool });
-    },
-    "Email/get": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailGet(a as never, { account: c.account, client, store: c.store, pool: c.pool });
-    },
-    "Email/set": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool });
-    },
+    "Mailbox/set": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        mailboxSet(a as never, { account: c.account, client, store: c.store }),
+      ),
+    "Email/query": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+      ),
+    "Email/get": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+      ),
+    "Email/set": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+      ),
     "Email/changes": async (a, c) =>
       emailChanges(a as never, { account: c.account, store: c.store }),
-    "Email/queryChanges": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailQueryChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool });
-    },
-    "Email/copy": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailCopy(a as never, { account: c.account, client, store: c.store });
-    },
-    "Email/import": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailImport(a as never, { account: c.account, client, store: c.store });
-    },
+    "Email/queryChanges": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailQueryChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+      ),
+    "Email/copy": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailCopy(a as never, { account: c.account, client, store: c.store }),
+      ),
+    "Email/import": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailImport(a as never, { account: c.account, client, store: c.store }),
+      ),
     "Email/parse": async (a, c) =>
       emailParse(a as never, { account: c.account, store: c.store }),
     "SearchSnippet/get": async (a, c) =>
       searchSnippetGet(a as never, { account: c.account }),
-    "Thread/get": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return threadGet(a as never, { account: c.account, client, store: c.store, pool: c.pool });
-    },
-    "Thread/changes": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return threadChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool });
-    },
+    "Thread/get": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        threadGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+      ),
+    "Thread/changes": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        threadChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+      ),
     "PushSubscription/get": async (a, c) =>
       pushSubscriptionGet(a as never, { account: c.account, store: c.store, dispatcher: c.dispatcher }),
     "PushSubscription/set": async (a, c) =>
@@ -237,15 +237,15 @@ export function makeMethodTable(): Record<string, Handler> {
       emailSubmissionQuery(a as never, { account: c.account, store: c.store }),
     "EmailSubmission/changes": async (a, c) =>
       emailSubmissionChanges(a as never, { account: c.account, store: c.store }),
-    "EmailSubmission/set": async (a, c) => {
-      const client = await c.pool.getForAccount(c.account);
-      return emailSubmissionSet(a as never, {
-        cfg: c.cfg,
-        account: c.account,
-        client,
-        store: c.store,
-      });
-    },
+    "EmailSubmission/set": async (a, c) =>
+      c.pool.withConnection(c.account, "interactive", (client) =>
+        emailSubmissionSet(a as never, {
+          cfg: c.cfg,
+          account: c.account,
+          client,
+          store: c.store,
+        }),
+      ),
     "Identity/get": async (a, c) =>
       identityGet(a as never, { account: c.account, store: c.store }),
     "Identity/set": async (a, c) =>
