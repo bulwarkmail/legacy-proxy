@@ -69,6 +69,42 @@ interface BookListEntry {
 const bookListCache = new Map<string, BookListEntry>();
 const BOOK_LIST_TTL_MS = 15_000;
 
+// Per-collection resource listing (href + etag), same lifetime rules as the
+// book list above. Two callers want it: ContactCard/query, which turns it
+// straight into ids, and multiGet, which uses the etags to decide which cards
+// it already holds.
+interface ResourceListEntry {
+  resources: Array<{ href: string; etag: string | null }>;
+  at: number;
+}
+const resourceListCache = new Map<string, ResourceListEntry>();
+const RESOURCE_LIST_TTL_MS = 15_000;
+
+// vCard bodies keyed by (identity, href, etag). An etag names an exact byte
+// sequence, so an entry can never be wrong for its key -- the only staleness
+// is in the etag we matched it against, which comes from resourceListCache and
+// is therefore bounded by that cache's TTL, not this one's. A contacts app
+// re-reads the whole book on every load, so this drops nearly all the REPORT
+// traffic in steady state.
+//
+// Insertion-ordered Map as a crude LRU: the bound exists to stop an enormous
+// address book from pinning memory, not to manage a working set.
+const vcardCache = new Map<string, string>();
+const VCARD_CACHE_MAX = 5_000;
+
+function rememberVCard(key: string, data: string): void {
+  // Re-insert so a re-read moves the entry to the young end.
+  vcardCache.delete(key);
+  vcardCache.set(key, data);
+  if (vcardCache.size <= VCARD_CACHE_MAX) return;
+  const drop = vcardCache.size - VCARD_CACHE_MAX;
+  let i = 0;
+  for (const k of vcardCache.keys()) {
+    if (i++ >= drop) break;
+    vcardCache.delete(k);
+  }
+}
+
 // HTTP methods that only read. Anything else invalidates the cached book list.
 const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
 
@@ -81,6 +117,8 @@ const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
 export function resetCardDavCaches(): void {
   discoveryCache.clear();
   bookListCache.clear();
+  resourceListCache.clear();
+  vcardCache.clear();
 }
 
 function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
@@ -185,6 +223,10 @@ export class CardDavClient {
 
   /** List the .vcf resources in a single address-book collection. */
   async listResources(bookHref: string): Promise<Array<{ href: string; etag: string | null }>> {
+    const listKey = `${this.cacheKey}|${bookHref}`;
+    const cached = freshEntry(resourceListCache.get(listKey), RESOURCE_LIST_TTL_MS);
+    if (cached) return cached.resources;
+
     const xml = await this.propfind(bookHref, 1, ["DAV:getetag", "DAV:resourcetype"]);
     const responses = splitResponses(xml);
     const out: Array<{ href: string; etag: string | null }> = [];
@@ -194,7 +236,20 @@ export class CardDavClient {
       if (!href) continue;
       out.push({ href, etag: textOf(r, "getetag") });
     }
+    resourceListCache.set(listKey, { resources: out, at: Date.now() });
     return out;
+  }
+
+  /** Current etag for a resource, from the cached listing of its collection. */
+  private knownEtag(bookHref: string, href: string): string | null {
+    const key = `${this.cacheKey}|${bookHref}`;
+    const cached = freshEntry(resourceListCache.get(key), RESOURCE_LIST_TTL_MS);
+    if (!cached) return null;
+    return cached.resources.find((r) => r.href === href)?.etag ?? null;
+  }
+
+  private vcardKey(href: string, etag: string): string {
+    return `${this.cacheKey}|${href}|${etag}`;
   }
 
   /**
@@ -203,21 +258,35 @@ export class CardDavClient {
    */
   async multiGet(bookHref: string, hrefs: string[]): Promise<VCardResource[]> {
     if (hrefs.length === 0) return [];
+
+    // Serve anything whose current etag we know and whose body we already
+    // hold; only the remainder costs a REPORT.
+    const out: VCardResource[] = [];
+    const hrefsToFetch: string[] = [];
+    for (const href of hrefs) {
+      const etag = this.knownEtag(bookHref, href);
+      const hit = etag ? vcardCache.get(this.vcardKey(href, etag)) : undefined;
+      if (etag && hit !== undefined) out.push({ href, etag, data: hit });
+      else hrefsToFetch.push(href);
+    }
+    if (hrefsToFetch.length === 0) return out;
+
     const body =
       `<?xml version="1.0" encoding="utf-8" ?>\n` +
       `<C:addressbook-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">\n` +
       `  <D:prop><D:getetag/><C:address-data/></D:prop>\n` +
-      hrefs.map((h) => `  <D:href>${escapeXml(h)}</D:href>`).join("\n") +
+      hrefsToFetch.map((h) => `  <D:href>${escapeXml(h)}</D:href>`).join("\n") +
       `\n</C:addressbook-multiget>`;
 
     const xml = await this.request("REPORT", bookHref, body, { Depth: "1" });
     const responses = splitResponses(xml);
-    const out: VCardResource[] = [];
     for (const r of responses) {
       const href = extractHref(r);
       const data = textOf(r, "address-data");
       if (!href || !data) continue;
-      out.push({ href, etag: textOf(r, "getetag"), data });
+      const etag = textOf(r, "getetag");
+      if (etag) rememberVCard(this.vcardKey(href, etag), data);
+      out.push({ href, etag, data });
     }
     return out;
   }

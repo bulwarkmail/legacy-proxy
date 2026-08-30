@@ -268,6 +268,38 @@ describe("CardDAV request caching", () => {
     expect(secondPass).toBe(firstPass);
   });
 
+  it("serves unchanged vCards from cache instead of re-issuing REPORTs", async () => {
+    dav.addBook("default", "Default", [["alice.vcf", ALICE]]);
+
+    const first = await contactCardGet({ accountId: "7", ids: null }, ctx);
+    expect(first.list).toHaveLength(1);
+    const reportsAfterFirst = dav.calls.filter((c) => c.method === "REPORT").length;
+    expect(reportsAfterFirst).toBeGreaterThan(0);
+
+    // Same etags => the bodies we already hold are still current.
+    const second = await contactCardGet({ accountId: "7", ids: null }, ctx);
+    expect(second.list).toEqual(first.list);
+    expect(dav.calls.filter((c) => c.method === "REPORT").length).toBe(reportsAfterFirst);
+  });
+
+  it("re-fetches a vCard once its etag moves", async () => {
+    const href = dav.addBook("default", "Default", [["alice.vcf", ALICE]]);
+    const { cardIds } = await ids();
+    const reportsBefore = dav.calls.filter((c) => c.method === "REPORT").length;
+
+    // Rewrite the card server-side, giving it a new etag, and drop the
+    // listing cache the way a write through this proxy would.
+    const book = dav.books.get(href)!;
+    const res = book.resources.get(href + "alice.vcf")!;
+    res.data = res.data.replace("Alice Example", "Alice Renamed");
+    res.etag = dav.nextEtag();
+    resetCardDavCaches();
+
+    const after = await contactCardGet({ accountId: "7", ids: cardIds }, ctx);
+    expect(dav.calls.filter((c) => c.method === "REPORT").length).toBeGreaterThan(reportsBefore);
+    expect(JSON.stringify(after.list)).toContain("Alice Renamed");
+  });
+
   it("re-lists address books after a write invalidates the cache", async () => {
     dav.addBook("default", "Default", [["alice.vcf", ALICE]]);
     const { bookId, cardIds } = await ids();
