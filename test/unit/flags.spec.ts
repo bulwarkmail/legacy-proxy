@@ -17,9 +17,15 @@ describe("flags ↔ keywords", () => {
     expect(keywordToFlag("mylabel")).toBe("mylabel");
     expect(keywordToFlag("$label:pink")).toBe("$label:pink");
   });
-  it("rejects unsafe custom keywords", () => {
-    expect(() => keywordToFlag("bad space")).toThrow();
-    expect(() => keywordToFlag("bad/slash")).toThrow();
+  it("accepts every atom character, the slash of nested tags included", () => {
+    expect(keywordToFlag("$label:red")).toBe("$label:red");
+    expect(keywordToFlag("project/2026")).toBe("project/2026");
+  });
+  it("rejects what neither an IMAP atom nor a JMAP keyword may contain", () => {
+    for (const bad of ["bad space", "bad*star", 'bad"quote', "bad(paren", "bad]bracket", "bad%percent", "\\Seen", "tab\there", "accentué", ""]) {
+      expect(() => keywordToFlag(bad), bad).toThrow();
+    }
+    expect(() => keywordToFlag("x".repeat(256))).toThrow();
   });
   it("roundtrips a flag set", () => {
     const flags = ["\\Seen", "\\Flagged", "MyLabel"];
