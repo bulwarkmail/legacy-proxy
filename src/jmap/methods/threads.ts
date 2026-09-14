@@ -15,6 +15,7 @@ import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids
 import { decodeEmailState, encodeEmailState } from "../../state/states.js";
 import { accountNotFound, cannotCalculateChanges } from "../errors.js";
 import { withMailbox } from "../../imap/client.js";
+import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes } from "./mailbox.js";
 import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
 import { THREAD_HEADER_FIELDS } from "../../imap/fetcher.js";
@@ -128,10 +129,10 @@ async function syncMailboxScan(
     const gaps = [...live].filter((uid) => !cachedSet.has(uid));
     if (gaps.length > 0) {
       const upserts: EmailCacheUpsert[] = [];
-      for await (const msg of client.fetch(
+      for await (const msg of fetchByUid(
+        client,
         gaps,
         { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
-        { uid: true },
       )) {
         if (msg.uid == null) continue;
         const hb =

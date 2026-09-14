@@ -5,6 +5,7 @@ import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMail
 import { encodeEmailState } from "../../state/states.js";
 import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
+import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
 import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
@@ -348,7 +349,8 @@ function compareHits(a: SortableHit, b: SortableHit, sort: SortSpec[]): number {
 }
 
 // Enrich UIDs with whatever metadata the requested sort needs. Non-receivedAt
-// sorts FETCH envelope/size/flags from IMAP — one batched FETCH per mailbox.
+// sorts FETCH envelope/size/flags from IMAP — batched per mailbox, split into
+// bounded UID sets so huge folders don't overflow the server's line limit.
 async function fetchSortMetadata(
   client: ImapFlow,
   uids: number[],
@@ -359,9 +361,7 @@ async function fetchSortMetadata(
   const query = needsFetch
     ? { uid: true, internalDate: true, size: true, envelope: true, flags: true }
     : { uid: true, internalDate: true };
-  // Pass the array, not a joined string: imapflow compresses number[] into
-  // range syntax (1:5000), keeping the command line bounded on huge folders.
-  for await (const msg of client.fetch(uids, query, { uid: true })) {
+  for await (const msg of fetchByUid(client, uids, query)) {
     const uid = Number(msg.uid);
     out.set(uid, {
       receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
@@ -440,7 +440,7 @@ async function postFilterByHasAttachment(
     try {
       await withMailbox(ctx.client, row.name, async () => {
         const upserts: EmailCacheUpsert[] = [];
-        for await (const msg of ctx.client.fetch(missingUids, { uid: true, bodyStructure: true }, { uid: true })) {
+        for await (const msg of fetchByUid(ctx.client, missingUids, { uid: true, bodyStructure: true })) {
           const uid = Number(msg.uid);
           const eid = uidByEid.get(uid);
           if (!eid) continue;

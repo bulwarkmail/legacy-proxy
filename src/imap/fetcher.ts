@@ -7,6 +7,7 @@ import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mappi
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
 import { parseHeaderBlock, asMessageIds, computeThreadIdFromHeaders, type ParsedHeader } from "./headers.js";
+import { fetchByUid } from "./uids.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
 
 // The header fields threading and the default Email/get property set need:
@@ -313,10 +314,10 @@ async function fetchBodyValuesBatched(
     const byUid = new Map(g.members.map((m) => [m.uid, m]));
     const rawByUid = new Map<number, Map<string, Buffer>>();
     try {
-      for await (const msg of client.fetch(
+      for await (const msg of fetchByUid(
+        client,
         g.members.map((m) => m.uid),
         { uid: true, bodyParts: g.partIds },
-        { uid: true },
       )) {
         if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
       }
@@ -391,10 +392,10 @@ async function fetchPreviewsBatched(
   for (const [partId, group] of byPartId) {
     const taskByUid = new Map(group.map((t) => [t.uid, t]));
     try {
-      for await (const m of client.fetch(
+      for await (const m of fetchByUid(
+        client,
         group.map((t) => t.uid),
         { uid: true, bodyParts: [{ key: partId, start: 0, maxLength: PREVIEW_FETCH_BYTES }] },
-        { uid: true },
       )) {
         if (m.uid == null) continue;
         const buf = m.bodyParts?.get(partId);
@@ -464,7 +465,7 @@ export async function fetchEmailsBatch(
   }
 
   if (missing.length > 0) {
-    for await (const m of client.fetch(missing, metaQuery(needsFull), { uid: true })) {
+    for await (const m of fetchByUid(client, missing, metaQuery(needsFull))) {
       if (m.uid == null) continue;
       raws.set(m.uid, rawFromFetch(m, needsFull));
     }
@@ -473,7 +474,7 @@ export async function fetchEmailsBatch(
   // Flags for cache-served messages: one flags-only FETCH for the whole set.
   const flagUids = uids.filter((uid) => raws.get(uid)?.flags === null);
   if (flagUids.length > 0) {
-    for await (const m of client.fetch(flagUids, { uid: true, flags: true }, { uid: true })) {
+    for await (const m of fetchByUid(client, flagUids, { uid: true, flags: true })) {
       if (m.uid == null) continue;
       const r = raws.get(m.uid);
       if (r) r.flags = new Set(m.flags ?? []);
