@@ -1,0 +1,18 @@
+{
+  "mailbox-org": {
+    "domains": ["mailbox.org"],
+    "imap":    { "host": "imap.mailbox.org",  "port": 993,  "secure": true },
+    "smtp":    { "host": "smtp.mailbox.org",  "port": 465,  "secure": true },
+    "sieve":   { "host": "imap.mailbox.org",  "port": 4190, "starttls": true },
+    "carddav": { "host": "dav.mailbox.org",   "port": 443,  "secure": true, "basePath": "/.well-known/carddav" },
+    "auth":    { "mech": ["PLAIN", "LOGIN"] }
+  },
+  "posteo": {
+    "domains": ["posteo.de", "posteo.net"],
+    "imap":    { "host": "posteo.de",         "port": 993,  "secure": true },
+    "smtp":    { "host": "posteo.de",          "port": 465,  "secure": true },
+    "sieve":   { "host": "posteo.de",          "port": 4190, "starttls": true },
+    "carddav": { "host": "posteo.de:8443",     "port": 8443, "secure": true, "basePath": "/", "principalPath": "/principals/" },
+    "auth":    { "mech": ["PLAIN", "LOGIN"] }
+  }
+}

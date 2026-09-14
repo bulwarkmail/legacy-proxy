@@ -1,14 +1,17 @@
 import crypto from "node:crypto";
+import { Transform, pipeline, type Readable } from "node:stream";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import compress from "@fastify/compress";
 import { loadConfig } from "./util/config.js";
 import { log } from "./util/log.js";
 import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
-import { resolveProvider } from "./auth/providers.js";
+import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import { makeSession, signSession, verifySession } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
+import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { openImap } from "./imap/client.js";
@@ -48,6 +51,10 @@ const app = Fastify({
 });
 
 await app.register(cors, { origin: true });
+// JMAP responses with bodyValues are large, highly compressible JSON —
+// hundreds of KB shrink to tens. The SSE route is unaffected: it writes to
+// reply.raw directly, bypassing the onSend hook this plugin uses.
+await app.register(compress, { global: true, threshold: 1024 });
 
 app.get("/healthz", async () => ({ ok: true }));
 
@@ -61,7 +68,7 @@ app.post("/api/login", async (req, reply) => {
   };
   if (!body?.username) return reply.code(400).send({ error: "username required" });
 
-  const providerName = body.provider ?? cfg.defaultProvider;
+  const providerName = resolveProviderName(cfg, { explicit: body.provider, username: body.username });
   const provider = resolveProvider(cfg, providerName);
   const creds: Credentials = {
     mech: body.mech ?? (body.accessToken ? "XOAUTH2" : "PLAIN"),
@@ -71,9 +78,9 @@ app.post("/api/login", async (req, reply) => {
   };
 
   // verify by opening an IMAP session once
+  let probe;
   try {
-    const probe = await openImap({ provider, creds });
-    await probe.logout();
+    probe = await openImap({ provider, creds });
   } catch (e) {
     return reply.code(401).send({ error: "auth failed", detail: (e as Error).message });
   }
@@ -87,6 +94,9 @@ app.post("/api/login", async (req, reply) => {
     username: body.username,
     vault,
   });
+  // Reuse the probe as the account's pooled connection instead of logging out
+  // and paying a second TCP+TLS+LOGIN when the client's first JMAP call lands.
+  pool.adopt(account, probe);
   const token = signSession(cfg.sessionHmacKey, makeSession({ accountSlug: slug, username: body.username }));
   return { token, accountId: String(account.id), apiUrl: `${cfg.publicUrl}/jmap` };
 });
@@ -111,16 +121,6 @@ app.get("/jmap/session", async (req, reply) => {
   }
   return buildSession(cfg, account, provider);
 });
-
-// Capabilities advertised on the Session resource. We reject HTTP-level any
-// request that lists a `using` value we don't recognise (RFC 8620 §3.6.1).
-const KNOWN_CAPABILITIES = new Set([
-  "urn:ietf:params:jmap:core",
-  "urn:ietf:params:jmap:mail",
-  "urn:ietf:params:jmap:submission",
-  "urn:ietf:params:jmap:vacationresponse",
-  "urn:bulwark:params:jmap:sieve",
-]);
 
 app.post("/jmap", async (req, reply) => {
   const account = await authn(req);
@@ -153,6 +153,14 @@ app.post("/jmap", async (req, reply) => {
   }
 });
 
+// Blob cache bounds. Parts above the per-blob cap stream straight through
+// without being cached -- they are the ones streaming exists for, and holding
+// one in memory to write it to SQLite would undo that. The total cap keeps the
+// database file bounded; the TTL keeps a deleted message's parts from lingering.
+const BLOB_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const BLOB_CACHE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+const BLOB_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
+
 app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
   "/jmap/download/:accountId/:blobId/:type/:name",
   async (req, reply) => {
@@ -161,7 +169,6 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     if (req.params.accountId !== String(account.id)) return reply.code(404).send({ error: "not found" });
 
     const { decodeBlobId, decodeEmailId } = await import("./mapping/ids.js");
-    const { withMailbox } = await import("./imap/client.js");
 
     // RFC 8620 §6.2: clients pass a desired Content-Type via the {type} URL
     // template variable. Honor it (after a sanity check) so the test suite's
@@ -196,32 +203,116 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     } catch {
       return reply.code(404).send({ error: "blob not found" });
     }
-    const mbox = store.db
-      .prepare(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
+    const mbox = store
+      .prep(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
       .get(emailParts.mailboxIdx, account.id) as { id: number; name: string } | undefined;
     if (!mbox) return reply.code(404).send({ error: "mailbox gone" });
 
-    const client = await pool.getForAccount(account);
-    try {
-      const buf = await withMailbox(client, mbox.name, async () => {
-        if (parsed.partId) {
-          const dl = await client.download(`${emailParts.uid}`, parsed.partId, { uid: true });
-          if (!dl) return null;
-          const chunks: Buffer[] = [];
-          for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
-          return { body: Buffer.concat(chunks), contentType: dl.meta?.contentType ?? "application/octet-stream" };
-        }
-        const dl = await client.download(`${emailParts.uid}`, undefined, { uid: true });
-        if (!dl) return null;
-        const chunks: Buffer[] = [];
-        for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
-        return { body: Buffer.concat(chunks), contentType: "message/rfc822" };
-      });
-      if (!buf) return reply.code(404).send({ error: "blob not found" });
-      reply.header("Content-Type", allowedType ?? buf.contentType);
+    // A blobId names an immutable (mailbox, uidvalidity, uid, part) tuple, so
+    // a cached body is always current. Serving it here skips the IMAP round
+    // trip *and* the mailbox lock entirely -- which is what makes re-opening a
+    // message with inline images feel instant.
+    const cachedBlob = store.getCachedBlob(req.params.blobId, account.id);
+    if (cachedBlob) {
+      reply.header("Content-Type", allowedType ?? cachedBlob.ctype ?? "application/octet-stream");
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
-      return reply.send(buf.body);
+      return reply.send(cachedBlob.body);
+    }
+
+    // Downloads can hold the socket for the duration of a large attachment;
+    // the bulk connection keeps them from blocking interactive JMAP calls.
+    //
+    // Stream rather than buffer. Collecting the whole part first meant the
+    // client saw no bytes until the entire IMAP transfer finished, so a 20 MB
+    // attachment paid its full download time as time-to-first-byte and its
+    // full size as proxy memory. Piping straight through overlaps the two
+    // transfers and bounds what we hold.
+    //
+    // Both the pooled connection and the mailbox lock therefore outlive this
+    // handler: they are given back when the body stream ends, not when the
+    // route returns.
+    const lease = await pool.acquire(account, "bulk");
+    const client = lease.client;
+    const lock = await client.getMailboxLock(mbox.name);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      lock.release();
+      lease.release();
+    };
+
+    try {
+      const dl = await client.download(
+        `${emailParts.uid}`,
+        parsed.partId ?? undefined,
+        { uid: true },
+      );
+      if (!dl) {
+        release();
+        return reply.code(404).send({ error: "blob not found" });
+      }
+
+      const contentType = parsed.partId
+        ? dl.meta?.contentType ?? "application/octet-stream"
+        : "message/rfc822";
+
+      const source = dl.content as Readable;
+
+      // Tee through a Transform rather than a "data" listener: attaching one
+      // would switch the source to flowing mode immediately, and the compress
+      // plugin's async onSend hook means fastify does not attach its pipe in
+      // the same tick -- chunks emitted in between would be lost. A Transform
+      // only pulls when the consumer pulls, so nothing can slip past.
+      //
+      // Small parts are collected on the way through and cached; once a part
+      // grows past the cap we drop what we have and let the rest stream by,
+      // which is the case streaming exists for in the first place.
+      let collected: Buffer[] | null = [];
+      let collectedBytes = 0;
+      const tee = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          if (collected) {
+            collectedBytes += chunk.length;
+            if (collectedBytes > BLOB_CACHE_MAX_BYTES) collected = null;
+            else collected.push(chunk);
+          }
+          cb(null, chunk);
+        },
+      });
+
+      pipeline(source, tee, (err) => {
+        release();
+        if (err) {
+          // Either IMAP failed mid-literal or the HTTP client hung up while
+          // the server was still writing one. Either way this connection is
+          // parked mid-FETCH and no later command on it would parse, so drop
+          // it; the pool dials a fresh one on the next request.
+          log.warn({ err: err.message }, "download stream aborted; recycling connection");
+          client.close();
+          return;
+        }
+        if (!collected) return;
+        try {
+          store.putCachedBlob({
+            id: req.params.blobId,
+            accountId: account.id,
+            ctype: contentType,
+            body: Buffer.concat(collected),
+            ttlMs: BLOB_CACHE_TTL_MS,
+          });
+          store.pruneBlobCache(BLOB_CACHE_MAX_TOTAL_BYTES);
+        } catch (cacheErr) {
+          // Caching is best-effort; a failure here must not fail the download.
+          log.warn({ err: (cacheErr as Error).message }, "blob cache write failed");
+        }
+      });
+
+      reply.header("Content-Type", allowedType ?? contentType);
+      reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      return reply.send(tee);
     } catch (e) {
+      release();
       log.error({ err: (e as Error).message }, "download error");
       return reply.code(502).send({ error: "download failed" });
     }
@@ -329,13 +420,13 @@ async function authn(req: {
     const username = decoded.slice(0, colon);
     const password = decoded.slice(colon + 1);
 
-    const providerName = cfg.defaultProvider;
+    const providerName = resolveProviderName(cfg, { username });
     const provider = resolveProvider(cfg, providerName);
     const creds: Credentials = { mech: "PLAIN", username, password };
 
+    let probe;
     try {
-      const probe = await openImap({ provider, creds });
-      await probe.logout();
+      probe = await openImap({ provider, creds });
     } catch (e) {
       log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
       return null;
@@ -348,6 +439,9 @@ async function authn(req: {
       username,
       vault,
     });
+    // Keep the validated connection: the JMAP request this auth is for will
+    // need one immediately.
+    pool.adopt(account, probe);
     basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
     return account;
   }

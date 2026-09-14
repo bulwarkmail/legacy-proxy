@@ -1,8 +1,9 @@
 // Minimal CardDAV client (RFC 6352). Implements just what we need to back
 // JMAP for Contacts (RFC 9610): discover the user's address books, list the
-// vCards in each, and fetch them in batches. We do not implement the change
-// feed (sync-collection) yet; address-book state is computed from a content
-// hash of each book's resources.
+// vCards in each, fetch them in batches, and write them back (PUT / DELETE
+// on resources, extended MKCOL / PROPPATCH / DELETE on collections). We do
+// not implement the change feed (sync-collection) yet; address-book state is
+// computed from a content hash of each book's resources.
 //
 // We avoid a heavyweight WebDAV/XML library; the protocol surface we touch
 // is small enough to hand-parse with a regex-based extractor that only looks
@@ -11,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import { log } from "../util/log.js";
 
 export interface CardDavOpts {
   host: string;
@@ -37,21 +39,115 @@ export interface VCardResource {
   data: string;
 }
 
+// A JMAP client constructs a fresh CardDavClient per method call, and every
+// contacts method starts by walking the discovery chain: .well-known redirects
+// -> DAV root -> current-user-principal -> addressbook-home-set. That is up to
+// four sequential PROPFINDs before any useful work, repeated on AddressBook/get,
+// ContactCard/query and ContactCard/get alike.
+//
+// Both hops are stable for the lifetime of an account, so memoise them per
+// (origin, username) across client instances. The long TTL is a safety valve
+// for a server that gets reconfigured under us, not a correctness mechanism.
+interface DiscoveryEntry {
+  principal?: string;
+  home?: string;
+  at: number;
+}
+const discoveryCache = new Map<string, DiscoveryEntry>();
+const DISCOVERY_TTL_MS = 60 * 60_000;
+
+// The address-book list is a single Depth:1 PROPFIND, but the same JMAP
+// envelope typically asks for it three or four times over. Cache it briefly.
+// Correctness comes from invalidation, not the TTL: every write this client
+// issues drops the entry (a PUT changes the book's ctag, which feeds the JMAP
+// state string), so the re-read the mutating paths do after a change still
+// sees the server's new truth.
+interface BookListEntry {
+  books: AddressBookInfo[];
+  at: number;
+}
+const bookListCache = new Map<string, BookListEntry>();
+const BOOK_LIST_TTL_MS = 15_000;
+
+// Per-collection resource listing (href + etag), same lifetime rules as the
+// book list above. Two callers want it: ContactCard/query, which turns it
+// straight into ids, and multiGet, which uses the etags to decide which cards
+// it already holds.
+interface ResourceListEntry {
+  resources: Array<{ href: string; etag: string | null }>;
+  at: number;
+}
+const resourceListCache = new Map<string, ResourceListEntry>();
+const RESOURCE_LIST_TTL_MS = 15_000;
+
+// vCard bodies keyed by (identity, href, etag). An etag names an exact byte
+// sequence, so an entry can never be wrong for its key -- the only staleness
+// is in the etag we matched it against, which comes from resourceListCache and
+// is therefore bounded by that cache's TTL, not this one's. A contacts app
+// re-reads the whole book on every load, so this drops nearly all the REPORT
+// traffic in steady state.
+//
+// Insertion-ordered Map as a crude LRU: the bound exists to stop an enormous
+// address book from pinning memory, not to manage a working set.
+const vcardCache = new Map<string, string>();
+const VCARD_CACHE_MAX = 5_000;
+
+function rememberVCard(key: string, data: string): void {
+  // Re-insert so a re-read moves the entry to the young end.
+  vcardCache.delete(key);
+  vcardCache.set(key, data);
+  if (vcardCache.size <= VCARD_CACHE_MAX) return;
+  const drop = vcardCache.size - VCARD_CACHE_MAX;
+  let i = 0;
+  for (const k of vcardCache.keys()) {
+    if (i++ >= drop) break;
+    vcardCache.delete(k);
+  }
+}
+
+// HTTP methods that only read. Anything else invalidates the cached book list.
+const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
+
+/**
+ * Drop every memoised discovery result and book list. Production code never
+ * needs this — a given account keeps talking to the same server — but tests
+ * stand up a fresh fake DAV server per case behind the same (origin, user)
+ * identity, so they must clear what the previous case cached.
+ */
+export function resetCardDavCaches(): void {
+  discoveryCache.clear();
+  bookListCache.clear();
+  resourceListCache.clear();
+  vcardCache.clear();
+}
+
+function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
+  if (!entry) return null;
+  if (Date.now() - entry.at >= ttl) return null;
+  return entry;
+}
+
 export class CardDavClient {
   private readonly opts: CardDavOpts;
   private readonly origin: string;
   private readonly authHeader: string;
+  /** Cache identity: same server, same user => same discovery + book list. */
+  private readonly cacheKey: string;
 
   constructor(opts: CardDavOpts) {
     this.opts = opts;
     const proto = opts.secure ? "https" : "http";
     this.origin = `${proto}://${opts.host}:${opts.port}`;
     this.authHeader = buildAuth(opts.creds);
+    this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}`;
   }
 
   /** Find the principal URL via /.well-known/carddav (RFC 6764 §6). */
   async discoverPrincipal(): Promise<string> {
     if (this.opts.principalPath) return this.opts.principalPath;
+
+    const cached = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
+    if (cached?.principal) return cached.principal;
 
     const start = this.opts.basePath ?? "/.well-known/carddav";
     // 1. follow redirects from .well-known to the DAV root.
@@ -61,9 +157,33 @@ export class CardDavClient {
     const xml = await this.propfind(root, 0, [
       "DAV:current-user-principal",
     ]);
-    const principal = pickHref(xml, "current-user-principal");
-    if (principal) return principal;
-    return root;
+    const principal = pickHref(xml, "current-user-principal") ?? root;
+    this.rememberDiscovery({ principal });
+    return principal;
+  }
+
+  /** From the principal URL, locate the addressbook-home-set (slash-terminated). */
+  async addressBookHome(): Promise<string> {
+    const cached = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
+    if (cached?.home) return cached.home;
+
+    const principal = await this.discoverPrincipal();
+    const homeXml = await this.propfind(principal, 0, [
+      "urn:ietf:params:xml:ns:carddav addressbook-home-set",
+    ]);
+    const found = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    const home = found.endsWith("/") ? found : found + "/";
+    this.rememberDiscovery({ home });
+    return home;
+  }
+
+  private rememberDiscovery(patch: { principal?: string; home?: string }): void {
+    const existing = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
+    discoveryCache.set(this.cacheKey, {
+      principal: patch.principal ?? existing?.principal,
+      home: patch.home ?? existing?.home,
+      at: existing?.at ?? Date.now(),
+    });
   }
 
   /**
@@ -71,11 +191,10 @@ export class CardDavClient {
    * every addressbook collection beneath it.
    */
   async listAddressBooks(): Promise<AddressBookInfo[]> {
-    const principal = await this.discoverPrincipal();
-    const homeXml = await this.propfind(principal, 0, [
-      "urn:ietf:params:xml:ns:carddav addressbook-home-set",
-    ]);
-    const home = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    const cached = freshEntry(bookListCache.get(this.cacheKey), BOOK_LIST_TTL_MS);
+    if (cached) return cached.books;
+
+    const home = await this.addressBookHome();
 
     const xml = await this.propfind(home, 1, [
       "DAV:resourcetype",
@@ -98,11 +217,16 @@ export class CardDavClient {
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
       });
     }
+    bookListCache.set(this.cacheKey, { books, at: Date.now() });
     return books;
   }
 
   /** List the .vcf resources in a single address-book collection. */
   async listResources(bookHref: string): Promise<Array<{ href: string; etag: string | null }>> {
+    const listKey = `${this.cacheKey}|${bookHref}`;
+    const cached = freshEntry(resourceListCache.get(listKey), RESOURCE_LIST_TTL_MS);
+    if (cached) return cached.resources;
+
     const xml = await this.propfind(bookHref, 1, ["DAV:getetag", "DAV:resourcetype"]);
     const responses = splitResponses(xml);
     const out: Array<{ href: string; etag: string | null }> = [];
@@ -112,7 +236,20 @@ export class CardDavClient {
       if (!href) continue;
       out.push({ href, etag: textOf(r, "getetag") });
     }
+    resourceListCache.set(listKey, { resources: out, at: Date.now() });
     return out;
+  }
+
+  /** Current etag for a resource, from the cached listing of its collection. */
+  private knownEtag(bookHref: string, href: string): string | null {
+    const key = `${this.cacheKey}|${bookHref}`;
+    const cached = freshEntry(resourceListCache.get(key), RESOURCE_LIST_TTL_MS);
+    if (!cached) return null;
+    return cached.resources.find((r) => r.href === href)?.etag ?? null;
+  }
+
+  private vcardKey(href: string, etag: string): string {
+    return `${this.cacheKey}|${href}|${etag}`;
   }
 
   /**
@@ -121,26 +258,149 @@ export class CardDavClient {
    */
   async multiGet(bookHref: string, hrefs: string[]): Promise<VCardResource[]> {
     if (hrefs.length === 0) return [];
+
+    // Serve anything whose current etag we know and whose body we already
+    // hold; only the remainder costs a REPORT.
+    const out: VCardResource[] = [];
+    const hrefsToFetch: string[] = [];
+    for (const href of hrefs) {
+      const etag = this.knownEtag(bookHref, href);
+      const hit = etag ? vcardCache.get(this.vcardKey(href, etag)) : undefined;
+      if (etag && hit !== undefined) out.push({ href, etag, data: hit });
+      else hrefsToFetch.push(href);
+    }
+    if (hrefsToFetch.length === 0) return out;
+
     const body =
       `<?xml version="1.0" encoding="utf-8" ?>\n` +
       `<C:addressbook-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">\n` +
       `  <D:prop><D:getetag/><C:address-data/></D:prop>\n` +
-      hrefs.map((h) => `  <D:href>${escapeXml(h)}</D:href>`).join("\n") +
+      hrefsToFetch.map((h) => `  <D:href>${escapeXml(h)}</D:href>`).join("\n") +
       `\n</C:addressbook-multiget>`;
 
     const xml = await this.request("REPORT", bookHref, body, { Depth: "1" });
     const responses = splitResponses(xml);
-    const out: VCardResource[] = [];
     for (const r of responses) {
       const href = extractHref(r);
       const data = textOf(r, "address-data");
       if (!href || !data) continue;
-      out.push({ href, etag: textOf(r, "getetag"), data });
+      const etag = textOf(r, "getetag");
+      if (etag) rememberVCard(this.vcardKey(href, etag), data);
+      out.push({ href, etag, data });
     }
     return out;
   }
 
+  // -- writes ---------------------------------------------------------------
+
+  /**
+   * Store a vCard. `ifMatch` guards an update against concurrent edits
+   * (RFC 7232 §3.1); without it we send `If-None-Match: *` so a create can
+   * never clobber an existing resource. Returns the new ETag when the server
+   * offers one.
+   */
+  async putResource(
+    href: string,
+    vcard: string,
+    opts: { ifMatch?: string | null } = {},
+  ): Promise<{ etag: string | null }> {
+    const headers: Record<string, string> = { "Content-Type": "text/vcard; charset=utf-8" };
+    if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+    else headers["If-None-Match"] = "*";
+    const res = await this.raw("PUT", href, vcard, headers);
+    if (res.status === 412) throw new CardDavConflict(href);
+    if (!res.ok) throw await httpError("PUT", href, res);
+    return { etag: res.headers.get("etag") };
+  }
+
+  /** Delete a vCard resource (or an address-book collection). Missing is fine. */
+  async deleteResource(href: string, opts: { ifMatch?: string | null } = {}): Promise<void> {
+    const headers: Record<string, string> = {};
+    if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+    const res = await this.raw("DELETE", href, null, headers);
+    if (res.status === 412) throw new CardDavConflict(href);
+    if (!res.ok && res.status !== 404) throw await httpError("DELETE", href, res);
+  }
+
+  /**
+   * Create an address-book collection via extended MKCOL (RFC 5689), which
+   * lets us set the resourcetype and display name in one round trip. Radicale,
+   * Stalwart, Baikal, SOGo and Apple's server all accept this form.
+   */
+  async makeAddressBook(
+    href: string,
+    props: { displayName: string; description?: string | null },
+  ): Promise<void> {
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:mkcol xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">\n` +
+      `  <D:set><D:prop>\n` +
+      `    <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>\n` +
+      `    <D:displayname>${escapeXml(props.displayName)}</D:displayname>\n` +
+      (props.description ? `    <C:addressbook-description>${escapeXml(props.description)}</C:addressbook-description>\n` : "") +
+      `  </D:prop></D:set>\n` +
+      `</D:mkcol>`;
+    const res = await this.raw("MKCOL", href, body, { "Content-Type": "application/xml; charset=utf-8" });
+    if (res.status === 405) throw new CardDavConflict(href); // already exists
+    if (!res.ok) throw await httpError("MKCOL", href, res);
+    // 207 from an extended MKCOL means some property failed to set.
+    if (res.status === 207) {
+      const text = await res.text();
+      if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
+        throw new Error(`CardDAV MKCOL ${href} → property failure: ${text.slice(0, 200)}`);
+      }
+    }
+  }
+
+  /** PROPPATCH displayname / addressbook-description on a collection. */
+  async updateAddressBookProps(
+    href: string,
+    props: { displayName?: string; description?: string | null },
+  ): Promise<void> {
+    const set: string[] = [];
+    const remove: string[] = [];
+    if (props.displayName !== undefined) set.push(`<D:displayname>${escapeXml(props.displayName)}</D:displayname>`);
+    if (props.description !== undefined) {
+      if (props.description) set.push(`<C:addressbook-description>${escapeXml(props.description)}</C:addressbook-description>`);
+      else remove.push(`<C:addressbook-description/>`);
+    }
+    if (set.length === 0 && remove.length === 0) return;
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">\n` +
+      (set.length ? `  <D:set><D:prop>${set.join("")}</D:prop></D:set>\n` : "") +
+      (remove.length ? `  <D:remove><D:prop>${remove.join("")}</D:prop></D:remove>\n` : "") +
+      `</D:propertyupdate>`;
+    const res = await this.raw("PROPPATCH", href, body, { "Content-Type": "application/xml; charset=utf-8" });
+    if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
+    const text = await res.text();
+    if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
+      throw new Error(`CardDAV PROPPATCH ${href} → property failure: ${text.slice(0, 200)}`);
+    }
+  }
+
   // -- low-level ----------------------------------------------------------
+
+  private async raw(
+    method: string,
+    path: string,
+    body: string | null,
+    headers: Record<string, string> = {},
+  ): Promise<Response> {
+    const url = absolutise(this.origin, path);
+    // Any write invalidates the cached book list before it is issued: a PUT or
+    // DELETE moves the collection's ctag (and so its JMAP state), and MKCOL /
+    // PROPPATCH change the set itself. Dropping it up front rather than after
+    // means a write that fails midway can't leave a stale list behind.
+    if (!READ_METHODS.has(method.toUpperCase())) bookListCache.delete(this.cacheKey);
+    const res = await fetch(url, {
+      method,
+      headers: { Authorization: this.authHeader, ...headers },
+      ...(body === null ? {} : { body }),
+    });
+    log.debug({ method, url, status: res.status }, "carddav request");
+    return res;
+  }
 
   private async followToCollection(path: string): Promise<string> {
     let url = absolutise(this.origin, path);
@@ -151,6 +411,7 @@ export class CardDavClient {
         body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
         redirect: "manual",
       });
+      log.debug({ url, status: res.status }, "carddav discovery probe");
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
@@ -170,8 +431,8 @@ export class CardDavClient {
   private async propfind(path: string, depth: 0 | 1, props: string[]): Promise<string> {
     const ns = collectNamespaces(props);
     const propXml = props.map((p) => {
-      const [nsUri, name] = p.includes(" ") ? p.split(" ") : ["DAV:", p];
-      const prefix = ns.prefix(nsUri!);
+      const [nsUri, name] = splitProp(p);
+      const prefix = ns.prefix(nsUri);
       return `<${prefix}:${name}/>`;
     }).join("");
 
@@ -189,22 +450,26 @@ export class CardDavClient {
     body: string,
     extra: Record<string, string> = {},
   ): Promise<string> {
-    const url = absolutise(this.origin, path);
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: this.authHeader,
-        "Content-Type": "application/xml; charset=utf-8",
-        ...extra,
-      },
-      body,
+    const res = await this.raw(method, path, body, {
+      "Content-Type": "application/xml; charset=utf-8",
+      ...extra,
     });
-    if (!res.ok && res.status !== 207) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
-    }
+    if (!res.ok && res.status !== 207) throw await httpError(method, path, res);
     return await res.text();
   }
+}
+
+/** Thrown on 412 (If-Match / If-None-Match failed) or 405 on MKCOL (exists). */
+export class CardDavConflict extends Error {
+  constructor(readonly href: string) {
+    super(`CardDAV conflict on ${href}`);
+  }
+}
+
+async function httpError(method: string, path: string, res: Response): Promise<Error> {
+  const text = await res.text().catch(() => "");
+  log.warn({ method, path, status: res.status }, "carddav request failed");
+  return new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
 }
 
 // -----------------------------------------------------------------------
@@ -246,6 +511,23 @@ function escapeXml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/**
+ * Property spec → [namespace URI, local name]. Accepts `"<uri> <name>"`,
+ * the shorthand `"DAV:<name>"`, or a bare name (DAV: namespace).
+ *
+ * The shorthand used to be emitted verbatim as `<D:DAV:resourcetype/>` —
+ * malformed XML that lenient servers (Stalwart) ignore by answering allprop,
+ * but strict ones (Radicale) reject outright.
+ */
+export function splitProp(p: string): [string, string] {
+  if (p.includes(" ")) {
+    const idx = p.indexOf(" ");
+    return [p.slice(0, idx), p.slice(idx + 1).trim()];
+  }
+  if (p.startsWith("DAV:")) return ["DAV:", p.slice(4)];
+  return ["DAV:", p];
+}
+
 function collectNamespaces(props: string[]): { prefix(uri: string): string; declarations(): string } {
   const map = new Map<string, string>([
     ["DAV:", "D"],
@@ -253,9 +535,8 @@ function collectNamespaces(props: string[]): { prefix(uri: string): string; decl
     ["http://calendarserver.org/ns/", "CS"],
   ]);
   for (const p of props) {
-    if (!p.includes(" ")) continue;
-    const [uri] = p.split(" ");
-    if (uri && !map.has(uri)) map.set(uri, `n${map.size}`);
+    const [uri] = splitProp(p);
+    if (!map.has(uri)) map.set(uri, `n${map.size}`);
   }
   return {
     prefix: (uri: string) => map.get(uri) ?? "D",

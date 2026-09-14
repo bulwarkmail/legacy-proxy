@@ -100,8 +100,8 @@ async function fetchRfc822(
     throw notFound();
   }
   if (parts.accountIdx !== accountId) throw notFound();
-  const mbox = store.db
-    .prepare(`SELECT name FROM mailbox WHERE id = ? AND account_id = ?`)
+  const mbox = store
+    .prep(`SELECT name FROM mailbox WHERE id = ? AND account_id = ?`)
     .get(parts.mailboxIdx, accountId) as { name: string } | undefined;
   if (!mbox) throw notFound();
 

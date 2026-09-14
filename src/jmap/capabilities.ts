@@ -8,6 +8,19 @@ export const WS_CAPABILITY = "urn:ietf:params:jmap:websocket";
 export const SIEVE_CAPABILITY = "urn:bulwark:params:jmap:sieve";
 export const CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
 
+// Every capability the /jmap endpoint accepts in a request's `using` list
+// (RFC 8620 §3.6.1). Must cover everything buildSession can advertise —
+// contacts was once missing here, so clients that saw it on the session
+// object got a 400 unknownCapability back on their first request (issue #3).
+export const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
+  CORE_CAPABILITY,
+  MAIL_CAPABILITY,
+  SUBMISSION_CAPABILITY,
+  VACATION_CAPABILITY,
+  SIEVE_CAPABILITY,
+  CONTACTS_CAPABILITY,
+]);
+
 export function coreCapabilityProps(cfg: AppConfig) {
   return {
     maxSizeUpload: cfg.limits.maxSizeUpload,

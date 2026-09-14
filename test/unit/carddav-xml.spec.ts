@@ -5,6 +5,7 @@ import {
   textOf,
   hasResourceType,
   pickHref,
+  splitProp,
 } from "../../src/carddav/client.js";
 
 const MULTISTATUS = `<?xml version="1.0" encoding="utf-8"?>
@@ -64,6 +65,18 @@ describe("CardDAV XML helpers", () => {
       <x:current-user-principal><x:href>/principals/user@x.io/</x:href></x:current-user-principal>
     </x:prop></x:propstat></x:response></x:multistatus>`;
     expect(pickHref(xml, "current-user-principal")).toBe("/principals/user@x.io/");
+  });
+
+  it("splits property specs into namespace + local name", () => {
+    // "DAV:resourcetype" used to be emitted as <D:DAV:resourcetype/>, which
+    // Radicale rejects as malformed XML (issue #3).
+    expect(splitProp("DAV:resourcetype")).toEqual(["DAV:", "resourcetype"]);
+    expect(splitProp("resourcetype")).toEqual(["DAV:", "resourcetype"]);
+    expect(splitProp("urn:ietf:params:xml:ns:carddav addressbook-home-set")).toEqual([
+      "urn:ietf:params:xml:ns:carddav",
+      "addressbook-home-set",
+    ]);
+    expect(splitProp("http://calendarserver.org/ns/ getctag")).toEqual(["http://calendarserver.org/ns/", "getctag"]);
   });
 
   it("decodes XML entities and CDATA in element text", () => {

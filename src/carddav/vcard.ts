@@ -1,7 +1,10 @@
 // vCard 3.0 / 4.0 parser → JSContact (RFC 9553) projection used by JMAP for
-// Contacts (RFC 9610). We don't aim for full fidelity - we cover the
-// properties webmail actually displays: FN, N, EMAIL, TEL, ORG, TITLE, ADR,
-// NOTE, URL, BDAY, NICKNAME, KIND, UID, REV.
+// Contacts (RFC 9610), and the reverse serialiser used by ContactCard/set.
+// We don't aim for full fidelity - we cover the properties webmail actually
+// displays: FN, N, EMAIL, TEL, ORG, TITLE, ADR, NOTE, URL, BDAY, NICKNAME,
+// KIND, MEMBER, UID, REV. Anything else is passed through untouched on update.
+
+import { Buffer } from "node:buffer";
 
 export interface JsContact {
   uid: string;
@@ -46,10 +49,17 @@ export interface JsContact {
   >;
   notes?: Record<string, { note: string }>;
   links?: Record<string, { uri: string; kind?: "contact" | "generic" }>;
-  anniversaries?: Record<string, { kind: "birth" | "death" | "wedding" | "other"; date: string }>;
+  anniversaries?: Record<string, { kind: "birth" | "death" | "wedding" | "other"; date: string | AnniversaryDate }>;
+  /** Group membership (KIND:group): map of member UID/URI → true. */
+  members?: Record<string, boolean>;
   updated?: string;
   prodId?: string;
 }
+
+/** RFC 9553 §1.5.5 date shapes a client may send for anniversaries. */
+export type AnniversaryDate =
+  | { "@type"?: "Timestamp"; utc: string }
+  | { "@type"?: "PartialDate"; year?: number; month?: number; day?: number };
 
 interface ParsedLine {
   name: string;
@@ -336,6 +346,14 @@ function toJsContact(props: ParsedLine[]): JsContact {
         }
         break;
       }
+      case "MEMBER":
+      case "X-ADDRESSBOOKSERVER-MEMBER": {
+        const uri = unescapeValue(p.value);
+        if (!uri) break;
+        c.members = c.members ?? {};
+        c.members[uri] = true;
+        break;
+      }
     }
   }
   if (!c.uid) {
@@ -345,6 +363,294 @@ function toJsContact(props: ParsedLine[]): JsContact {
   }
   c.kind = c.kind ?? "individual";
   return c;
+}
+
+// ---------------------------------------------------------------------------
+// JSContact → vCard 4.0 serialisation (the write path for ContactCard/set).
+// ---------------------------------------------------------------------------
+
+/**
+ * vCard property names the JSContact projection above models. Everything
+ * else in an existing card (PHOTO, X-*, IMPP, GEO, …) is opaque to us and is
+ * carried over verbatim on update so we never destroy data we don't
+ * understand.
+ */
+const MANAGED_PROPS = new Set([
+  "BEGIN",
+  "END",
+  "VERSION",
+  "PRODID",
+  "REV",
+  "UID",
+  "FN",
+  "N",
+  "NICKNAME",
+  "EMAIL",
+  "TEL",
+  "ORG",
+  "TITLE",
+  "ROLE",
+  "ADR",
+  "NOTE",
+  "URL",
+  "BDAY",
+  "ANNIVERSARY",
+  "DEATHDATE",
+  "KIND",
+  "X-ADDRESSBOOKSERVER-KIND",
+  "MEMBER",
+  "X-ADDRESSBOOKSERVER-MEMBER",
+]);
+
+export const PRODID = "-//Bulwark//legacy-proxy//EN";
+
+export interface SerializeOpts {
+  /**
+   * The vCard text the card was loaded from. Properties we don't model are
+   * copied through unchanged so a round trip through JMAP is lossless for
+   * them.
+   */
+  preserveFrom?: string;
+  /** Override REV (defaults to now). Tests pass a fixed value. */
+  rev?: string;
+}
+
+/** Serialise one JSContact as a vCard 4.0 body (CRLF line endings). */
+export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
+  const lines: string[] = ["BEGIN:VCARD", "VERSION:4.0", `PRODID:${escapeValue(PRODID)}`];
+  const push = (name: string, params: Record<string, string[] | undefined>, value: string) => {
+    let head = name;
+    for (const [k, vs] of Object.entries(params)) {
+      if (!vs || vs.length === 0) continue;
+      head += `;${k}=${vs.map(quoteParam).join(",")}`;
+    }
+    lines.push(`${head}:${value}`);
+  };
+
+  push("UID", {}, escapeValue(c.uid));
+  if (c.kind && c.kind !== "individual") push("KIND", {}, c.kind);
+
+  const fn = fullName(c);
+  push("FN", {}, escapeValue(fn));
+
+  const comps = c.name?.components ?? [];
+  if (comps.length > 0) {
+    const pick = (...kinds: string[]) =>
+      comps
+        .filter((x) => kinds.includes(x.kind))
+        .map((x) => x.value)
+        .join(",");
+    const n = [
+      pick("surname", "surname2"),
+      pick("given"),
+      pick("additional", "middle", "given2"),
+      pick("prefix", "title"),
+      pick("suffix", "credential", "generation"),
+    ];
+    push("N", {}, n.map(escapeComponent).join(";"));
+  }
+
+  for (const nick of Object.values(c.nicknames ?? {})) {
+    if (nick?.name) push("NICKNAME", {}, escapeValue(nick.name));
+  }
+
+  for (const e of Object.values(c.emails ?? {})) {
+    if (!e?.address) continue;
+    push("EMAIL", { TYPE: contextTypes(e.contexts), PREF: prefParam(e.pref) }, escapeValue(e.address));
+  }
+
+  for (const p of Object.values(c.phones ?? {})) {
+    if (!p?.number) continue;
+    const types = contextTypes(p.contexts);
+    const f = p.features ?? {};
+    if (f["mobile"]) types.push("cell");
+    if (f["fax"]) types.push("fax");
+    if (f["voice"]) types.push("voice");
+    if (f["text"]) types.push("text");
+    if (f["pager"]) types.push("pager");
+    push("TEL", { TYPE: types, PREF: prefParam(p.pref) }, escapeValue(p.number));
+  }
+
+  for (const o of Object.values(c.organizations ?? {})) {
+    if (!o) continue;
+    const parts = [o.name ?? "", ...(o.units ?? []).map((u) => u.name)];
+    if (parts.every((x) => !x)) continue;
+    push("ORG", {}, parts.map(escapeComponent).join(";"));
+  }
+
+  for (const t of Object.values(c.titles ?? {})) {
+    if (!t?.name) continue;
+    push(t.kind === "role" ? "ROLE" : "TITLE", {}, escapeValue(t.name));
+  }
+
+  for (const a of Object.values(c.addresses ?? {})) {
+    if (!a) continue;
+    const fields = addressFields(a);
+    if (fields.every((x) => !x)) continue;
+    const params: Record<string, string[] | undefined> = { TYPE: contextTypes(a.contexts) };
+    if (a.full) params["LABEL"] = [a.full];
+    push("ADR", params, fields.map(escapeComponent).join(";"));
+  }
+
+  for (const n of Object.values(c.notes ?? {})) {
+    if (n?.note) push("NOTE", {}, escapeValue(n.note));
+  }
+
+  for (const l of Object.values(c.links ?? {})) {
+    if (l?.uri) push("URL", {}, escapeValue(l.uri));
+  }
+
+  for (const an of Object.values(c.anniversaries ?? {})) {
+    if (!an) continue;
+    const date = formatDate(an.date);
+    if (!date) continue;
+    const prop = an.kind === "birth" ? "BDAY" : an.kind === "death" ? "DEATHDATE" : "ANNIVERSARY";
+    push(prop, {}, date);
+  }
+
+  for (const [uri, on] of Object.entries(c.members ?? {})) {
+    if (on && uri) push("MEMBER", {}, escapeValue(uri));
+  }
+
+  push("REV", {}, opts.rev ?? new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z"));
+
+  if (opts.preserveFrom) {
+    for (const raw of unmanagedLines(opts.preserveFrom)) lines.push(raw);
+  }
+
+  lines.push("END:VCARD");
+  return lines.map(fold).join("\r\n") + "\r\n";
+}
+
+/** Lines of an existing vCard whose property we don't model (first VCARD only). */
+export function unmanagedLines(text: string): string[] {
+  const out: string[] = [];
+  let inCard = false;
+  for (const raw of unfold(text).split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line) continue;
+    const upper = line.toUpperCase();
+    if (upper === "BEGIN:VCARD") {
+      if (inCard) break; // only the first card in the resource
+      inCard = true;
+      continue;
+    }
+    if (upper === "END:VCARD") break;
+    if (!inCard) continue;
+    const parsed = parseLine(line);
+    if (!parsed) continue;
+    if (MANAGED_PROPS.has(parsed.name)) continue;
+    out.push(line);
+  }
+  return out;
+}
+
+function fullName(c: JsContact): string {
+  if (c.name?.full) return c.name.full;
+  const comps = c.name?.components ?? [];
+  if (comps.length > 0) {
+    const order = ["prefix", "title", "given", "given2", "middle", "additional", "surname", "surname2", "suffix", "credential", "generation"];
+    const parts = order
+      .flatMap((k) => comps.filter((x) => x.kind === k).map((x) => x.value))
+      .filter(Boolean);
+    if (parts.length > 0) return parts.join(" ");
+  }
+  const org = Object.values(c.organizations ?? {}).find((o) => o?.name)?.name;
+  if (org) return org;
+  const email = Object.values(c.emails ?? {}).find((e) => e?.address)?.address;
+  if (email) return email;
+  return "";
+}
+
+function contextTypes(ctx?: Record<string, boolean>): string[] {
+  const out: string[] = [];
+  if (!ctx) return out;
+  if (ctx["private"] || ctx["home"]) out.push("home");
+  if (ctx["work"]) out.push("work");
+  return out;
+}
+
+function prefParam(pref?: number): string[] | undefined {
+  if (typeof pref !== "number" || !Number.isFinite(pref)) return undefined;
+  const v = Math.min(100, Math.max(1, Math.round(pref)));
+  return [String(v)];
+}
+
+function addressFields(a: NonNullable<JsContact["addresses"]>[string]): string[] {
+  // pobox;ext;street;locality;region;postcode;country
+  const byKind = (...kinds: string[]) =>
+    (a.components ?? [])
+      .filter((x) => kinds.includes(x.kind))
+      .map((x) => x.value)
+      .filter(Boolean)
+      .join(" ");
+  const street = a.street ?? byKind("name", "street", "number", "block", "direction", "landmark");
+  const ext = byKind("apartment", "floor", "building", "room", "subdistrict", "district");
+  const pobox = byKind("postOfficeBox");
+  const locality = a.locality ?? byKind("locality");
+  const region = a.region ?? byKind("region");
+  const postcode = a.postcode ?? byKind("postcode");
+  const country = a.country ?? byKind("country");
+  const fields = [pobox, ext, street, locality, region, postcode, country];
+  if (fields.every((x) => !x) && a.full) fields[2] = a.full;
+  return fields;
+}
+
+function formatDate(d: string | AnniversaryDate | undefined): string | null {
+  if (!d) return null;
+  if (typeof d === "string") return d.trim() || null;
+  if ("utc" in d && d.utc) return d.utc.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const pd = d as { year?: number; month?: number; day?: number };
+  const yy = pd.year != null ? String(pd.year).padStart(4, "0") : null;
+  const mm = pd.month != null ? String(pd.month).padStart(2, "0") : null;
+  const dd = pd.day != null ? String(pd.day).padStart(2, "0") : null;
+  if (yy && mm && dd) return `${yy}${mm}${dd}`;
+  if (yy && mm) return `${yy}-${mm}`;
+  if (mm && dd) return `--${mm}${dd}`;
+  if (yy) return yy;
+  return null;
+}
+
+/** RFC 6350 §3.4: escape backslash, comma, semicolon and newline in a text value. */
+export function escapeValue(v: string): string {
+  return v
+    .replace(/\\/g, "\\\\")
+    .replace(/\r?\n/g, "\\n")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;");
+}
+
+/** Like escapeValue, for one field of a structured (`;`-separated) value. */
+function escapeComponent(v: string): string {
+  return escapeValue(v);
+}
+
+function quoteParam(v: string): string {
+  const clean = v.replace(/["\r\n]/g, "");
+  return /[;:,]/.test(clean) ? `"${clean}"` : clean;
+}
+
+/** RFC 6350 §3.2: fold at 75 octets, continuation lines start with a space. */
+export function fold(line: string): string {
+  const bytes = Buffer.from(line, "utf8");
+  if (bytes.length <= 75) return line;
+  const out: string[] = [];
+  let cur = "";
+  let curLen = 0;
+  const limit = 75;
+  for (const ch of line) {
+    const n = Buffer.byteLength(ch, "utf8");
+    const budget = out.length === 0 ? limit : limit - 1;
+    if (curLen + n > budget) {
+      out.push(cur);
+      cur = "";
+      curLen = 0;
+    }
+    cur += ch;
+    curLen += n;
+  }
+  if (cur) out.push(cur);
+  return out.map((s, i) => (i === 0 ? s : " " + s)).join("\r\n");
 }
 
 function hashString(s: string): string {

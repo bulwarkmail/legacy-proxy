@@ -56,13 +56,13 @@ JMAP method coverage:
 | Mailbox           | `get`, `query`, `queryChanges`, `changes`, `set`                     |
 | Email             | `get`, `query`, `queryChanges`, `changes`, `set`, `copy`, `import`, `parse` |
 | SearchSnippet     | `get` (returns null snippets; IMAP exposes no match offsets)         |
-| Thread            | `get`, `changes` (built from a header-scan index, cached briefly)    |
+| Thread            | `get`, `changes` (persistent header index in SQLite, updated incrementally per folder) |
 | Identity          | `get`, `set`, `changes`                                              |
 | EmailSubmission   | `get`, `query`, `changes`, `set` (with `onSuccessUpdateEmail` / `onSuccessDestroyEmail`) |
 | VacationResponse  | `get`, `set`, `changes` (full body + dates round-tripped through Sieve)  |
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
-| AddressBook       | `get`, `changes` (read-only via CardDAV)                             |
-| ContactCard       | `get`, `query`, `queryChanges`, `changes` (read-only via CardDAV)    |
+| AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
+| ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -97,7 +97,15 @@ Backends:
   per account in a request-path pool (separate from the IDLE socket).
 - ManageSieve (RFC 5804) for the vacation autoresponder.
 - SMTP Submission via nodemailer.
-- CardDAV (RFC 6352) read path for AddressBook and ContactCard.
+- CardDAV (RFC 6352) for AddressBook and ContactCard. Reads are live
+  PROPFIND / `addressbook-multiget`; writes are `PUT` with `If-None-Match: *`
+  (create) or `If-Match` (update), `DELETE`, extended `MKCOL` (RFC 5689) and
+  `PROPPATCH`. Cards are re-serialised as vCard 4.0 on update; properties the
+  JSContact projection doesn't model (PHOTO, IMPP, X-*, …) are carried over
+  untouched.
+  A CardDAV account with no collections at all (a fresh Radicale user, for
+  example) gets a `Contacts` address book created on the first
+  `ContactCard/set`.
 
 Auth and storage:
 
@@ -111,9 +119,10 @@ Auth and storage:
 
 Sort and filter:
 
-- Server advertises `emailQuerySortOptions: ["receivedAt"]`. The handler also
-  accepts `size`, `from`, `to`, `subject`, `sentAt`, and `hasKeyword`
-  (it pays a per-match FETCH for those).
+- Server advertises `emailQuerySortOptions: ["receivedAt"]`. A pure
+  `receivedAt` sort (what clients send by default) is answered from UID order
+  with no per-message FETCH. The handler also accepts `size`, `from`, `to`,
+  `subject`, `sentAt`, and `hasKeyword` (those pay a per-match FETCH).
 - `hasAttachment` filter is rejected: IMAP without a server-side flag for it
   cannot answer cheaply.
 - `*/changes` and `Email/queryChanges` use a real change log seeded by
@@ -125,8 +134,16 @@ Sort and filter:
 
 - WebSocket transport (`@fastify/websocket` is in the deps tree but no `/jmap/ws`
   handler is registered, so the capability is not advertised).
-- `ContactCard/set` and `AddressBook/set` return `forbidden`. CardDAV writes
-  (MKCOL / PUT / DELETE) are not wired up.
+- CardDAV cards live in exactly one collection, so `ContactCard/set` rejects
+  `addressBookIds` changes (moving a card between books) with
+  `invalidProperties`. `AddressBook/set` only persists `name` and
+  `description`; `isDefault`, `sortOrder`, `isSubscribed` and `color` have no
+  CardDAV equivalent and are accepted but ignored. No sharing (`shareWith`).
+- The JSContact ⇄ vCard translation covers name, nicknames, emails, phones,
+  organisations, titles, addresses, notes, links, anniversaries, kind and
+  group members. Other JSContact properties sent on create (media,
+  onlineServices, …) are dropped; on update the corresponding vCard lines
+  are preserved as-is.
 - Multi-mailbox membership: an Email lives in exactly one IMAP folder. JMAP
   operations that try to add or remove a mailbox membership treat the move as
   a copy + expunge, which produces a new id rather than preserving the old
@@ -201,9 +218,10 @@ The response carries `{ token, accountId, apiUrl }`. Use the token as
 opens a probe IMAP session with the supplied credentials, seals them into the
 vault, and only mints a token if IMAP accepts.
 
-`provider` is the key into `providers.json` (defaults to `DEFAULT_PROVIDER`).
-For OAuth providers, pass `accessToken` instead of `password` and the proxy
-will use `XOAUTH2`.
+`provider` is the key into `providers.json`. When omitted, the proxy picks it
+from the email domain of `username` (see [Provider selection](#provider-selection)),
+falling back to `DEFAULT_PROVIDER`. For OAuth providers, pass `accessToken`
+instead of `password` and the proxy will use `XOAUTH2`.
 
 ### HTTP Basic
 
@@ -211,6 +229,36 @@ will use `XOAUTH2`.
 The first request in a 5 minute window costs one IMAP probe; subsequent
 requests reuse the cached account. Useful for compliance suite runs and
 servers that already terminate auth at a reverse proxy.
+
+Basic auth carries no explicit provider, so the proxy selects one from the
+email domain of the username (see [Provider selection](#provider-selection)).
+This is what lets a JMAP client like the Bulwark webmail front several IMAP
+backends through one proxy without any client-side change: the user just types
+their email, and the domain routes them to the right provider.
+
+### Provider selection
+
+Every login resolves to exactly one provider key from `providers.json`, in this
+order:
+
+1. an explicit `provider` in the `/api/login` body, if present;
+2. the provider whose `domains` list contains the username's email domain
+   (case-insensitive). This mirrors RFC 8620 §2.2, which uses the email domain
+   as the routing key for service autodiscovery;
+3. `DEFAULT_PROVIDER` otherwise.
+
+Give each provider a `domains` array to enable step 2:
+
+```json
+{
+  "posteo":      { "domains": ["posteo.de", "posteo.net"], "imap": { ... }, ... },
+  "mailbox-org": { "domains": ["mailbox.org"],             "imap": { ... }, ... }
+}
+```
+
+See `providers.two-servers.example.json` for a full two-provider catalogue.
+If two backends share one email domain, that domain can only map to a single
+provider. Use the explicit `/api/login` `provider` field for the exception.
 
 ### Gmail
 
@@ -249,7 +297,9 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
 A `null` for any of `sieve` or `carddav` is allowed; the corresponding JMAP
 methods will then either return empty results or, for vacation, reject with
-the underlying ManageSieve error.
+the underlying ManageSieve error. An optional `domains` array on a provider
+opts it into domain-based [provider selection](#provider-selection);
+`providers.two-servers.example.json` shows two providers wired up that way.
 
 ## Tests
 
