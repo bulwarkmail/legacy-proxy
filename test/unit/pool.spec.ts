@@ -298,3 +298,75 @@ describe("ImapPool", () => {
     expect(got).toBe(true);
   });
 });
+
+describe("ImapPool under a burst", () => {
+  it("counts a dial in flight against an adopted probe", async () => {
+    const pool = makePool();
+    const dials = Promise.all([
+      pool.acquire(account, "interactive"),
+      pool.acquire(account, "interactive"),
+      pool.acquire(account, "interactive"),
+    ]);
+    const probe = new FakeClient();
+    pool.adopt(account, probe as never);
+    await dials;
+    await settle();
+
+    expect(opened).toHaveLength(3);
+    expect(probe.loggedOut).toBe(true);
+  });
+});
+
+describe("ImapPool idle reaper", () => {
+  it("logs out a free connection left alone past the idle limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const pool = makePool();
+      const a = await pool.acquire(account, "interactive");
+      a.release();
+
+      vi.advanceTimersByTime(4 * 60_000);
+      pool.reapIdle();
+      expect((a.client as unknown as FakeClient).loggedOut).toBe(false);
+
+      vi.advanceTimersByTime(2 * 60_000);
+      pool.reapIdle();
+      expect((a.client as unknown as FakeClient).loggedOut).toBe(true);
+
+      // Gone from the pool: the next borrower dials afresh.
+      const b = await pool.acquire(account, "interactive");
+      expect(b.client).not.toBe(a.client);
+      expect(opened).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a borrowed connection alone however old it is", async () => {
+    vi.useFakeTimers();
+    try {
+      const pool = makePool();
+      const a = await pool.acquire(account, "interactive");
+
+      vi.advanceTimersByTime(60 * 60_000);
+      pool.reapIdle();
+      expect((a.client as unknown as FakeClient).loggedOut).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs on its own timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const pool = makePool();
+      const a = await pool.acquire(account, "interactive");
+      a.release();
+
+      vi.advanceTimersByTime(7 * 60_000);
+      expect((a.client as unknown as FakeClient).loggedOut).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
