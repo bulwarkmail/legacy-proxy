@@ -1,17 +1,50 @@
 import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { GmailConfig } from "./config.js";
+import { redirectAllowed, type GmailConfig } from "./config.js";
 
 interface Connection {
-  authorization(state: string): Promise<{ url: string; verifier: string }>;
+  authorization(
+    state: string,
+    options?: { prompt?: "consent" | "select_account"; loginHint?: string },
+  ): Promise<{ url: string; verifier: string }>;
   connect(code: string, verifier: string): Promise<string | void>;
+  signIn?(code: string, verifier: string): Promise<{ email: string; needsConsent: boolean }>;
+}
+interface Tokens {
+  issueTokens(email: string, client: string): IssuedTokens;
+  refreshTokens(refreshToken: string, client: string): IssuedTokens | null;
+  revokeToken(token: string, client: string): void;
+}
+interface IssuedTokens {
+  accessToken: string;
+  expiresIn: number;
+  refreshToken: string;
+}
+/** The application's authorization request, carried through Google's consent. */
+interface ClientRequest {
+  id: string;
+  redirectUri: string;
+  state: string;
+  challenge: string;
 }
 interface Flow {
   state: string;
   verifier: string;
   expiresAt: number;
   issue: boolean;
+  client?: ClientRequest;
+  /** Consent was already asked for once in this sign-in. */
+  consented?: boolean;
 }
+interface AuthorizationCode {
+  email: string;
+  client: string;
+  redirectUri: string;
+  challenge: string;
+  expiresAt: number;
+}
+/** Authorization codes are exchanged by the application's server right after the redirect. */
+const CODE_TTL = 60_000;
 interface Issued {
   email: string;
   password: string;
@@ -45,9 +78,14 @@ export async function registerGmailRoutes(
     now?: () => number;
     /** When present, the consent page can issue the Bulwark bridge password itself (self-service onboarding). */
     store?: { issuePassword(email: string): string; hasPassword?(email: string): boolean };
+    /** With registered clients (config.oauthClients), the bridge signs users in to them: see /oauth/authorize. */
+    tokens?: Tokens;
   },
 ): Promise<void> {
-  const { config, connection, store } = options;
+  const { config, connection, store, tokens } = options;
+  const clients = new Map((config.oauthClients ?? []).map((c) => [c.id, c]));
+  const signIn = connection.signIn && tokens && clients.size > 0 ? connection.signIn.bind(connection) : null;
+  const codes = new Map<string, AuthorizationCode>();
   const issued = new Map<string, Issued>();
   const now = options.now ?? Date.now;
   // A pending flow lives in an encrypted cookie rather than in memory, so unauthenticated starts cannot
@@ -81,12 +119,14 @@ export async function registerGmailRoutes(
   const prune = () => {
     for (const [state, expiresAt] of consumed) if (expiresAt <= now()) consumed.delete(state);
     for (const [k, r] of issued) if (r.expiresAt <= now()) issued.delete(k);
+    for (const [k, c] of codes) if (c.expiresAt <= now()) codes.delete(k);
   };
   const timer = setInterval(prune, TTL).unref();
   app.addHook("onClose", async () => {
     clearInterval(timer);
     consumed.clear();
     issued.clear();
+    codes.clear();
   });
   const cookie = (name: string, value: string, age: number) =>
     `${name}=${value}; Path=/auth/google; HttpOnly; SameSite=Lax; Max-Age=${age}${config.secureCookies ? "; Secure" : ""}`;
@@ -104,7 +144,7 @@ export async function registerGmailRoutes(
     });
     scope.addContentTypeParser(
       "application/x-www-form-urlencoded",
-      { parseAs: "string", bodyLimit: 1024 },
+      { parseAs: "string", bodyLimit: 4096 },
       (_req, body, done) => done(null, Object.fromEntries(new URLSearchParams(String(body)))),
     );
     // no-referrer makes browsers send Origin: null on native form POSTs.
@@ -153,6 +193,7 @@ export async function registerGmailRoutes(
       if (consumed.size >= MAX_CONSUMED) consumed.delete(consumed.keys().next().value!);
       consumed.set(state, flow.expiresAt);
       reply.header("Set-Cookie", cookie(COOKIE, "", 0));
+      if (flow.client) return finishSignIn(flow, flow.client, query, reply);
       if (query.error || typeof query.code !== "string" || !query.code) {
         return reply.code(303).redirect("/auth/google/result?status=cancelled");
       }
@@ -205,5 +246,177 @@ export async function registerGmailRoutes(
         .type("text/html")
         .send(page(`<p>${message}</p><a href="/auth/google/start">Connect Gmail</a>`));
     });
+
+    if (!signIn || !tokens) return;
+
+    // --- Sign-in for registered applications (OAuth 2.0 authorization server) ---
+    // The application sends the user here; the user signs in with Google, the bridge checks that the account
+    // is allowed and connected (asking Gmail consent once when it is not), and hands the application a
+    // single-use code for bridge tokens. Google tokens never leave the bridge.
+    scope.get("/.well-known/oauth-authorization-server", async (_req, reply) =>
+      reply.header("Cache-Control", "public, max-age=3600").send({
+        issuer: config.origin,
+        authorization_endpoint: `${config.origin}/oauth/authorize`,
+        token_endpoint: `${config.origin}/oauth/token`,
+        revocation_endpoint: `${config.origin}/oauth/revoke`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        code_challenge_methods_supported: ["S256"],
+        token_endpoint_auth_methods_supported: ["none"],
+        revocation_endpoint_auth_methods_supported: ["none"],
+        authorization_response_iss_parameter_supported: true,
+      }),
+    );
+    scope.get("/oauth/authorize", { logLevel: "silent" }, async (req, reply) => {
+      const query = req.query as Record<string, unknown>;
+      const param = (name: string) => (typeof query[name] === "string" ? (query[name] as string) : "");
+      const client = clients.get(param("client_id"));
+      const redirectUri = param("redirect_uri");
+      // Without a registered redirect there is nowhere safe to send an error.
+      if (!client || !redirectUri || !redirectAllowed(client, redirectUri)) {
+        return reply
+          .code(400)
+          .type("text/html")
+          .send(page("<p>This application is not registered to sign in through this bridge.</p>"));
+      }
+      const request: ClientRequest = { id: client.id, redirectUri, state: param("state"), challenge: param("code_challenge") };
+      if (param("response_type") !== "code") return back(reply, request, { error: "unsupported_response_type" });
+      if (
+        param("code_challenge_method") !== "S256" ||
+        !/^[A-Za-z0-9_-]{43}$/.test(request.challenge) ||
+        request.state.length > 512
+      ) {
+        return back(reply, request, { error: "invalid_request", error_description: "PKCE (S256) is required" });
+      }
+      try {
+        const state = crypto.randomBytes(32).toString("base64url");
+        const { url, verifier } = await connection.authorization(state, {
+          prompt: param("prompt") === "consent" ? "consent" : "select_account",
+        });
+        reply.header(
+          "Set-Cookie",
+          cookie(COOKIE, seal({ state, verifier, expiresAt: now() + TTL, issue: false, client: request }), TTL / 1000),
+        );
+        return reply.code(303).redirect(url);
+      } catch {
+        return back(reply, request, { error: "temporarily_unavailable" });
+      }
+    });
+    scope.post("/oauth/token", { logLevel: "silent" }, async (req, reply) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const param = (name: string) => (typeof body[name] === "string" ? (body[name] as string) : "");
+      reply.header("Pragma", "no-cache");
+      const client = clients.get(param("client_id"));
+      if (!client) return reply.code(401).send({ error: "invalid_client" });
+      let result: IssuedTokens | null = null;
+      if (param("grant_type") === "authorization_code") {
+        const code = param("code");
+        const entry = codes.get(code);
+        // Single use whatever the outcome.
+        codes.delete(code);
+        if (
+          entry &&
+          entry.expiresAt > now() &&
+          entry.client === client.id &&
+          entry.redirectUri === param("redirect_uri") &&
+          verifierMatches(param("code_verifier"), entry.challenge)
+        ) {
+          try {
+            result = tokens.issueTokens(entry.email, client.id);
+          } catch {
+            // Disconnected between consent and exchange.
+          }
+        }
+      } else if (param("grant_type") === "refresh_token") {
+        result = tokens.refreshTokens(param("refresh_token"), client.id);
+      } else {
+        return reply.code(400).send({ error: "unsupported_grant_type" });
+      }
+      if (!result) return reply.code(400).send({ error: "invalid_grant" });
+      return reply.send({
+        access_token: result.accessToken,
+        token_type: "Bearer",
+        expires_in: result.expiresIn,
+        refresh_token: result.refreshToken,
+      });
+    });
+    scope.post("/oauth/revoke", { logLevel: "silent" }, async (req, reply) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const client = typeof body.client_id === "string" ? clients.get(body.client_id) : undefined;
+      if (!client) return reply.code(401).send({ error: "invalid_client" });
+      if (typeof body.token === "string") tokens.revokeToken(body.token, client.id);
+      // RFC 7009: an unknown or already revoked token is not an error.
+      return reply.send({});
+    });
   });
+
+  function back(
+    reply: import("fastify").FastifyReply,
+    request: ClientRequest,
+    params: Record<string, string>,
+  ) {
+    const url = new URL(request.redirectUri);
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+    if (request.state) url.searchParams.set("state", request.state);
+    url.searchParams.set("iss", config.origin);
+    return reply.code(303).redirect(url.toString());
+  }
+
+  async function finishSignIn(
+    flow: Flow,
+    request: ClientRequest,
+    query: Record<string, unknown>,
+    reply: import("fastify").FastifyReply,
+  ) {
+    if (!signIn || query.error || typeof query.code !== "string" || !query.code) {
+      return back(reply, request, { error: "access_denied" });
+    }
+    try {
+      const { email, needsConsent } = await signIn(query.code, flow.verifier);
+      if (needsConsent) {
+        if (flow.consented) {
+          return back(reply, request, { error: "access_denied", error_description: "Gmail access was not granted" });
+        }
+        // First sign-in for this account, or its grant is gone: ask Google for consent, once.
+        const state = crypto.randomBytes(32).toString("base64url");
+        const { url, verifier } = await connection.authorization(state, { prompt: "consent", loginHint: email });
+        // Replaces the clearing of the finished flow's cookie: Fastify appends Set-Cookie headers.
+        reply.removeHeader("set-cookie");
+        reply.header(
+          "Set-Cookie",
+          cookie(
+            COOKIE,
+            seal({ state, verifier, expiresAt: now() + TTL, issue: false, client: request, consented: true }),
+            TTL / 1000,
+          ),
+        );
+        return reply.code(303).redirect(url);
+      }
+      prune();
+      const code = crypto.randomBytes(32).toString("base64url");
+      if (codes.size >= MAX_CONSUMED) codes.delete(codes.keys().next().value!);
+      codes.set(code, {
+        email,
+        client: request.id,
+        redirectUri: request.redirectUri,
+        challenge: request.challenge,
+        expiresAt: now() + CODE_TTL,
+      });
+      return back(reply, request, { code });
+    } catch (err) {
+      // Gaxios errors can include client secrets and tokens: only the allowlist refusal is told apart.
+      const refused = err instanceof Error && err.message === "Account is not allowed";
+      return back(reply, request, refused
+        ? { error: "access_denied", error_description: "This Google account is not enabled on the bridge" }
+        : { error: "server_error" });
+    }
+  }
+}
+
+/** PKCE S256 (RFC 7636), compared in constant time. */
+function verifierMatches(verifier: string, challenge: string): boolean {
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) return false;
+  const actual = Buffer.from(crypto.createHash("sha256").update(verifier).digest("base64url"));
+  const expected = Buffer.from(challenge);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }

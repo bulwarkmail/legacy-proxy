@@ -292,6 +292,34 @@ it("rotates bridge passwords and leaves non-bridge passwords to the legacy backe
         })
       ).statusCode,
     ).toBe(401);
+    // A sign-in token opens the same mailbox, as a bearer token only.
+    const signedIn = store.issueTokens(email, "webmail");
+    const bearer = await app.inject({
+      url: "/jmap/session",
+      headers: { authorization: "Bearer " + signedIn.accessToken },
+    });
+    expect(bearer.statusCode).toBe(200);
+    expect(bearer.json().accounts[mail.accountId]).toBeDefined();
+    expect(
+      (
+        await app.inject({
+          url: "/jmap/session",
+          headers: {
+            authorization:
+              "Basic " + Buffer.from(`${email}:${signedIn.accessToken}`).toString("base64"),
+          },
+        })
+      ).json(),
+    ).toEqual({ legacy: true });
+    store.revokeToken(signedIn.refreshToken, "webmail");
+    expect(
+      (
+        await app.inject({
+          url: "/jmap/session",
+          headers: { authorization: "Bearer " + signedIn.accessToken },
+        })
+      ).statusCode,
+    ).toBe(401);
     // An IMAP app password for an allowlisted address still reaches the legacy backend.
     const imap = await app.inject({
       url: "/jmap/session",

@@ -334,6 +334,33 @@ lives in an encrypted, browser-bound cookie rather than in server memory, so aba
 or scripted starts cannot block other users. `npm run gmail:password` remains
 available for operators.
 
+#### Sign in with Google from a mail client (no bridge password)
+
+Register the mail client with `GMAIL_OAUTH_CLIENTS` and the bridge also becomes an
+OAuth 2.0 authorization server for it (authorization code with PKCE S256, public
+clients, metadata at `/.well-known/oauth-authorization-server`):
+
+```bash
+GMAIL_OAUTH_CLIENTS='[{"id":"bulwark","redirectUris":["https://webmail.example.com/*/auth/callback"]}]'
+```
+
+Redirect URIs match exactly, except that `*` stands for one path segment (Bulwark
+puts the locale there). The client sends the user to `/oauth/authorize`; the user
+picks a Google account, and the bridge checks it against `GMAIL_ALLOWED_EMAILS`. An
+account whose Gmail access is already stored signs in without a consent screen. Any
+other account is sent to Google's consent once, and its grant is stored as by
+**Connect Gmail**. The client then gets a single-use code, valid for a minute, and
+exchanges it at `/oauth/token` for a bridge access token (`gmat_…`, one hour, Bearer
+only) and a refresh token (`gmrt_…`). The refresh token lasts while it keeps being
+used, up to 180 days between uses. `/oauth/revoke` ends a refresh token and the
+access tokens under it. Only hashes of these tokens are stored. They are separate
+from the bridge password: every signed-in client has its own, signing in again
+revokes nothing, and disconnecting the account deletes them all. Google tokens never
+leave the bridge.
+
+In Bulwark, give the bridge's server entry an OAuth client ID equal to the
+registered `id`, and optionally a button label such as "Sign in with Google".
+
 Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
 The same database caches metadata, message bodies and attachment bytes in plaintext;
 protect `DATA_DIR` and its backups. Cached values expire and are bounded to 256 MiB

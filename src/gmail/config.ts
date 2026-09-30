@@ -24,6 +24,58 @@ export interface GmailConfig {
   /** Addresses (`user@example.com`) and whole domains (`@example.com`) allowed to connect. */
   allowedEmails: AllowList;
   secureCookies: boolean;
+  /**
+   * Applications allowed to sign users in through the bridge (OAuth 2.0 authorization code with PKCE),
+   * so an account can be added to a mail client with a Google sign-in instead of a bridge password.
+   * Absent or empty: the bridge is no authorization server and only bridge passwords sign in.
+   */
+  oauthClients?: OAuthClient[];
+}
+
+/** A public OAuth client: its id and the redirect URIs it may use; `*` stands for one path segment. */
+export interface OAuthClient {
+  id: string;
+  redirectUris: string[];
+}
+
+export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
+  if (!raw?.trim()) return [];
+  const list: unknown = JSON.parse(raw);
+  if (!Array.isArray(list)) throw new Error("GMAIL_OAUTH_CLIENTS must be a JSON array");
+  return list.map((c: { id?: unknown; redirectUris?: unknown }) => {
+    const uris = Array.isArray(c?.redirectUris) ? c.redirectUris : [];
+    if (
+      typeof c?.id !== "string" ||
+      !/^[A-Za-z0-9._-]{1,64}$/.test(c.id) ||
+      !uris.length ||
+      !uris.every((u) => {
+        if (typeof u !== "string") return false;
+        try {
+          const url = new URL(u.replaceAll("*", "x"));
+          return (
+            !url.hash &&
+            (url.protocol === "https:" ||
+              (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))
+          );
+        } catch {
+          return false;
+        }
+      })
+    )
+      throw new Error(
+        'GMAIL_OAUTH_CLIENTS entries need an "id" and HTTPS "redirectUris" (HTTP only on loopback)',
+      );
+    return { id: c.id, redirectUris: uris as string[] };
+  });
+}
+
+/** Exact match, where `*` in the registered URI stands for one path segment (a locale, say). */
+export function redirectAllowed(client: OAuthClient, uri: string): boolean {
+  return client.redirectUris.some((pattern) =>
+    new RegExp(
+      "^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^/?#]+") + "$",
+    ).test(uri),
+  );
 }
 
 /** Set-like allowlist: exact lower-case addresses plus `@domain` entries. */
@@ -136,5 +188,6 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
     redirectUri: `${base.origin}/auth/google/callback`,
     allowedEmails,
     secureCookies: base.protocol === "https:",
+    oauthClients: parseOAuthClients(process.env.GMAIL_OAUTH_CLIENTS),
   };
 }
