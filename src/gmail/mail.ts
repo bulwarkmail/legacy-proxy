@@ -61,6 +61,8 @@ const MAX_MAILBOX_GET = 10_000;
 const MAX_QUERY = 100;
 const MAX_BLOB = 50_000_000;
 /** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
+/** How long an idle account keeps its label counters; any change moves the cache key first. */
+const LABELS_TTL = 10 * 60_000;
 const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
   "id",
   "threadId",
@@ -416,12 +418,47 @@ export class GmailMail {
       throw error;
     }
   }
-  /** Every label with its counters: one Gmail call per label, so keep it off
-   * the paths that only need one label or no counter at all. */
+  /**
+   * Every label with its counters. Gmail reports counters only per label, so
+   * this is one read per label; through the batch endpoint they travel 100 to
+   * a request instead of 12 at a time - on a Workspace mailbox with 124 labels
+   * that is 2 round trips instead of 11, ~3.5 s down to a fraction. Still keep
+   * it off the paths that need one label or no counter at all.
+   *
+   * The cache key carries the account state, which moves with every history
+   * record, so counters are never older than the last change Gmail reported;
+   * the time limit only bounds how long an idle account keeps the entry.
+   */
   async labels(): Promise<GmailLabel[]> {
     const state = await this.state();
-    return this.cached("labels:" + state, 60_000, async () => {
+    return this.cached("labels:" + state, LABELS_TTL, async () => {
       const listed = await this.labelList();
+      const one = (label: GmailLabel) =>
+        this.api.get<GmailLabel>(`labels/${encodeURIComponent(label.id)}`, 1);
+      if (this.api.batch && listed.length > 1) {
+        try {
+          const labels: GmailLabel[] = [];
+          for (let offset = 0; offset < listed.length; offset += MAX_BATCH) {
+            const page = listed.slice(offset, offset + MAX_BATCH);
+            const answers = await this.api.batch<GmailLabel>(
+              page.map((label) => ({ resource: `labels/${encodeURIComponent(label.id)}` })),
+              1,
+            );
+            // A part that failed on its own is read on its own.
+            labels.push(
+              ...(await Promise.all(
+                page.map((label, index) => answers[index]?.data ?? one(label)),
+              )),
+            );
+          }
+          return labels;
+        } catch (error) {
+          // A batch Google throttled must not fall back to one read per
+          // label: that would spend the same exhausted budget again.
+          if (error instanceof JmapError && error.type === "serverUnavailable")
+            throw error;
+        }
+      }
       // One in-flight batch per concurrency slot; label detail supplies exact message/thread counts.
       const labels: GmailLabel[] = [];
       for (let offset = 0; offset < listed.length; offset += MAX_CONCURRENT) {

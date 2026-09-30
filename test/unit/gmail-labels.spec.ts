@@ -151,3 +151,67 @@ it("answers a push preview's mailbox query without reading every label's counter
   const details = get.mock.calls.filter((c) => String(c[0]).startsWith("labels/"));
   expect(details.map((c) => c[0])).toEqual(["labels/INBOX"]);
 });
+
+it("reads every label's counters through the batch endpoint, 100 to a request", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-labels-"));
+  const store = new GmailStore(dir, crypto.randomBytes(32));
+  cleanup.push(() => {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  // A Workspace mailbox with 124 labels: one labels.get each used to cost 11
+  // round trips at 12 in flight, ~3.5 s.
+  const many = [
+    { id: "INBOX", name: "INBOX", type: "system" },
+    ...Array.from({ length: 123 }, (_, i) => ({ id: `Label_${i}`, name: `L${i}`, type: "user" })),
+  ];
+  const detail = (id: string) => ({ ...many.find((l) => l.id === id)!, messagesTotal: 3, messagesUnread: 1 });
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile")
+      return { emailAddress: email, historyId: "5", messagesTotal: 2, threadsTotal: 2 };
+    if (resource === "labels") return { labels: many };
+    if (resource.startsWith("labels/")) return detail(decodeURIComponent(resource.slice(7)));
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const batch = vi.fn(async (reads: { resource: string }[]) =>
+    reads.map((read) => {
+      const id = decodeURIComponent(read.resource.slice(7));
+      // One part fails on its own: that label alone is read again singly.
+      return id === "Label_7" ? { status: 500 } : { status: 200, data: detail(id) };
+    }),
+  );
+  const mail = new GmailMail(email, { get, batch } as any, store);
+
+  const labels = await mail.labels();
+
+  expect(labels).toHaveLength(124);
+  expect(labels.every((l) => l.messagesTotal === 3)).toBe(true);
+  expect(batch).toHaveBeenCalledTimes(2);
+  expect(batch.mock.calls.map((c) => c[0].length)).toEqual([100, 24]);
+  const singles = get.mock.calls.filter((c) => String(c[0]).startsWith("labels/"));
+  expect(singles.map((c) => c[0])).toEqual(["labels/Label_7"]);
+});
+
+it("does not fall back to one read per label when Google throttles the batch", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-labels-"));
+  const store = new GmailStore(dir, crypto.randomBytes(32));
+  cleanup.push(() => {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile")
+      return { emailAddress: email, historyId: "5", messagesTotal: 2, threadsTotal: 2 };
+    if (resource === "labels") return { labels };
+    if (resource.startsWith("labels/")) return labels.find((l) => l.id === resource.slice(7));
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const { JmapError } = await import("../../src/jmap/errors.js");
+  const batch = vi.fn(async () => {
+    throw new JmapError("serverUnavailable", "Google rate limit; retry later");
+  });
+  const mail = new GmailMail(email, { get, batch } as any, store);
+
+  await expect(mail.labels()).rejects.toMatchObject({ type: "serverUnavailable" });
+  expect(get.mock.calls.filter((c) => String(c[0]).startsWith("labels/"))).toHaveLength(0);
+});
