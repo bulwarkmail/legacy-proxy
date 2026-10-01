@@ -13,10 +13,17 @@ import { makeSession, signSession, verifySession } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
+import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
+
+import { loadGmailConfig } from "./gmail/config.js";
+import { GmailStore } from "./gmail/store.js";
+import { GmailConnection } from "./gmail/connection.js";
+import { registerGmailBackend } from "./gmail/backend.js";
+import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfig();
 const store = new Store(cfg.dataDir);
@@ -56,7 +63,18 @@ await app.register(cors, { origin: true });
 // reply.raw directly, bypassing the onSend hook this plugin uses.
 await app.register(compress, { global: true, threshold: 1024 });
 
-app.get("/healthz", async () => ({ ok: true }));
+const gmailConfig = loadGmailConfig(cfg.publicUrl);
+const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
+// Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
+const gmailHooks: { push?: import("./gmail/push.js").GmailPush } = {};
+app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}), ...(gmailHooks.push ? { gmailPush: gmailHooks.push.stats() } : {}) }));
+
+if (gmailConfig && gmailStore) {
+  const connection = new GmailConnection(gmailConfig, gmailStore);
+  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection, gmailHooks);
+  await app.register(registerGmailRoutes, { config: gmailConfig, connection, store: gmailStore, tokens: gmailStore });
+  app.addHook("onClose", async () => gmailStore.close());
+}
 
 app.post("/api/login", async (req, reply) => {
   const body = req.body as {
@@ -139,7 +157,11 @@ app.post("/jmap", async (req, reply) => {
     }
   }
   try {
-    const out = await dispatch(env, { cfg, pool, store, account, dispatcher });
+    const out = await dispatch(env, {
+      methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher }),
+      maxCallsInRequest: cfg.limits.maxCallsInRequest,
+      sessionState: `s${account.id}`,
+    });
     if (process.env.JMAP_DEBUG === "1") {
       log.info(
         { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },
@@ -451,7 +473,7 @@ async function authn(req: {
 
 const port = cfg.port;
 app
-  .listen({ port, host: "0.0.0.0" })
+  .listen({ port, host: process.env.LISTEN_HOST ?? "0.0.0.0" })
   .then(() => log.info({ port, publicUrl: cfg.publicUrl }, "legacy-proxy listening"))
   .catch((e) => {
     log.fatal({ err: e }, "failed to listen");

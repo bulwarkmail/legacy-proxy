@@ -99,7 +99,7 @@ function resolveArgsInner(
 // After a `*/set` succeeds, harvest its created entries so subsequent calls
 // in the same request can reference them with `#tempId`.
 export function harvestCreatedIds(into: CreatedIds, methodName: string, result: Json): void {
-  if (!methodName.endsWith("/set") || !result || typeof result !== "object") return;
+  if ((!methodName.endsWith("/set") && methodName !== "Email/import") || !result || typeof result !== "object") return;
   const created = (result as { created?: unknown }).created;
   if (!created || typeof created !== "object") return;
   for (const [tempId, obj] of Object.entries(created as Record<string, unknown>)) {

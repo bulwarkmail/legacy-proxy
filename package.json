@@ -19,7 +19,10 @@
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:compliance": "node scripts/run-compliance.mjs",
-    "test:all": "npm run test && npm run test:integration && npm run test:compliance"
+    "test:all": "npm run test && npm run test:integration && npm run test:compliance",
+    "gmail:password": "node --env-file=.env --env-file-if-exists=.env.local dist/gmail/password.js",
+    "gmail:check": "node --env-file=.env --env-file-if-exists=.env.local dist/gmail/check.js",
+    "gmail:disconnect": "node --env-file=.env --env-file-if-exists=.env.local dist/gmail/disconnect.js"
   },
   "dependencies": {
     "@fastify/compress": "^9.1.0",
@@ -27,6 +30,7 @@
     "@fastify/websocket": "^11.0.1",
     "better-sqlite3": "^11.5.0",
     "fastify": "^5.1.0",
+    "google-auth-library": "^11.0.2",
     "imapflow": "^1.0.165",
     "libqp": "^2.1.1",
     "mailparser": "^3.7.1",

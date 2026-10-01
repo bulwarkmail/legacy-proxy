@@ -137,6 +137,7 @@ export async function buildRfc822(
   create: JmapEmailCreate,
   hostname: string,
   getBlob: BlobLookup = () => null,
+  keepBcc = false,
 ): Promise<Buffer> {
   // Choose a root structure based on the inputs we got. Prefer `bodyStructure`
   // (RFC 8621 §4.5.1 form 1) when present — it's the canonical source of
@@ -160,6 +161,8 @@ export async function buildRfc822(
       root.setContent(text ?? "");
     }
   }
+
+  root.keepBcc = keepBcc;
 
   const setIfPresent = (header: string, value: string | null): void => {
     if (value) root.setHeader(header, value);

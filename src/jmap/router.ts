@@ -1,51 +1,6 @@
-import type { ImapPool } from "../imap/pool.js";
-import type { Store, AccountRow } from "../state/store.js";
-import type { AppConfig } from "../util/config.js";
-import type { PushDispatcher } from "../push/dispatcher.js";
 import { log } from "../util/log.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
 import { harvestCreatedIds, resolveArgs, type CreatedIds } from "./refs.js";
-import {
-  mailboxGet,
-  mailboxQuery,
-  mailboxQueryChanges,
-  mailboxChanges,
-  mailboxSet,
-} from "./methods/mailbox.js";
-import {
-  emailGet,
-  emailQuery,
-  emailSet,
-  emailChanges,
-  emailQueryChanges,
-  emailCopy,
-  emailParse,
-  emailImport,
-  searchSnippetGet,
-} from "./methods/email.js";
-import { identityGet, identitySet, identityChanges } from "./methods/identity.js";
-import {
-  emailSubmissionChanges,
-  emailSubmissionGet,
-  emailSubmissionQuery,
-  emailSubmissionSet,
-} from "./methods/submission.js";
-import { vacationGet, vacationSet, vacationChanges } from "./methods/vacation.js";
-import {
-  addressBookGet,
-  addressBookSet,
-  addressBookChanges,
-  contactCardGet,
-  contactCardQuery,
-  contactCardSet,
-  contactCardChanges,
-  contactCardQueryChanges,
-  contactsAvailable,
-} from "./methods/contacts.js";
-import { threadGet, threadChanges } from "./methods/threads.js";
-import { pushSubscriptionGet, pushSubscriptionSet } from "./methods/push.js";
-import { resolveProvider } from "../auth/providers.js";
-import { openCredentials } from "../auth/credentials.js";
 
 export type MethodCall = [string, Record<string, unknown>, string];
 
@@ -66,208 +21,14 @@ export interface ResponseEnvelope {
   sessionState: string;
 }
 
-interface Ctx {
-  cfg: AppConfig;
-  pool: ImapPool;
-  store: Store;
-  account: AccountRow;
-  dispatcher: PushDispatcher;
+/** Handlers are bound by the server; dispatch does not know their transport. */
+export type MethodTable = Readonly<Record<string, (args: Record<string, unknown>) => Promise<unknown>>>;
+
+export interface DispatchContext {
+  methods: MethodTable;
+  maxCallsInRequest: number;
+  sessionState: string;
 }
-
-type Handler = (args: Record<string, unknown>, ctx: Ctx) => Promise<unknown>;
-
-export function makeMethodTable(): Record<string, Handler> {
-  return {
-    "Core/echo": async (a) => a,
-    // RFC 8620 §6.3: Blob/copy. The proxy doesn't (yet) cross account
-    // boundaries — IMAP namespaces don't share — so we surface that limitation
-    // as the spec-defined error. Same-account copies are also forbidden by
-    // §6.3 and must return invalidArguments.
-    "Blob/copy": async (a) => {
-      const args = a as { fromAccountId?: string; accountId?: string };
-      if (!args.fromAccountId || !args.accountId) {
-        throw invalidArguments("fromAccountId and accountId are required");
-      }
-      if (args.fromAccountId === args.accountId) {
-        throw invalidArguments("fromAccountId must differ from accountId");
-      }
-      throw new JmapError(
-        "fromAccountNotFound",
-        "cross-account Blob/copy is not supported by the IMAP backend",
-      );
-    },
-    // Stubs for capabilities we don't advertise but the UI may probe anyway.
-    // Returning an empty result is more graceful than `unknownMethod`, which
-    // some clients treat as a fatal protocol error.
-    "Quota/get": async (a) => ({
-      accountId: (a as { accountId?: string }).accountId ?? "",
-      state: "0",
-      list: [],
-      notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
-    }),
-    "AddressBook/get": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      if (!contactsAvailable(provider)) {
-        return {
-          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
-          state: "0",
-          list: [],
-          notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
-        };
-      }
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return addressBookGet(a as never, { account: c.account, provider, creds });
-    },
-    "AddressBook/set": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return addressBookSet(a as never, { account: c.account, provider, creds });
-    },
-    "AddressBook/changes": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return addressBookChanges(a as never, { account: c.account, provider, creds });
-    },
-    "ContactCard/get": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      if (!contactsAvailable(provider)) {
-        return {
-          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
-          state: "0",
-          list: [],
-          notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
-        };
-      }
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return contactCardGet(a as never, { account: c.account, provider, creds });
-    },
-    "ContactCard/query": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      if (!contactsAvailable(provider)) {
-        return {
-          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
-          queryState: "0",
-          canCalculateChanges: false,
-          position: 0,
-          total: 0,
-          ids: [],
-        };
-      }
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return contactCardQuery(a as never, { account: c.account, provider, creds });
-    },
-    "ContactCard/set": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return contactCardSet(a as never, { account: c.account, provider, creds });
-    },
-    "ContactCard/changes": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return contactCardChanges(a as never, { account: c.account, provider, creds });
-    },
-    "ContactCard/queryChanges": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return contactCardQueryChanges(a as never, { account: c.account, provider, creds });
-    },
-    "Mailbox/get": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        mailboxGet(a as never, { account: c.account, client, store: c.store }),
-      ),
-    "Mailbox/query": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        mailboxQuery(a as never, { account: c.account, client, store: c.store }),
-      ),
-    "Mailbox/queryChanges": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        mailboxQueryChanges(a as never, { account: c.account, client, store: c.store }),
-      ),
-    "Mailbox/changes": async (a, c) =>
-      mailboxChanges(a as never, { account: c.account, store: c.store }),
-    "Mailbox/set": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        mailboxSet(a as never, { account: c.account, client, store: c.store }),
-      ),
-    "Email/query": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
-    "Email/get": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
-    "Email/set": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
-    "Email/changes": async (a, c) =>
-      emailChanges(a as never, { account: c.account, store: c.store }),
-    "Email/queryChanges": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailQueryChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
-    "Email/copy": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailCopy(a as never, { account: c.account, client, store: c.store }),
-      ),
-    "Email/import": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailImport(a as never, { account: c.account, client, store: c.store }),
-      ),
-    "Email/parse": async (a, c) =>
-      emailParse(a as never, { account: c.account, store: c.store }),
-    "SearchSnippet/get": async (a, c) =>
-      searchSnippetGet(a as never, { account: c.account }),
-    "Thread/get": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        threadGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
-    "Thread/changes": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        threadChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
-    "PushSubscription/get": async (a, c) =>
-      pushSubscriptionGet(a as never, { account: c.account, store: c.store, dispatcher: c.dispatcher }),
-    "PushSubscription/set": async (a, c) =>
-      pushSubscriptionSet(a as never, { account: c.account, store: c.store, dispatcher: c.dispatcher }),
-    "EmailSubmission/get": async (a, c) =>
-      emailSubmissionGet(a as never, { account: c.account, store: c.store }),
-    "EmailSubmission/query": async (a, c) =>
-      emailSubmissionQuery(a as never, { account: c.account, store: c.store }),
-    "EmailSubmission/changes": async (a, c) =>
-      emailSubmissionChanges(a as never, { account: c.account, store: c.store }),
-    "EmailSubmission/set": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailSubmissionSet(a as never, {
-          cfg: c.cfg,
-          account: c.account,
-          client,
-          store: c.store,
-        }),
-      ),
-    "Identity/get": async (a, c) =>
-      identityGet(a as never, { account: c.account, store: c.store }),
-    "Identity/set": async (a, c) =>
-      identitySet(a as never, { account: c.account, store: c.store }),
-    "Identity/changes": async (a, c) =>
-      identityChanges(a as never, { account: c.account, store: c.store }),
-    "VacationResponse/get": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return vacationGet(a as never, { account: c.account, provider, creds, store: c.store });
-    },
-    "VacationResponse/set": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
-      return vacationSet(a as never, { account: c.account, provider, creds, store: c.store });
-    },
-    "VacationResponse/changes": async (a, c) =>
-      vacationChanges(a as never, { account: c.account, store: c.store }),
-  };
-}
-
-const TABLE = makeMethodTable();
 
 // RFC 8620 §3.6.1: each method requires a specific capability in `using`. If
 // the client didn't request it, the server returns `unknownMethod` for that
@@ -290,6 +51,7 @@ const METHOD_CAPABILITY: Record<string, string> = {
   "Email/parse": "urn:ietf:params:jmap:mail",
   "SearchSnippet/get": "urn:ietf:params:jmap:mail",
   "Thread/get": "urn:ietf:params:jmap:mail",
+  "Keyword/get": "https://bulwarkmail.com/ns/jmap/keywords",
   "Thread/changes": "urn:ietf:params:jmap:mail",
   "Identity/get": "urn:ietf:params:jmap:submission",
   "Identity/set": "urn:ietf:params:jmap:submission",
@@ -316,6 +78,7 @@ const METHOD_CAPABILITY: Record<string, string> = {
 // paid the sum of three unrelated transports' latency instead of the maximum.
 const PARALLEL_SAFE_METHODS = new Set([
   "Core/echo",
+  "Keyword/get",
   "Quota/get",
   "Mailbox/get",
   "Mailbox/query",
@@ -388,13 +151,13 @@ async function runCall(
   prior: Record<string, { name: string; result: unknown }>,
   createdIds: CreatedIds,
   using: Set<string>,
-  ctx: Ctx,
+  ctx: DispatchContext,
 ): Promise<CallOutcome> {
   const [name, rawArgs, callId] = call;
   const t0 = Date.now();
   try {
     const args = resolveArgs(rawArgs, prior, createdIds) as Record<string, unknown>;
-    const handler = TABLE[name];
+    const handler = Object.hasOwn(ctx.methods, name) ? ctx.methods[name] : undefined;
     if (!handler) throw unknownMethod(name);
     const requiredCap = METHOD_CAPABILITY[name];
     if (requiredCap && !using.has(requiredCap)) {
@@ -403,7 +166,7 @@ async function runCall(
       // to the negotiated capability set.
       throw unknownMethod(name);
     }
-    const result = await handler(args, ctx);
+    const result = await handler(args);
     const ms = Date.now() - t0;
     if (ms >= 250) log.info({ method: name, callId, ms }, "jmap method slow");
 
@@ -428,9 +191,9 @@ async function runCall(
   }
 }
 
-export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<ResponseEnvelope> {
+export async function dispatch(env: RequestEnvelope, ctx: DispatchContext): Promise<ResponseEnvelope> {
   if (!Array.isArray(env.methodCalls)) throw invalidArguments("methodCalls must be an array");
-  if (env.methodCalls.length > ctx.cfg.limits.maxCallsInRequest) {
+  if (env.methodCalls.length > ctx.maxCallsInRequest) {
     throw invalidArguments("too many method calls");
   }
   const using = new Set(env.using ?? []);
@@ -491,6 +254,6 @@ export async function dispatch(env: RequestEnvelope, ctx: Ctx): Promise<Response
   return {
     methodResponses: responses,
     createdIds: Object.keys(createdIdsOut).length ? createdIdsOut : undefined,
-    sessionState: `s${ctx.account.id}`,
+    sessionState: ctx.sessionState,
   };
 }

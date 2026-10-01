@@ -12,12 +12,10 @@ const CORE = "urn:ietf:params:jmap:core";
 // Core/echo touches nothing but the envelope, so the surrounding context can
 // be inert -- these tests are about the dispatch loop, not the handlers.
 const ctx = {
-  cfg: { limits: { maxCallsInRequest: 100 } },
-  pool: {},
-  store: {},
-  account: { id: 7 },
-  dispatcher: {},
-} as unknown as Parameters<typeof dispatch>[1];
+  methods: { "Core/echo": async (args: Record<string, unknown>) => args },
+  maxCallsInRequest: 100,
+  sessionState: "s7",
+} satisfies Parameters<typeof dispatch>[1];
 
 function echo(id: string, args: Record<string, unknown> = {}): MethodCall {
   return ["Core/echo", args, id];
@@ -127,7 +125,7 @@ describe("dispatch", () => {
   });
 
   it("rejects an envelope over the call limit", async () => {
-    const tiny = { ...ctx, cfg: { limits: { maxCallsInRequest: 2 } } } as typeof ctx;
+    const tiny = { ...ctx, maxCallsInRequest: 2 };
     await expect(
       dispatch({ using: [CORE], methodCalls: [echo("a"), echo("b"), echo("c")] }, tiny),
     ).rejects.toThrow();
