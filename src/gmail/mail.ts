@@ -908,6 +908,9 @@ export class GmailMail {
           : { q: await q() };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
+        // Ask Gmail for no more than the page needs: a count asks for one id,
+        // and listing 500 of a large label to return one takes seconds.
+        const pageSize = String(Math.min(500, Math.max(1, wanted)));
         const refs = new Map<string, { id: string; threadId: string }>();
         let token = "";
         const tokens = new Set<string>();
@@ -920,13 +923,13 @@ export class GmailMail {
             }>(
               // Keyed by account state: a listing that survives here is one
               // no history record has touched, so it cannot go stale.
-              `page:${state}:${hash(listing)}:${hash(cursor)}`,
+              `page:${state}:${hash(listing)}:${pageSize}:${hash(cursor)}`,
               MESSAGE_TTL,
               () =>
                 this.api.get("messages", 5, {
                   ...listing,
                   includeSpamTrash: "true",
-                  maxResults: "500",
+                  maxResults: pageSize,
                   ...(cursor ? { pageToken: cursor } : {}),
                 }),
             );
