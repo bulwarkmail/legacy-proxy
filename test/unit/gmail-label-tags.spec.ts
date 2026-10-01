@@ -147,3 +147,34 @@ it("enumerates the account's keywords from the labels rather than the mailbox", 
   );
   expect(result.list.some((k) => k.id === "$label:inbox")).toBe(false);
 });
+
+it("counts a tag from its label's counters, and an unknown tag without asking Gmail", async () => {
+  const store = open();
+  const calls: string[] = [];
+  const get = vi.fn(async (resource: string, _cost?: number, params?: Record<string, unknown>) => {
+    calls.push(resource + (params?.q ? "?q" : params?.labelIds ? "?labelIds" : ""));
+    if (resource === "profile") return profile;
+    if (resource === "labels") return { labels };
+    if (resource === "labels/Label_2") return { ...labels.at(-1), messagesTotal: 7, messagesUnread: 3 };
+    if (resource === "messages") return { messages: [{ id: "a", threadId: "t" }] };
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as never, store);
+  const query = mail.methods()["Email/query"]!;
+  const count = async (filter: unknown) =>
+    ((await query({ accountId: mail.accountId, filter, limit: 1, calculateTotal: true })) as { total: number }).total;
+
+  expect(await count({ hasKeyword: "$label:da-leggere" })).toBe(7);
+  expect(
+    await count({ operator: "AND", conditions: [{ hasKeyword: "$label:da-leggere" }, { notKeyword: "$seen" }] }),
+  ).toBe(3);
+  // Exact counters and a listing by label id: never a search.
+  expect(calls.some((c) => c.endsWith("?q"))).toBe(false);
+
+  calls.length = 0;
+  expect(await count({ hasKeyword: "$label:another-accounts-tag" })).toBe(0);
+  expect(
+    await count({ operator: "AND", conditions: [{ hasKeyword: "$label:another-accounts-tag" }, { notKeyword: "$seen" }] }),
+  ).toBe(0);
+  expect(calls.filter((c) => c.startsWith("messages") || c.startsWith("labels/"))).toEqual([]);
+});

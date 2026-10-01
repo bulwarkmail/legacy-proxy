@@ -17,6 +17,7 @@ import {
   ALL_MAIL,
   HIDDEN_LABELS,
   labelKeyword,
+  LABEL_KEYWORD,
   upstreamId,
   mapMessage,
   partTree,
@@ -493,6 +494,56 @@ export class GmailMail {
     }
     return (id) => keywords.get(id) ?? null;
   }
+  /**
+   * `{hasKeyword: "$label:x"}`, alone or ANDed with `{notKeyword: "$seen"}`,
+   * rewritten as the same query on the label's mailbox; `null` when the account
+   * has no label with that keyword; `undefined` for any other filter.
+   */
+  private async labelKeywordFilter(
+    filter: unknown,
+  ): Promise<Record<string, unknown> | null | undefined> {
+    if (!this.labelTags || !filter || typeof filter !== "object") return undefined;
+    const f = filter as Record<string, unknown>;
+    const isTag = (c: unknown): c is { hasKeyword: string } =>
+      !!c &&
+      typeof c === "object" &&
+      Object.keys(c).length === 1 &&
+      typeof (c as Record<string, unknown>).hasKeyword === "string" &&
+      ((c as Record<string, unknown>).hasKeyword as string).toLowerCase().startsWith(LABEL_KEYWORD);
+    let tag: string | undefined;
+    let unread = false;
+    if (isTag(f)) tag = f.hasKeyword;
+    else if (
+      f.operator === "AND" &&
+      Array.isArray(f.conditions) &&
+      f.conditions.length === 2 &&
+      Object.keys(f).length === 2
+    ) {
+      const parts = f.conditions as unknown[];
+      const tagged = parts.find(isTag);
+      const unseen = parts.find(
+        (c) =>
+          !!c &&
+          typeof c === "object" &&
+          Object.keys(c).length === 1 &&
+          (c as Record<string, unknown>).notKeyword === "$seen",
+      );
+      if (tagged && unseen) {
+        tag = tagged.hasKeyword;
+        unread = true;
+      }
+    }
+    if (tag === undefined) return undefined;
+    const wanted = tag.toLowerCase();
+    const label = (await this.labelList()).find(
+      (l) => l.type === "user" && labelKeyword(l.name) === wanted,
+    );
+    if (!label) return null;
+    const box = { inMailbox: "l_" + label.id };
+    return unread
+      ? { operator: "AND", conditions: [box, { notKeyword: "$seen" }] }
+      : box;
+  }
   private account(args: Record<string, unknown>): void {
     if (args.accountId !== this.accountId) throw accountNotFound();
   }
@@ -779,9 +830,23 @@ export class GmailMail {
     )
       throw invalidArguments("Invalid collapseThreads");
     const state = await this.state();
+    // A tag is a Gmail label, so "messages with this tag" (and "unread ones")
+    // is a folder query on that label: exact counters, no search. Clients
+    // count every tag this way, often for tags another account defines; one
+    // the account does not have matches nothing and needs no call at all.
+    const asLabel = await this.labelKeywordFilter(args.filter);
+    if (asLabel === null)
+      return {
+        accountId: this.accountId,
+        queryState: hash([state, "no-label"]),
+        canCalculateChanges: false,
+        position: 0,
+        ids: [],
+        ...(args.calculateTotal === true ? { total: 0 } : {}),
+      };
     // Common folder view: use exact label/profile counts and fetch only the
     // requested pages. A large Inbox must not require a full account scan.
-    const f = args.filter as Record<string, unknown> | undefined;
+    const f = (asLabel ?? args.filter) as Record<string, unknown> | undefined;
     // "Unread in a folder" is the shape a notification preview and every unread
     // badge use. Gmail keeps UNREAD as a label, so it lists exactly like a folder
     // and its count is the label's own messagesUnread - no search, no full scan.
