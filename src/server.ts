@@ -48,6 +48,11 @@ const app = Fastify({
   loggerInstance: log,
   bodyLimit: cfg.limits.maxSizeRequest,
   disableRequestLogging: false,
+  // The download URL carries the attachment's file name as a path segment.
+  // Fastify's default cap of 100 characters answers longer ones with a 404,
+  // which a client shows as an empty attached message; percent-encoding
+  // triples non-ASCII names, so leave room for a 255-byte name.
+  routerOptions: { maxParamLength: 1024 },
 });
 
 await app.register(cors, { origin: true });
