@@ -128,18 +128,41 @@ export class GmailCompose {
     if (a && a.accountId !== this.c.accountId) fail("accountNotFound", "Wrong account");
     if (!(await this.c.enabled())) fail("accountReadOnly", "Composition disabled");
   }
+  /**
+   * A draft write, forgetting only what it touches (see GmailStore.forget):
+   * the messages named in `touched` and the one Gmail answers with. A message
+   * the write changed beyond those turns up in the history the next read
+   * fetches.
+   */
   private async mutate<T>(
     resource: string,
     cost: number,
     method: "POST" | "DELETE",
     data?: unknown,
     params?: Record<string, string>,
+    touched: { id: string; threadId?: string }[] = [],
   ): Promise<T> {
-    this.c.store.invalidate(this.c.email);
+    const forget = (answer?: unknown) => {
+      // A draft carries its message under `message`; a sent or imported message is the answer itself.
+      const reply = answer as { id?: unknown; threadId?: unknown; message?: unknown } | undefined;
+      const answered = (reply?.message ?? reply) as { id?: unknown; threadId?: unknown } | undefined;
+      const named =
+        typeof answered?.id === "string"
+          ? [...touched, { id: answered.id, threadId: typeof answered.threadId === "string" ? answered.threadId : undefined }]
+          : touched;
+      this.c.store.forget(
+        this.c.email,
+        named.map((m) => m.id),
+        named.flatMap((m) => (m.threadId ? [m.threadId] : [])),
+      );
+    };
+    forget();
+    let answer: T | undefined;
     try {
-      return await this.c.api.mutate<T>(resource, cost, method, data, params);
+      answer = await this.c.api.mutate<T>(resource, cost, method, data, params);
+      return answer;
     } finally {
-      this.c.store.invalidate(this.c.email);
+      forget(answer);
     }
   }
   private placement(input: Record<string, unknown>) {
@@ -431,7 +454,7 @@ export class GmailCompose {
     );
     if (!m.labelIds?.includes("DRAFT")) fail("forbidden", "Permanent mail deletion is disabled");
     const draft = await this.checkedDraft(original);
-    await this.mutate("drafts/" + encodeURIComponent(draft.id), 10, "DELETE");
+    await this.mutate("drafts/" + encodeURIComponent(draft.id), 10, "DELETE", undefined, undefined, [draft.message]);
     // Every autosave creates a draft; its id mapping is only needed while the message exists.
     this.c.store.forgetDraft(this.c.email, original);
   }
@@ -545,7 +568,7 @@ export class GmailCompose {
     if (!this.c.store.beginSubmission(this.c.email, original, fingerprint))
       fail("serverFail", "Submission already in progress");
     // Persist the intent before crossing the network. An unknown outcome is never replayed.
-    const sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id }).catch((e) => {
+    const sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id }, undefined, [draft.message]).catch((e) => {
       // Google never received or refused the send: nothing went out, so the draft stays sendable.
       if (e instanceof GmailNotSent) {
         this.c.store.abandonSubmission(this.c.email, original);
@@ -674,7 +697,7 @@ export class GmailCompose {
       return this.c.store.scheduleFinish(row.id, "uncertain", "concurrent send of the same draft");
     let sent: GmailMessage;
     try {
-      sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id });
+      sent = await this.mutate<GmailMessage>("drafts/send", 100, "POST", { id: draft.id }, undefined, [draft.message]);
     } catch (e) {
       if (e instanceof GmailNotSent) {
         this.c.store.abandonSubmission(this.c.email, row.original);

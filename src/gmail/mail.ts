@@ -1105,17 +1105,30 @@ export class GmailMail {
       e instanceof JmapError
         ? e.toMethodError()
         : { type: "serverFail", description: "Gmail update failed" };
+    // Before and after: a read that starts while the write is in flight must
+    // not cache what it saw. A message write forgets that message and the
+    // listings; a label write can rename or empty a label on any message, so
+    // it still empties the account.
     const mutate = async <T>(
       resource: string,
       cost: number,
       method: "POST" | "PATCH" | "DELETE",
       data?: unknown,
+      message?: { id: string; threadId?: string },
     ): Promise<T> => {
-      this.store.invalidate(this.email);
+      const forget = () =>
+        message
+          ? this.store.forget(
+              this.email,
+              [message.id],
+              message.threadId ? [message.threadId] : [],
+            )
+          : this.store.invalidate(this.email);
+      forget();
       try {
         return await this.api.mutate!<T>(resource, cost, method, data);
       } finally {
-        this.store.invalidate(this.email);
+        forget();
       }
     };
     // Fresh label metadata validates membership and prevents editing system labels.
@@ -1185,6 +1198,7 @@ export class GmailMail {
                   5,
                   "POST",
                   delta,
+                  message,
                 )
               : message;
           const mapped = await mapMessage(
