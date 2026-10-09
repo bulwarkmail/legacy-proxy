@@ -14,7 +14,8 @@ import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
-import { buildRfc822, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { readBlob } from "../blobs.js";
 import {
   changesFromLog,
   changesOrCannotCalculate,
@@ -1396,6 +1397,17 @@ export async function applyEmailUpdate(
   });
 }
 
+function referencedBlobIds(create: JmapEmailCreate): Set<string> {
+  const out = new Set<string>();
+  const walk = (p: BodyStructurePart): void => {
+    if (p.blobId) out.add(p.blobId);
+    p.subParts?.forEach(walk);
+  };
+  if (create.bodyStructure) walk(create.bodyStructure);
+  create.attachments?.forEach(walk);
+  return out;
+}
+
 interface CreatedEmailResult {
   id: string;
   blobId: string;
@@ -1443,11 +1455,29 @@ async function applyEmailCreate(
     }
   }
 
-  const mime = await buildRfc822(
-    payload as JmapEmailCreate,
-    ctx.account.host || "localhost",
-    (blobId) => ctx.store.getUpload(blobId, ctx.account.id),
-  );
+  // buildRfc822 looks blobs up synchronously, so load them first. Besides
+  // uploads these can be parts of existing mail: a re-opened draft or a
+  // forward references its attachments by their part blobIds.
+  const blobs = new Map<string, { body: Buffer; ctype: string }>();
+  for (const blobId of referencedBlobIds(payload as JmapEmailCreate)) {
+    const blob = await readBlob(blobId, ctx);
+    if (blob) blobs.set(blobId, blob);
+  }
+
+  let mime: Buffer;
+  try {
+    mime = await buildRfc822(
+      payload as JmapEmailCreate,
+      ctx.account.host || "localhost",
+      (blobId) => blobs.get(blobId) ?? null,
+    );
+  } catch (e) {
+    // RFC 8621 §4.6: a part referencing an unknown blob fails the create.
+    if (e instanceof MissingBlobError) {
+      throw new JmapError("blobNotFound", e.message, { notFound: [e.blobId] });
+    }
+    throw e;
+  }
 
   const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;
   const res = await ctx.client.append(target.name, mime, flags.length ? flags : undefined, idate);
