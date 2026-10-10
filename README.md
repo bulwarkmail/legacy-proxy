@@ -300,6 +300,9 @@ methods will then either return empty results or, for vacation, reject with
 the underlying ManageSieve error. An optional `domains` array on a provider
 opts it into domain-based [provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
+When the DAV server uses a different login than the mail server, set
+`username` and `password` on the `carddav` entry (e.g.
+`"password": "$CARDDAV_PASSWORD"`); otherwise the IMAP credentials are reused.
 
 ## Tests
 
