@@ -13,7 +13,7 @@ const SYSTEM: ReadonlyArray<[string, string]> = [
 const KW_TO_FLAG = new Map<string, string>(SYSTEM);
 const FLAG_TO_KW = new Map<string, string>(SYSTEM.map(([k, f]) => [f.toLowerCase(), k]));
 
-const SAFE_FLAG = /^[A-Za-z0-9$_\\.-]+$/;
+const SAFE_FLAG = /^[A-Za-z0-9$_\\.:-]+$/;
 
 export function keywordToFlag(kw: string): string {
   const sys = KW_TO_FLAG.get(kw);
