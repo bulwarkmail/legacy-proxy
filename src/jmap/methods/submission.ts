@@ -209,13 +209,28 @@ export async function emailSubmissionSet(
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
-      await submit({
+      const result = await submit({
         provider,
         creds,
         envelopeFrom: env.from,
         rcptTo: env.to,
         raw: stripBccHeader(raw),
       });
+      // The only record a send leaves on our side. Without it there is no way
+      // to tell "never left the proxy" from "delivered, nobody answered".
+      // Addresses are personal data, so they are only logged on request.
+      const sendLog = {
+        emailId: payload.emailId,
+        accepted: result.accepted.length,
+        rejected: result.rejected.length,
+        smtpResponse: result.response,
+        messageId: result.messageId,
+        ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
+          ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
+          : {}),
+      };
+      if (result.rejected.length > 0) log.warn(sendLog, "submission: SMTP server rejected some recipients");
+      else log.info(sendLog, "submission: accepted by SMTP server");
       const id = `s-${ctx.account.id}-${Date.now()}-${tempId}`;
       const sub: SubmissionResult = {
         id,
