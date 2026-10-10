@@ -21,7 +21,8 @@ interface BodyValue {
 
 // JMAP `bodyStructure` (RFC 8621 §4.1.4): a recursive tree describing the
 // MIME hierarchy. Leaves carry either a partId (resolved through bodyValues)
-// or a blobId (references a previously-uploaded blob).
+// or a blobId (an upload, or a part of existing mail such as a forwarded
+// attachment).
 export interface BodyStructurePart {
   type?: string;
   partId?: string;
@@ -164,9 +165,9 @@ function wrapAttachments(
 }
 
 export interface BlobLookup {
-  // Returns the bytes for a previously-uploaded blobId, or null if missing.
-  // The lookup is synchronous for buildRfc822's MimeNode walk; loading from
-  // SQLite is cheap so a sync API is enough.
+  // Returns the bytes for a blobId, or null if missing. The lookup is
+  // synchronous for buildRfc822's MimeNode walk; callers load the referenced
+  // blobs up front (some need an IMAP fetch) and answer from those.
   (blobId: string): { body: Buffer; ctype: string } | null;
 }
 
