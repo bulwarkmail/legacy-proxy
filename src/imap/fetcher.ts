@@ -9,6 +9,7 @@ import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js"
 import { parseHeaderBlock, asMessageIds, computeThreadIdFromHeaders, type ParsedHeader } from "./headers.js";
 import { fetchByUid } from "./uids.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
+import { log } from "../util/log.js";
 
 // The header fields threading and the default Email/get property set need:
 // References for threadId + `references`, In-Reply-To / Message-ID as backup.
@@ -321,8 +322,9 @@ async function fetchBodyValuesBatched(
       )) {
         if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
       }
-    } catch {
+    } catch (e) {
       // fall through: members without raw parts get isEncodingProblem below
+      log.warn({ uids: g.members.length, partIds: g.partIds, ...imapErrorDetails(e) }, "body part FETCH failed");
     }
     for (const m of g.members) {
       const bodyParts = rawByUid.get(m.uid);
@@ -346,6 +348,25 @@ async function fetchBodyValuesBatched(
     }
   }
   return out;
+}
+
+// The server's side of a failed IMAP command. imapflow puts the tagged NO/BAD
+// text on the error object; without it the log only says "Command failed".
+export function imapErrorDetails(e: unknown): Record<string, unknown> {
+  const err = e as {
+    message?: string;
+    responseText?: string;
+    responseStatus?: string;
+    serverResponseCode?: string;
+    code?: string;
+  };
+  return {
+    err: err?.message ?? String(e),
+    responseStatus: err?.responseStatus,
+    responseText: err?.responseText,
+    serverResponseCode: err?.serverResponseCode,
+    code: err?.code,
+  };
 }
 
 // Fetch preview snippets for the given messages, batching one FETCH per
@@ -405,8 +426,9 @@ async function fetchPreviewsBatched(
         const decoded = decodeTransferEncoding(buf, t.encoding);
         out.set(m.uid, buildPreview(decodePartText(decoded, t.charset), t.isHtml));
       }
-    } catch {
+    } catch (e) {
       // best-effort: leave preview empty (and uncached) for this group
+      log.warn({ partId, uids: group.length, ...imapErrorDetails(e) }, "preview FETCH failed");
     }
   }
   return out;
