@@ -248,6 +248,12 @@ export async function buildRfc822(
     root.setHeader(h.name, h.value ?? "");
   }
 
+  // MimeNode drops Bcc from the output by default. Keep it: the stored draft
+  // is what EmailSubmission/set derives the envelope from when the client
+  // sends none, and without the header Bcc recipients were silently never
+  // sent to. Submission strips it again before handing the message to SMTP.
+  root.keepBcc = true;
+
   return await new Promise<Buffer>((resolve, reject) => {
     root.build((err: Error | null, message: Buffer) => {
       if (err) reject(err);

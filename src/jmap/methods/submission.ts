@@ -11,6 +11,7 @@ import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, n
 import { applyEmailUpdate } from "./email.js";
 import { SIDE_RESPONSES, type MethodCall } from "../router.js";
 import { encodeEmailState } from "../../state/states.js";
+import { log } from "../../util/log.js";
 
 interface SetError {
   type: string;
@@ -114,6 +115,39 @@ async function fetchRfc822(
   return { raw, mailboxName: mbox.name };
 }
 
+// The Message-ID the recipients see. nodemailer's info.messageId is one it
+// makes up itself; with a raw message it never reaches the wire.
+export function messageIdOf(raw: Buffer): string | null {
+  const text = raw.toString("binary");
+  const end = text.search(/\r?\n\r?\n/);
+  const head = end < 0 ? text : text.slice(0, end);
+  const m = /^message-id:[ \t]*([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/im.exec(head);
+  return m ? m[1]!.replace(/\s+/g, " ").trim() : null;
+}
+
+// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop it (and
+// its folded continuation lines) from the header block, leaving the body
+// byte-for-byte untouched.
+export function stripBccHeader(raw: Buffer): Buffer {
+  const text = raw.toString("binary");
+  const m = /\r?\n\r?\n/.exec(text);
+  // Include the last header line's own line break so every line we keep is
+  // terminated and the blank separator line follows untouched.
+  const headerEnd = m ? m.index + (text[m.index] === "\r" ? 2 : 1) : text.length;
+  const lines = text.slice(0, headerEnd).split(/(?<=\n)/);
+  const kept: string[] = [];
+  let dropping = false;
+  for (const line of lines) {
+    if (/^[ \t]/.test(line)) {
+      if (!dropping) kept.push(line);
+      continue;
+    }
+    dropping = /^bcc[ \t]*:/i.test(line);
+    if (!dropping) kept.push(line);
+  }
+  return Buffer.from(kept.join("") + text.slice(headerEnd), "binary");
+}
+
 function asEmail(s: string | undefined | null): string | null {
   if (!s) return null;
   const t = s.trim();
@@ -185,13 +219,28 @@ export async function emailSubmissionSet(
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
-      await submit({
+      const result = await submit({
         provider,
         creds,
         envelopeFrom: env.from,
         rcptTo: env.to,
-        raw,
+        raw: stripBccHeader(raw),
       });
+      // The only record a send leaves on our side. Without it there is no way
+      // to tell "never left the proxy" from "delivered, nobody answered".
+      // Addresses are personal data, so they are only logged on request.
+      const sendLog = {
+        emailId: payload.emailId,
+        accepted: result.accepted.length,
+        rejected: result.rejected.length,
+        smtpResponse: result.response,
+        messageId: messageIdOf(raw),
+        ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
+          ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
+          : {}),
+      };
+      if (result.rejected.length > 0) log.warn(sendLog, "submission: SMTP server rejected some recipients");
+      else log.info(sendLog, "submission: accepted by SMTP server");
       const id = `s-${ctx.account.id}-${Date.now()}-${tempId}`;
       const sub: SubmissionResult = {
         id,
@@ -212,6 +261,18 @@ export async function emailSubmissionSet(
       rememberSubmission(ctx.account.id, sub);
       successByTempId.set(tempId, { emailId: payload.emailId });
     } catch (e) {
+      const smtp = e as { response?: string; responseCode?: number; command?: string; code?: string };
+      log.warn(
+        {
+          emailId: payload.emailId,
+          err: (e as Error).message,
+          smtpResponse: smtp.response,
+          smtpResponseCode: smtp.responseCode,
+          smtpCommand: smtp.command,
+          code: smtp.code,
+        },
+        "submission failed",
+      );
       notCreated[tempId] = toSetError(e);
     }
   }
