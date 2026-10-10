@@ -14,7 +14,7 @@ import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
-import { openImap } from "./imap/client.js";
+import { imapErrorDetails, openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -253,8 +253,15 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
         parsed.partId ?? undefined,
         { uid: true },
       );
-      if (!dl) {
+      // imapflow answers `{}` rather than null when the FETCH came back
+      // without the message or part (expunged, or the server could not
+      // produce it), so check for the stream itself.
+      if (!dl?.content) {
         release();
+        log.warn(
+          { mailbox: mbox.name, uid: emailParts.uid, partId: parsed.partId ?? null },
+          "download: IMAP server returned no content",
+        );
         return reply.code(404).send({ error: "blob not found" });
       }
 
@@ -318,7 +325,10 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
       return reply.send(tee);
     } catch (e) {
       release();
-      log.error({ err: (e as Error).message }, "download error");
+      log.error(
+        { mailbox: mbox.name, uid: emailParts.uid, partId: parsed.partId ?? null, ...imapErrorDetails(e) },
+        "download error",
+      );
       return reply.code(502).send({ error: "download failed" });
     }
   },

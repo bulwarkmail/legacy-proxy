@@ -42,3 +42,22 @@ export async function withMailbox<T>(
     lock.release();
   }
 }
+
+// The server's side of a failed IMAP command. imapflow puts the tagged NO/BAD
+// text on the error object; without it the log only says "Command failed".
+export function imapErrorDetails(e: unknown): Record<string, unknown> {
+  const err = e as {
+    message?: string;
+    responseText?: string;
+    responseStatus?: string;
+    serverResponseCode?: string;
+    code?: string;
+  };
+  return {
+    err: err?.message ?? String(e),
+    responseStatus: err?.responseStatus,
+    responseText: err?.responseText,
+    serverResponseCode: err?.serverResponseCode,
+    code: err?.code,
+  };
+}
