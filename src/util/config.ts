@@ -19,6 +19,9 @@ export interface ProviderConfig {
     secure?: boolean;
     basePath?: string;
     principalPath?: string;
+    /** DAV login when it differs from the mail login; falls back to the IMAP credentials. */
+    username?: string;
+    password?: string;
   } | null;
   auth: { mech: string[] };
 }
