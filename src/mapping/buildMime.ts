@@ -21,7 +21,8 @@ interface BodyValue {
 
 // JMAP `bodyStructure` (RFC 8621 §4.1.4): a recursive tree describing the
 // MIME hierarchy. Leaves carry either a partId (resolved through bodyValues)
-// or a blobId (references a previously-uploaded blob).
+// or a blobId (an upload, or a part of existing mail such as a forwarded
+// attachment).
 export interface BodyStructurePart {
   type?: string;
   partId?: string;
@@ -48,6 +49,9 @@ export interface JmapEmailCreate {
   sentAt?: string | null;
   textBody?: BodyPartRef[] | null;
   htmlBody?: BodyPartRef[] | null;
+  // RFC 8621 §4.6: with textBody / htmlBody, attachments (inline images with
+  // a cid, and files) are listed here instead of in a bodyStructure.
+  attachments?: BodyStructurePart[] | null;
   bodyValues?: Record<string, BodyValue> | null;
   // Headers passed through verbatim (asRaw form). We don't attempt to
   // re-parse these; clients that send us structured forms should map them
@@ -106,9 +110,18 @@ function nodeFromBodyStructure(
     node.setContent(bodyValues[part.partId]!.value!);
   } else if (part.blobId) {
     const blob = getBlob(part.blobId);
-    if (blob) node.setContent(blob.body);
+    // An empty part would go out as a blank file or a broken inline image;
+    // refuse the message instead.
+    if (!blob) throw new MissingBlobError(part.blobId);
+    node.setContent(blob.body);
   }
   return node;
+}
+
+export class MissingBlobError extends Error {
+  constructor(readonly blobId: string) {
+    super(`blob ${blobId} not found`);
+  }
 }
 
 function resolveBody(
@@ -126,10 +139,35 @@ function resolveBody(
   return chunks.join("\r\n");
 }
 
+// RFC 8621 §4.6: inline parts with a cid sit next to the HTML they are
+// referenced from in a multipart/related; everything else, and inline parts
+// without HTML to show them, goes into a multipart/mixed around that.
+function wrapAttachments(
+  body: MimeNode,
+  attachments: BodyStructurePart[],
+  hasHtml: boolean,
+  getBlob: BlobLookup,
+  hostname: string,
+): MimeNode {
+  const related = hasHtml ? attachments.filter((a) => a.cid && a.disposition === "inline") : [];
+  const mixed = attachments.filter((a) => !related.includes(a));
+  let root = body;
+  for (const [type, parts] of [["multipart/related", related], ["multipart/mixed", mixed]] as const) {
+    if (!parts.length) continue;
+    const wrapper = new MimeNode(type, { hostname });
+    wrapper.appendChild(root);
+    for (const p of parts) {
+      wrapper.appendChild(nodeFromBodyStructure({ ...p, disposition: p.disposition ?? "attachment" }, null, getBlob, hostname));
+    }
+    root = wrapper;
+  }
+  return root;
+}
+
 export interface BlobLookup {
-  // Returns the bytes for a previously-uploaded blobId, or null if missing.
-  // The lookup is synchronous for buildRfc822's MimeNode walk; loading from
-  // SQLite is cheap so a sync API is enough.
+  // Returns the bytes for a blobId, or null if missing. The lookup is
+  // synchronous for buildRfc822's MimeNode walk; callers load the referenced
+  // blobs up front (some need an IMAP fetch) and answer from those.
   (blobId: string): { body: Buffer; ctype: string } | null;
 }
 
@@ -159,6 +197,7 @@ export async function buildRfc822(
       root = new MimeNode("text/plain; charset=utf-8", { hostname });
       root.setContent(text ?? "");
     }
+    root = wrapAttachments(root, create.attachments ?? [], html !== null, getBlob, hostname);
   }
 
   const setIfPresent = (header: string, value: string | null): void => {
