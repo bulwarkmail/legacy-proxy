@@ -115,6 +115,16 @@ async function fetchRfc822(
   return { raw, mailboxName: mbox.name };
 }
 
+// The Message-ID the recipients see. nodemailer's info.messageId is one it
+// makes up itself; with a raw message it never reaches the wire.
+export function messageIdOf(raw: Buffer): string | null {
+  const text = raw.toString("binary");
+  const end = text.search(/\r?\n\r?\n/);
+  const head = end < 0 ? text : text.slice(0, end);
+  const m = /^message-id:[ \t]*([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/im.exec(head);
+  return m ? m[1]!.replace(/\s+/g, " ").trim() : null;
+}
+
 // RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop it (and
 // its folded continuation lines) from the header block, leaving the body
 // byte-for-byte untouched.
@@ -224,7 +234,7 @@ export async function emailSubmissionSet(
         accepted: result.accepted.length,
         rejected: result.rejected.length,
         smtpResponse: result.response,
-        messageId: result.messageId,
+        messageId: messageIdOf(raw),
         ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
           ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
           : {}),

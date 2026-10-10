@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildRfc822 } from "../../src/mapping/buildMime.js";
-import { stripBccHeader } from "../../src/jmap/methods/submission.js";
+import { messageIdOf, stripBccHeader } from "../../src/jmap/methods/submission.js";
 
 describe("Bcc handling", () => {
   it("keeps Bcc in the stored draft so the envelope can be derived from it", async () => {
@@ -35,5 +35,13 @@ describe("Bcc handling", () => {
   it("leaves a message without Bcc unchanged", () => {
     const raw = Buffer.from("From: a@example.org\r\nTo: b@example.org\r\n\r\nbody");
     expect(stripBccHeader(raw).equals(raw)).toBe(true);
+  });
+});
+
+describe("messageIdOf", () => {
+  it("reads the Message-ID header, folded or not, and ignores the body", () => {
+    expect(messageIdOf(Buffer.from("From: a@example.org\r\nMessage-ID: <x@example.org>\r\n\r\nbody"))).toBe("<x@example.org>");
+    expect(messageIdOf(Buffer.from("message-id:\r\n <y@example.org>\r\n\r\n"))).toBe("<y@example.org>");
+    expect(messageIdOf(Buffer.from("From: a@example.org\r\n\r\nMessage-ID: <body@example.org>\r\n"))).toBeNull();
   });
 });
