@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { providerForEmail, resolveProviderName } from "../../src/auth/providers.js";
+import { providerForEmail, resolveProvider, resolveProviderName } from "../../src/auth/providers.js";
 import type { AppConfig, ProviderConfig } from "../../src/util/config.js";
 
 function provider(domains?: string[]): ProviderConfig {
@@ -57,5 +57,14 @@ describe("resolveProviderName", () => {
   it("falls back to the default provider when the domain is unknown", () => {
     expect(resolveProviderName(cfg, { username: "x@unknown.tld" })).toBe("generic");
     expect(resolveProviderName(cfg, {})).toBe("generic");
+  });
+});
+
+describe("resolveProvider carddav credentials", () => {
+  it("interpolates a separate DAV login from the environment", () => {
+    process.env.TEST_DAV_PASSWORD = "s3cret";
+    const p = { ...provider(), carddav: { host: "dav.example", port: 443, username: "dav-user", password: "$TEST_DAV_PASSWORD" } };
+    const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
+    expect(resolveProvider(c).carddav).toMatchObject({ username: "dav-user", password: "s3cret" });
   });
 });
