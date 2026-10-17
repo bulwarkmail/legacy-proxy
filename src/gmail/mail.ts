@@ -102,6 +102,21 @@ const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
  */
 const MESSAGE_TTL = 30 * 24 * 60 * 60_000;
 
+/**
+ * What `Thread/get` keeps of a thread: its message ids and dates. Caching the
+ * full thread meant decrypting every body, and writing every message back to
+ * the cache, on each folder page that asked for its conversation sizes.
+ */
+type ThreadMembers = { messages: { id: string; internalDate?: string }[] };
+function threadMembers(thread: { messages?: GmailMessage[] }): ThreadMembers {
+  return {
+    messages: (thread.messages ?? []).map((m) => ({
+      id: m.id,
+      internalDate: m.internalDate,
+    })),
+  };
+}
+
 export class GmailMail {
   readonly accountId: string;
   private composer: GmailCompose;
@@ -726,6 +741,52 @@ export class GmailMail {
         const answer = answers[index];
         if (answer?.data)
           this.store.cache(this.email, key(id), answer.data, MESSAGE_TTL);
+      }
+    }
+  }
+  /**
+   * Fills the thread cache for `ids` with one batch read per hundred threads,
+   * so a folder page's conversation sizes cost one round trip to Google
+   * instead of fifty, four at a time. Best effort like {@link prefetch}.
+   */
+  private async prefetchThreads(ids: string[]): Promise<void> {
+    if (!this.api.batch || ids.length < 2) return;
+    const wanted = [
+      ...new Set(
+        ids.filter(
+          (id) =>
+            /^t_[A-Za-z0-9_-]{1,128}$/.test(id) &&
+            this.store.cached(this.email, `thread:v3:${id}`) === null,
+        ),
+      ),
+    ];
+    for (let offset = 0; offset < wanted.length; offset += MAX_BATCH) {
+      const page = wanted.slice(offset, offset + MAX_BATCH);
+      const revision = this.store.revision(this.email);
+      let answers: { status: number; data?: { messages?: GmailMessage[] } }[];
+      try {
+        answers = await this.api.batch<{ messages?: GmailMessage[] }>(
+          page.map((id) => ({
+            resource: `threads/${encodeURIComponent(id.slice(2))}`,
+            params: { format: "minimal" },
+          })),
+          10,
+        );
+      } catch (error) {
+        if (error instanceof JmapError && error.type === "serverUnavailable")
+          throw error;
+        return;
+      }
+      if (this.store.revision(this.email) !== revision) return;
+      for (const [index, id] of page.entries()) {
+        const answer = answers[index];
+        if (answer?.data)
+          this.store.cache(
+            this.email,
+            `thread:v3:${id}`,
+            threadMembers(answer.data),
+            MESSAGE_TTL,
+          );
       }
     }
   }
@@ -1577,31 +1638,25 @@ export class GmailMail {
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
         const state = await this.state();
+        await this.prefetchThreads(ids);
         const read = async (
           id: string,
         ): Promise<Record<string, unknown> | null> => {
           try {
-            const revision = this.store.revision(this.email);
-            const thread = await this.cached<{
-              id: string;
-              messages?: GmailMessage[];
-            }>(`thread:v2:${id}`, MESSAGE_TTL, () =>
-              this.api.get(
-                `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
-                10,
-                { format: "full" },
-              ),
+            const thread = await this.cached<ThreadMembers>(
+              `thread:v3:${id}`,
+              MESSAGE_TTL,
+              async () =>
+                threadMembers(
+                  await this.api.get<{ messages?: GmailMessage[] }>(
+                    `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
+                    10,
+                    { format: "minimal" },
+                  ),
+                ),
             );
-            if (this.store.revision(this.email) === revision)
-              for (const message of thread.messages ?? [])
-                this.store.cache(
-                  this.email,
-                  `message:v2:${message.id}`,
-                  message,
-                  MESSAGE_TTL,
-                );
-            const messages = [...(thread.messages ?? [])].sort(
-              (a, b) => Number(a.internalDate) - Number(b.internalDate),
+            const messages = [...thread.messages].sort(
+              (a, b) => Number(a.internalDate ?? 0) - Number(b.internalDate ?? 0),
             );
             return this.project(
               {
