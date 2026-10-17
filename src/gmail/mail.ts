@@ -117,6 +117,33 @@ function threadMembers(thread: { messages?: GmailMessage[] }): ThreadMembers {
   };
 }
 
+/**
+ * `filter` with an `inMailboxOtherThan` that names only Trash and/or Spam
+ * taken out of its top-level AND; `undefined` when there is none.
+ */
+function withoutSpamTrash(filter: unknown): unknown {
+  if (!filter || typeof filter !== "object") return undefined;
+  const f = filter as Record<string, unknown>;
+  if (
+    f.operator !== "AND" ||
+    !Array.isArray(f.conditions) ||
+    Object.keys(f).length !== 2
+  )
+    return undefined;
+  const isBins = (c: unknown): boolean => {
+    if (!c || typeof c !== "object" || Object.keys(c).length !== 1) return false;
+    const ids = (c as Record<string, unknown>).inMailboxOtherThan;
+    return (
+      Array.isArray(ids) &&
+      ids.length > 0 &&
+      ids.every((id) => id === "l_TRASH" || id === "l_SPAM")
+    );
+  };
+  const rest = (f.conditions as unknown[]).filter((c) => !isBins(c));
+  if (rest.length === f.conditions.length || rest.length === 0) return undefined;
+  return rest.length === 1 ? rest[0] : { operator: "AND", conditions: rest };
+}
+
 export class GmailMail {
   readonly accountId: string;
   private composer: GmailCompose;
@@ -901,7 +928,12 @@ export class GmailMail {
     // is a folder query on that label: exact counters, no search. Clients
     // count every tag this way, often for tags another account defines; one
     // the account does not have matches nothing and needs no call at all.
-    const asLabel = await this.labelKeywordFilter(args.filter);
+    // Tag views and their badges leave Trash and Spam out (#1156 upstream).
+    // Gmail lists without them when asked, so that condition is a listing
+    // flag on the label path, not a reason to enumerate every tagged message.
+    const binless = withoutSpamTrash(args.filter);
+    const asLabel = await this.labelKeywordFilter(binless ?? args.filter);
+    const skipSpamTrash = binless !== undefined && asLabel != null;
     if (asLabel === null)
       return {
         accountId: this.accountId,
@@ -971,7 +1003,10 @@ export class GmailMail {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
         // dependence on search syntax, label names or search-index lag.
         const listing: Record<string, string | string[]> = label
-          ? { labelIds: unreadIn ? [label.id, "UNREAD"] : label.id }
+          ? {
+              labelIds: unreadIn ? [label.id, "UNREAD"] : label.id,
+              ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
+            }
           : { q: await q() };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
@@ -994,8 +1029,8 @@ export class GmailMail {
               MESSAGE_TTL,
               () =>
                 this.api.get("messages", 5, {
-                  ...listing,
                   includeSpamTrash: "true",
+                  ...listing,
                   maxResults: pageSize,
                   ...(cursor ? { pageToken: cursor } : {}),
                 }),
@@ -1022,7 +1057,9 @@ export class GmailMail {
           // folder are different queries.
           queryState: hash([
             state,
-            label ? ["label", label.id, unreadIn ? "unread" : "all"] : search,
+            label
+              ? ["label", label.id, unreadIn ? "unread" : "all", skipSpamTrash]
+              : search,
           ]),
           canCalculateChanges: false,
           position: pos,

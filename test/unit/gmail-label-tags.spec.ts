@@ -186,3 +186,44 @@ it("counts a tag from its label's counters, and an unknown tag without asking Gm
   ).toBe(0);
   expect(calls.filter((c) => c.startsWith("messages") || c.startsWith("labels/"))).toEqual([]);
 });
+
+it("counts and lists a tag without Trash and Spam from the label, not a search of every tagged message", async () => {
+  const store = open();
+  const listings: Record<string, unknown>[] = [];
+  const get = vi.fn(async (resource: string, _cost?: number, params?: Record<string, unknown>) => {
+    if (resource === "profile") return profile;
+    if (resource === "labels") return { labels };
+    if (resource === "labels/Label_2") return { ...labels.at(-1), messagesTotal: 7, messagesUnread: 3 };
+    const label = labels.find((l) => resource === `labels/${l.id}`);
+    if (label) return label;
+    if (resource === "messages") {
+      listings.push(params ?? {});
+      return { messages: [{ id: "a", threadId: "t" }] };
+    }
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as never, store);
+  const query = mail.methods()["Email/query"]!;
+  const bins = { inMailboxOtherThan: ["l_TRASH", "l_SPAM"] };
+  const run = async (conditions: unknown[]) =>
+    (await query({
+      accountId: mail.accountId,
+      filter: { operator: "AND", conditions },
+      limit: 1,
+      calculateTotal: true,
+    })) as { ids: string[]; total: number };
+
+  expect((await run([{ hasKeyword: "$label:da_leggere" }, bins])).total).toBe(7);
+  expect((await run([{ hasKeyword: "$label:da_leggere" }, { notKeyword: "$seen" }, bins])).total).toBe(3);
+  expect((await run([{ hasKeyword: "$label:another-accounts-tag" }, bins])).total).toBe(0);
+  expect(listings).toHaveLength(2);
+  for (const listing of listings) {
+    expect(listing).not.toHaveProperty("q");
+    expect(listing.includeSpamTrash).toBe("false");
+  }
+  expect(listings[1]!.labelIds).toEqual(["Label_2", "UNREAD"]);
+
+  // Excluding any other folder is a real filter: it still goes to search.
+  await run([{ hasKeyword: "$label:da_leggere" }, { inMailboxOtherThan: ["l_INBOX"] }]);
+  expect(listings.at(-1)).toHaveProperty("q");
+});
