@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { JmapError } from "../jmap/errors.js";
 import type { MethodTable } from "../jmap/router.js";
 import type { GmailStore, PushSub } from "./store.js";
+import { assertPublicPushTarget } from "../util/pushTarget.js";
 import {
   matchesFilter,
   parseEmailPush,
@@ -78,6 +79,7 @@ export class GmailSubscriptions {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
+      await assertPublicPushTarget(sub.url);
       const res = await fetch(sub.url, {
         method: "POST",
         headers: { "content-type": "application/json", "x-push-type": kind },
