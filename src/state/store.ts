@@ -255,7 +255,7 @@ export class Store {
     if (created.length === 0 && updated.length === 0 && destroyed.length === 0) {
       return this.getState(accountId, kind);
     }
-    const newState = this.bumpState(accountId, kind);
+    const newState = this.nextState(accountId, kind);
     const key = `${accountId}|${kind}`;
     const buf = this.changeLog.get(key) ?? [];
     for (const id of created) buf.push({ state: newState, action: "created", id });
@@ -282,7 +282,16 @@ export class Store {
     return buf.filter((e) => e.state > sinceState && e.state <= currentState);
   }
 
+  // A state move with no entries behind it (an IDLE arrival, a folder count
+  // that moved). The log can no longer account for the period, so drop it:
+  // `*/changes` then answers `cannotCalculateChanges` instead of an empty diff
+  // that hides the change.
   bumpState(accountId: number, kind: string): number {
+    this.changeLog.delete(`${accountId}|${kind}`);
+    return this.nextState(accountId, kind);
+  }
+
+  private nextState(accountId: number, kind: string): number {
     const row = this.prep(`SELECT state FROM state_log WHERE account_id = ? AND kind = ?`)
       .get(accountId, kind) as { state: number } | undefined;
     const next = (row?.state ?? 0) + 1;
