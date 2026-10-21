@@ -850,7 +850,15 @@ export async function emailGet(
         subscribed: 0,
         last_seen: 0,
       } as never;
-      return fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts, ctx.store);
+      const got = await fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts, ctx.store);
+      const missing = uids.filter((uid) => !got.has(uid));
+      if (missing.length === 0) return got;
+      // A message appended moments ago, or through another connection, is
+      // outside this session's view until the server syncs it.
+      await ctx.client.noop();
+      const retried = await fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, missing, bodyOpts, ctx.store);
+      for (const [uid, meta] of retried) got.set(uid, meta);
+      return got;
     });
     for (const e of group.entries) {
       const meta = fetched.get(e.uid);
