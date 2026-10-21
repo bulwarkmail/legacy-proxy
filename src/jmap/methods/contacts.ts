@@ -39,7 +39,7 @@ interface AddressBookJson {
   myRights: {
     mayRead: boolean;
     mayWrite: boolean;
-    mayAdmin: boolean;
+    mayShare: boolean;
     mayDelete: boolean;
   };
 }
@@ -107,7 +107,7 @@ function projectAddressBook(b: AddressBookInfo, isFirst: boolean): AddressBookJs
     sortOrder: 0,
     isDefault: isFirst,
     isSubscribed: true,
-    myRights: { mayRead: true, mayWrite: true, mayAdmin: false, mayDelete: true },
+    myRights: { mayRead: true, mayWrite: true, mayShare: false, mayDelete: true },
   };
 }
 

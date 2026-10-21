@@ -522,7 +522,8 @@ describe("AddressBook/set", () => {
     expect(res.notCreated).toBeNull();
     const created = res.created?.["new-book"];
     expect(created?.id).toBe(Buffer.from(`${HOME}work-friends/`).toString("base64url"));
-    expect(created).toMatchObject({ isDefault: false, myRights: { mayWrite: true, mayDelete: true } });
+    expect(created).toMatchObject({ isDefault: false, myRights: { mayRead: true, mayWrite: true, mayShare: false, mayDelete: true } });
+    expect(created.myRights).not.toHaveProperty("mayAdmin");
 
     const mkcol = dav.calls.find((c) => c.method === "MKCOL")!;
     expect(mkcol.path).toBe(`${HOME}work-friends/`);
