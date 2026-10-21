@@ -14,6 +14,7 @@ import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
+import { unescapePointerToken } from "../refs.js";
 import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
 import { readBlob } from "../blobs.js";
 import {
@@ -1102,7 +1103,9 @@ function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
         (id) => (v as Record<string, unknown>)[id] === true,
       );
     } else if (k.startsWith("mailboxIds/")) {
-      const id = k.slice("mailboxIds/".length);
+      // A patch key is a JSON Pointer (RFC 8620 §5.3): a "/" inside the
+      // member name arrives as "~1", a "~" as "~0".
+      const id = unescapePointerToken(k.slice("mailboxIds/".length));
       if (v === true) out.mailboxAdd.add(id);
       else if (v === null || v === false) out.mailboxRemove.add(id);
     } else if (k === "keywords") {
@@ -1115,7 +1118,7 @@ function resolvePatch(patch: Record<string, unknown>): ResolvedPatch {
       }
       out.keywordSet = set;
     } else if (k.startsWith("keywords/")) {
-      const kw = k.slice("keywords/".length);
+      const kw = unescapePointerToken(k.slice("keywords/".length));
       if (v === true) out.keywordAdd.add(kw);
       else if (v === null || v === false) out.keywordRemove.add(kw);
     } else {

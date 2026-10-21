@@ -127,7 +127,7 @@ export function jsonPointer(input: Json, pointer: string): Json {
   // concatenate the resulting arrays". Without this, chained back-refs like
   // `path: "/list/*/id"` (Email/query → Email/get) silently return undefined.
   if (pointer === "" || pointer === "/") return input;
-  const parts = pointer.replace(/^\//, "").split("/").map(unescape);
+  const parts = pointer.replace(/^\//, "").split("/").map(unescapePointerToken);
   return walk(input, parts, 0);
 }
 
@@ -156,6 +156,7 @@ function walk(here: Json, parts: string[], i: number): Json {
   return undefined;
 }
 
-function unescape(s: string): string {
+/** One JSON Pointer reference token back to the name it encodes (RFC 6901 §4). */
+export function unescapePointerToken(s: string): string {
   return s.replaceAll("~1", "/").replaceAll("~0", "~");
 }
