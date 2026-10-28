@@ -8,6 +8,8 @@ import { GmailMail } from "../../src/gmail/mail.js";
 import { GmailPush } from "../../src/gmail/push.js";
 import { GMAIL_MODIFY } from "../../src/gmail/config.js";
 import { JmapError } from "../../src/jmap/errors.js";
+// Relay hosts here are fake; the address check has its own spec.
+vi.mock("../../src/util/pushTarget.js", () => ({ assertPublicPushTarget: async () => {} }));
 const email = "pushed@example.test";
 const PUSH = {
   topic: "projects/p/topics/gmail",
