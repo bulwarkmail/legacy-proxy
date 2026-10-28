@@ -49,6 +49,9 @@ function interpolate(p: ProviderConfig): ProviderConfig {
           host: env(p.carddav.host),
           basePath: p.carddav.basePath ? env(p.carddav.basePath) : undefined,
           principalPath: p.carddav.principalPath ? env(p.carddav.principalPath) : undefined,
+          username: p.carddav.username ? env(p.carddav.username) : undefined,
+          password: p.carddav.password ? env(p.carddav.password) : undefined,
+          forUser: p.carddav.forUser ? env(p.carddav.forUser) : undefined,
         }
       : null,
     auth: p.auth,
