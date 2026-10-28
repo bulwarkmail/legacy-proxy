@@ -318,7 +318,10 @@ export class GmailStore {
           del.run(email, "message:v2:" + id);
           del.run(email, "meta:v2:" + id);
         }
-        for (const id of threads) del.run(email, "thread:v2:t_" + id);
+        for (const id of threads) {
+          del.run(email, "thread:v2:t_" + id);
+          del.run(email, "thread:v3:t_" + id);
+        }
       }
       this.db
         .prepare(

@@ -100,3 +100,49 @@ it("fetches threads concurrently, at most four at a time, in request order", asy
   expect(peak).toBeGreaterThan(1);
   expect(peak).toBeLessThanOrEqual(4);
 });
+
+it("reads a page's threads in one minimal batch and keeps only their members", async () => {
+  const store = open();
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile") return profile;
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const batch = vi.fn(async (reads: { resource: string; params?: Record<string, string> }[]) =>
+    reads.map(({ resource, params }) => {
+      expect(params).toEqual({ format: "minimal" });
+      const id = resource.slice("threads/".length);
+      return {
+        status: 200,
+        data: {
+          id,
+          messages: [
+            { id: "late" + id, threadId: id, internalDate: "2", payload: { body: { data: "secret" } } },
+            { id: "early" + id, threadId: id, internalDate: "1" },
+          ],
+        },
+      };
+    }),
+  );
+  const mail = new GmailMail(email, { get, batch } as any, store);
+  const ids = Array.from({ length: 50 }, (_, i) => "t_x" + i);
+  const read = async () => (await mail.methods()["Thread/get"]!({ accountId: mail.accountId, ids })) as any;
+
+  const first = await read();
+  expect(batch).toHaveBeenCalledTimes(1);
+  expect(get.mock.calls.some((c) => String(c[0]).startsWith("threads/"))).toBe(false);
+  expect(first.list.map((t: any) => t.id)).toEqual(ids);
+  expect(first.list[0].emailIds).toEqual(["m_earlyx0", "m_latex0"]);
+  // Nothing but ids and dates is cached, and no message is written from a thread.
+  expect(JSON.stringify(store.cached(email, "thread:v3:t_x0"))).not.toContain("secret");
+  expect(store.cached(email, "message:v2:latex0")).toBeNull();
+
+  const again = await read();
+  expect(batch).toHaveBeenCalledTimes(1);
+  expect(again.list).toEqual(first.list);
+
+  // A change Gmail reports for the thread drops it, and the next read asks again.
+  store.checkpoint(email, "99", [], ["x0"]);
+  await read();
+  expect(batch).toHaveBeenCalledTimes(2);
+  expect(batch.mock.calls[1]![0]).toHaveLength(1);
+});

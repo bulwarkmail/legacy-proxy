@@ -102,6 +102,48 @@ const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
  */
 const MESSAGE_TTL = 30 * 24 * 60 * 60_000;
 
+/**
+ * What `Thread/get` keeps of a thread: its message ids and dates. Caching the
+ * full thread meant decrypting every body, and writing every message back to
+ * the cache, on each folder page that asked for its conversation sizes.
+ */
+type ThreadMembers = { messages: { id: string; internalDate?: string }[] };
+function threadMembers(thread: { messages?: GmailMessage[] }): ThreadMembers {
+  return {
+    messages: (thread.messages ?? []).map((m) => ({
+      id: m.id,
+      internalDate: m.internalDate,
+    })),
+  };
+}
+
+/**
+ * `filter` with an `inMailboxOtherThan` that names only Trash and/or Spam
+ * taken out of its top-level AND; `undefined` when there is none.
+ */
+function withoutSpamTrash(filter: unknown): unknown {
+  if (!filter || typeof filter !== "object") return undefined;
+  const f = filter as Record<string, unknown>;
+  if (
+    f.operator !== "AND" ||
+    !Array.isArray(f.conditions) ||
+    Object.keys(f).length !== 2
+  )
+    return undefined;
+  const isBins = (c: unknown): boolean => {
+    if (!c || typeof c !== "object" || Object.keys(c).length !== 1) return false;
+    const ids = (c as Record<string, unknown>).inMailboxOtherThan;
+    return (
+      Array.isArray(ids) &&
+      ids.length > 0 &&
+      ids.every((id) => id === "l_TRASH" || id === "l_SPAM")
+    );
+  };
+  const rest = (f.conditions as unknown[]).filter((c) => !isBins(c));
+  if (rest.length === f.conditions.length || rest.length === 0) return undefined;
+  return rest.length === 1 ? rest[0] : { operator: "AND", conditions: rest };
+}
+
 export class GmailMail {
   readonly accountId: string;
   private composer: GmailCompose;
@@ -729,6 +771,52 @@ export class GmailMail {
       }
     }
   }
+  /**
+   * Fills the thread cache for `ids` with one batch read per hundred threads,
+   * so a folder page's conversation sizes cost one round trip to Google
+   * instead of fifty, four at a time. Best effort like {@link prefetch}.
+   */
+  private async prefetchThreads(ids: string[]): Promise<void> {
+    if (!this.api.batch || ids.length < 2) return;
+    const wanted = [
+      ...new Set(
+        ids.filter(
+          (id) =>
+            /^t_[A-Za-z0-9_-]{1,128}$/.test(id) &&
+            this.store.cached(this.email, `thread:v3:${id}`) === null,
+        ),
+      ),
+    ];
+    for (let offset = 0; offset < wanted.length; offset += MAX_BATCH) {
+      const page = wanted.slice(offset, offset + MAX_BATCH);
+      const revision = this.store.revision(this.email);
+      let answers: { status: number; data?: { messages?: GmailMessage[] } }[];
+      try {
+        answers = await this.api.batch<{ messages?: GmailMessage[] }>(
+          page.map((id) => ({
+            resource: `threads/${encodeURIComponent(id.slice(2))}`,
+            params: { format: "minimal" },
+          })),
+          10,
+        );
+      } catch (error) {
+        if (error instanceof JmapError && error.type === "serverUnavailable")
+          throw error;
+        return;
+      }
+      if (this.store.revision(this.email) !== revision) return;
+      for (const [index, id] of page.entries()) {
+        const answer = answers[index];
+        if (answer?.data)
+          this.store.cache(
+            this.email,
+            `thread:v3:${id}`,
+            threadMembers(answer.data),
+            MESSAGE_TTL,
+          );
+      }
+    }
+  }
   /** `metadata` omits bodies and parts: enough for list views, and much smaller to transfer and cache. */
   async message(
     id: string,
@@ -840,7 +928,12 @@ export class GmailMail {
     // is a folder query on that label: exact counters, no search. Clients
     // count every tag this way, often for tags another account defines; one
     // the account does not have matches nothing and needs no call at all.
-    const asLabel = await this.labelKeywordFilter(args.filter);
+    // Tag views and their badges leave Trash and Spam out (#1156 upstream).
+    // Gmail lists without them when asked, so that condition is a listing
+    // flag on the label path, not a reason to enumerate every tagged message.
+    const binless = withoutSpamTrash(args.filter);
+    const asLabel = await this.labelKeywordFilter(binless ?? args.filter);
+    const skipSpamTrash = binless !== undefined && asLabel != null;
     if (asLabel === null)
       return {
         accountId: this.accountId,
@@ -910,7 +1003,10 @@ export class GmailMail {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
         // dependence on search syntax, label names or search-index lag.
         const listing: Record<string, string | string[]> = label
-          ? { labelIds: unreadIn ? [label.id, "UNREAD"] : label.id }
+          ? {
+              labelIds: unreadIn ? [label.id, "UNREAD"] : label.id,
+              ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
+            }
           : { q: await q() };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
@@ -933,8 +1029,8 @@ export class GmailMail {
               MESSAGE_TTL,
               () =>
                 this.api.get("messages", 5, {
-                  ...listing,
                   includeSpamTrash: "true",
+                  ...listing,
                   maxResults: pageSize,
                   ...(cursor ? { pageToken: cursor } : {}),
                 }),
@@ -961,7 +1057,9 @@ export class GmailMail {
           // folder are different queries.
           queryState: hash([
             state,
-            label ? ["label", label.id, unreadIn ? "unread" : "all"] : search,
+            label
+              ? ["label", label.id, unreadIn ? "unread" : "all", skipSpamTrash]
+              : search,
           ]),
           canCalculateChanges: false,
           position: pos,
@@ -1577,31 +1675,25 @@ export class GmailMail {
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
         const state = await this.state();
+        await this.prefetchThreads(ids);
         const read = async (
           id: string,
         ): Promise<Record<string, unknown> | null> => {
           try {
-            const revision = this.store.revision(this.email);
-            const thread = await this.cached<{
-              id: string;
-              messages?: GmailMessage[];
-            }>(`thread:v2:${id}`, MESSAGE_TTL, () =>
-              this.api.get(
-                `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
-                10,
-                { format: "full" },
-              ),
+            const thread = await this.cached<ThreadMembers>(
+              `thread:v3:${id}`,
+              MESSAGE_TTL,
+              async () =>
+                threadMembers(
+                  await this.api.get<{ messages?: GmailMessage[] }>(
+                    `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
+                    10,
+                    { format: "minimal" },
+                  ),
+                ),
             );
-            if (this.store.revision(this.email) === revision)
-              for (const message of thread.messages ?? [])
-                this.store.cache(
-                  this.email,
-                  `message:v2:${message.id}`,
-                  message,
-                  MESSAGE_TTL,
-                );
-            const messages = [...(thread.messages ?? [])].sort(
-              (a, b) => Number(a.internalDate) - Number(b.internalDate),
+            const messages = [...thread.messages].sort(
+              (a, b) => Number(a.internalDate ?? 0) - Number(b.internalDate ?? 0),
             );
             return this.project(
               {
