@@ -25,6 +25,18 @@ const UNITS_PER_SECOND = 200;
 /** In-flight requests per account, high enough that the quota pacer above stays the limit rather than the socket count. */
 export const MAX_CONCURRENT = 12;
 
+/**
+ * How long a request may wait for one of those slots before it is refused.
+ *
+ * When Google is slow the slots, not the pacer, are the bottleneck: twelve
+ * searches that each run into the 15 s timeout let less than one request a
+ * second through, and a queue of two hundred then takes minutes to drain.
+ * The clients that filled it stop waiting after 30 s, so whatever is served
+ * after that is work nobody reads, still paid for from the account's quota.
+ * Refusing early hands the client a `serverUnavailable` it can retry.
+ */
+export const MAX_QUEUE_WAIT_MS = 10_000;
+
 /** Reads Google accepts in one batch request. */
 export const MAX_BATCH = 100;
 
@@ -192,9 +204,26 @@ export class GmailApi {
         "serverUnavailable",
         "Gmail request queue is full",
       );
-    if (this.active >= MAX_CONCURRENT)
-      await new Promise<void>((resolve) => this.waiting.push(resolve));
-    else this.active++;
+    if (this.active >= MAX_CONCURRENT) {
+      const admitted = await new Promise<boolean>((resolve) => {
+        const admit = () => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+        const timer = setTimeout(() => {
+          const at = this.waiting.indexOf(admit);
+          if (at >= 0) this.waiting.splice(at, 1);
+          resolve(false);
+        }, MAX_QUEUE_WAIT_MS);
+        this.waiting.push(admit);
+      });
+      // Not admitted means no slot was handed over: nothing to release below.
+      if (!admitted)
+        throw new (method ? GmailNotSent : JmapError)(
+          "serverUnavailable",
+          "Gmail requests are backed up; retry later",
+        );
+    } else this.active++;
     // Set right before a write reaches the network: failures before that point never changed Gmail.
     let dispatched = false;
     try {
@@ -307,15 +336,17 @@ export class GmailApi {
           const code =
             (error as { code?: string; cause?: { code?: string } }).code ??
             (error as { cause?: { code?: string } }).cause?.code;
+          const timedOut = isTimeout(error);
           const networkFailure =
-            code !== undefined &&
-            [
-              "ECONNRESET",
-              "ETIMEDOUT",
-              "EAI_AGAIN",
-              "ENOTFOUND",
-              "ECONNREFUSED",
-            ].includes(code);
+            timedOut ||
+            (code !== undefined &&
+              [
+                "ECONNRESET",
+                "ETIMEDOUT",
+                "EAI_AGAIN",
+                "ENOTFOUND",
+                "ECONNREFUSED",
+              ].includes(code));
           const temporary =
             networkFailure ||
             rateLimited ||
@@ -375,7 +406,9 @@ export class GmailApi {
               "serverUnavailable",
               rateLimited
                 ? "Google rate limit; retry later"
-                : "Google temporarily unavailable; retry later",
+                : timedOut
+                  ? TIMED_OUT
+                  : "Google temporarily unavailable; retry later",
             );
         }
       }
@@ -392,11 +425,36 @@ export class GmailApi {
   }
 }
 
+const TIMED_OUT = "Google did not answer in time; retry later";
+
+/**
+ * A request gaxios gave up on after its `timeout`.
+ *
+ * gaxios 7 enforces the timeout with `AbortSignal.timeout`. Under Node it
+ * fetches through node-fetch, which rejects with its own `AbortError` (no
+ * `code`), so the GaxiosError carries no code and no response, only that
+ * cause; with a native fetch the cause is the signal's DOMException and the
+ * GaxiosError's `code` is `"TimeoutError"`. No request here passes a signal
+ * of its own, so an abort is always the timeout.
+ */
+function isTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const e = error as { code?: unknown; response?: unknown; cause?: { name?: unknown } };
+  if (e.code === "TimeoutError") return true;
+  return (
+    e.response === undefined &&
+    (e.cause?.name === "AbortError" || e.cause?.name === "TimeoutError")
+  );
+}
+
 /** Library errors may contain Authorization headers: never pass them to the dispatcher. */
 function sanitize(error: unknown): JmapError {
   if (error instanceof JmapError) return error;
   const status = (error as { response?: { status?: number } }).response?.status;
   if (status === 404) return new JmapError("notFound");
+  // Not an authorization problem: telling the user to reconnect for it sends
+  // them after the wrong fault.
+  if (isTimeout(error)) return new JmapError("serverUnavailable", TIMED_OUT);
   const reason = (error as { response?: { data?: { error?: unknown } } })
     .response?.data?.error;
   if (status === 401 || reason === "invalid_grant")
