@@ -64,6 +64,13 @@ const MAX_BLOB = 50_000_000;
 /** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
 /** How long an idle account keeps its label counters; any change moves the cache key first. */
 const LABELS_TTL = 10 * 60_000;
+/**
+ * Distinct labels {@link GmailMail.labelDetail} reads one by one in an account
+ * state before it reads them all at once through {@link GmailMail.labels}.
+ * A folder page or a badge needs one or two; a client counting its tags asks
+ * for one per tag, a hundred or more each round.
+ */
+const LABEL_DETAILS_BEFORE_BATCH = 8;
 const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
   "id",
   "threadId",
@@ -109,6 +116,8 @@ export class GmailMail {
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
   private flights = new Map<string, Promise<unknown>>();
+  /** Labels {@link labelDetail} was asked for in the current account state. */
+  private labelsAsked?: { state: string; ids: Set<string> };
   /** Messages Gmail delivered during the last push sync, for push fan-out. */
   private lastDelivered: string[] = [];
   /**
@@ -410,9 +419,30 @@ export class GmailMail {
    * single label's numbers; reaching them through {@link labels} costs one
    * Gmail call per label in the account (124 of them on a real Workspace
    * mailbox, ~7.5 s), which is what used to time out a push preview.
+   *
+   * A client counting its tags asks for many labels at once, though: one
+   * `labels.get` per tag, each its own round trip through the account's
+   * twelve slots, every time the state moves. Past
+   * {@link LABEL_DETAILS_BEFORE_BATCH} distinct labels in one state, the
+   * whole set is read through the batch endpoint instead - a hundred labels
+   * to a request - and every further label in that state is served from it.
+   * Concurrent reads of the same label share one request either way.
    */
   async labelDetail(id: string): Promise<GmailLabel | undefined> {
     const state = await this.state();
+    const all = this.store.cached<GmailLabel[]>(this.email, "labels:" + state);
+    if (all) {
+      const label = all.find((l) => l.id === id);
+      if (label) return label;
+    }
+    if (this.labelsAsked?.state !== state)
+      this.labelsAsked = { state, ids: new Set() };
+    this.labelsAsked.ids.add(id);
+    if (this.api.batch && this.labelsAsked.ids.size > LABEL_DETAILS_BEFORE_BATCH) {
+      const label = (await this.labels()).find((l) => l.id === id);
+      if (label) return label;
+      // Not in the listing the batch was built from: ask for it on its own.
+    }
     try {
       return await this.cached<GmailLabel>(
         `label:${id}:${state}`,
