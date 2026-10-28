@@ -12,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import type { ProviderConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
 export interface CardDavOpts {
@@ -21,6 +22,21 @@ export interface CardDavOpts {
   basePath?: string;        // e.g. "/dav" - root of the DAV namespace
   principalPath?: string;   // override discovery, e.g. "/dav/addressbook/user@x.io/"
   creds: Credentials;
+}
+
+/**
+ * Client options for a provider's DAV entry. Provider settings apply to
+ * everyone who logs in through that provider, so a separate DAV login is
+ * only used for the mail login it names in `forUser`; everyone else, and
+ * every provider without one, gets the mail credentials.
+ */
+export function davOptions(cfg: NonNullable<ProviderConfig["carddav"]>, mailCreds: Credentials): CardDavOpts {
+  const { username, password, forUser, ...rest } = cfg;
+  if (!username && !password && !forUser) return { ...rest, creds: mailCreds };
+  // Also catches an unset $DAV_PASSWORD, which interpolates to "".
+  if (!username || !password || !forUser) throw new Error("DAV username, password and forUser must be set together");
+  const mine = forUser.toLowerCase() === mailCreds.username.toLowerCase();
+  return { ...rest, creds: mine ? { mech: "PLAIN", username, password } : mailCreds };
 }
 
 export interface AddressBookInfo {

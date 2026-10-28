@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { providerForEmail, resolveProvider, resolveProviderName } from "../../src/auth/providers.js";
+import { davOptions } from "../../src/carddav/client.js";
 import type { AppConfig, ProviderConfig } from "../../src/util/config.js";
 
 function provider(domains?: string[]): ProviderConfig {
@@ -60,11 +61,29 @@ describe("resolveProviderName", () => {
   });
 });
 
-describe("resolveProvider carddav credentials", () => {
+describe("DAV credentials", () => {
   it("interpolates a separate DAV login from the environment", () => {
     process.env.TEST_DAV_PASSWORD = "s3cret";
     const p = { ...provider(), carddav: { host: "dav.example", port: 443, username: "dav-user", password: "$TEST_DAV_PASSWORD" } };
     const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
     expect(resolveProvider(c).carddav).toMatchObject({ username: "dav-user", password: "s3cret" });
+  });
+
+  const mail = { mech: "PLAIN", username: "Me@Example.org", password: "mail" } as const;
+  const dav = { host: "dav.example", port: 443 };
+
+  it("uses the DAV login only for the mail login it names", () => {
+    const cfg = { ...dav, username: "dav-user", password: "pw", forUser: "me@example.org" };
+    expect(davOptions(cfg, mail).creds).toEqual({ mech: "PLAIN", username: "dav-user", password: "pw" });
+    expect(davOptions(cfg, { ...mail, username: "someone@example.org" }).creds).toEqual({ ...mail, username: "someone@example.org" });
+    expect(davOptions(dav, mail).creds).toBe(mail);
+  });
+
+  it("refuses a DAV login without forUser, or whose password interpolated to nothing", () => {
+    expect(() => davOptions({ ...dav, username: "dav-user", password: "pw" }, mail)).toThrow(/set together/);
+    delete process.env.TEST_DAV_UNSET;
+    const p = { ...provider(), carddav: { ...dav, username: "dav-user", password: "$TEST_DAV_UNSET", forUser: "me@example.org" } };
+    const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
+    expect(() => davOptions(resolveProvider(c).carddav!, mail)).toThrow(/set together/);
   });
 });

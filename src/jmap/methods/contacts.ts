@@ -15,7 +15,7 @@
 import crypto from "node:crypto";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { Buffer } from "node:buffer";
-import { CardDavClient, CardDavConflict, type AddressBookInfo } from "../../carddav/client.js";
+import { CardDavClient, CardDavConflict, davOptions, type AddressBookInfo } from "../../carddav/client.js";
 import { parseVCards, serializeVCard, type JsContact } from "../../carddav/vcard.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
@@ -69,9 +69,7 @@ function ensureCardDav(provider: ProviderConfig): NonNullable<ProviderConfig["ca
 }
 
 function makeClient(ctx: ContactCtx): CardDavClient {
-  const { username, password, ...cfg } = ensureCardDav(ctx.provider);
-  const creds: Credentials = username && password ? { mech: "PLAIN", username, password } : ctx.creds;
-  return new CardDavClient({ ...cfg, creds });
+  return new CardDavClient(davOptions(ensureCardDav(ctx.provider), ctx.creds));
 }
 
 function encodeId(s: string): string {
