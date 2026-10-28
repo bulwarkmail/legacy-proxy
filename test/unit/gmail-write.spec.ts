@@ -189,6 +189,17 @@ it("updates partial successes and invalidates cached metadata and state", async 
   expect(result.newState).not.toBe(oldState);
   expect((await mail.message("a")).labelIds).not.toContain("UNREAD");
 });
+it("forgets only the message it wrote, keeping the rest of the cache", async () => {
+  const { set, mail, store } = await setup();
+  await mail.message("a");
+  const other = { id: "b", threadId: "u", internalDate: "900", labelIds: ["INBOX"] };
+  store.cache(email, "message:v2:b", other, 60_000);
+  store.cache(email, "thread:v2:t_u", { id: "u", messages: [other] }, 60_000);
+  await set("Email", { update: { m_a: { "keywords/$seen": true } } });
+  expect(store.cached(email, "message:v2:b")).toEqual(other);
+  expect(store.cached(email, "thread:v2:t_u")).not.toBeNull();
+  expect((await mail.message("a")).labelIds).not.toContain("UNREAD");
+});
 it("rejects a stale ifInState without mutation", async () => {
   const { set, mutate } = await setup();
   await expect(

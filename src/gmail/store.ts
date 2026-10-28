@@ -280,6 +280,49 @@ export class GmailStore {
       this.db.prepare("DELETE FROM gmail_cache WHERE email=?").run(email);
     })();
   }
+  /**
+   * Forgets what one write can have changed and keeps the rest of the account's
+   * cache: the listings and counters, the profile (so the next read asks Gmail
+   * for the history that write produced, and {@link checkpoint} catches any
+   * message the write moved besides the ones named here), and the named
+   * messages and threads.
+   *
+   * {@link invalidate} empties the whole account instead. Run after every
+   * mark-as-read, that sent the next folder opened back to Gmail for each of
+   * its messages, and a busy mailbox into Google's rate limit.
+   */
+  forget(email: string, messages: string[], threads: string[]): void {
+    this.db.transaction(() => {
+      this.drop(email, messages, threads);
+      this.db
+        .prepare("DELETE FROM gmail_cache WHERE email=? AND key='profile'")
+        .run(email);
+    })();
+  }
+  /** Moves the revision on and drops the listings plus the given messages and threads. Callers hold a transaction. */
+  private drop(email: string, messages: string[], threads: string[]): void {
+    this.db
+      .prepare(
+        "INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1",
+      )
+      .run(email);
+    this.db
+      .prepare(
+        "DELETE FROM gmail_cache WHERE email=? AND (key LIKE 'page:%' OR key LIKE 'query:%' OR key LIKE 'labels:%')",
+      )
+      .run(email);
+    const del = this.db.prepare(
+      "DELETE FROM gmail_cache WHERE email=? AND key=?",
+    );
+    for (const id of messages) {
+      del.run(email, "message:v2:" + id);
+      del.run(email, "meta:v2:" + id);
+    }
+    for (const id of threads) {
+      del.run(email, "thread:v2:t_" + id);
+      del.run(email, "thread:v3:t_" + id);
+    }
+  }
   cursor(email: string): string | null {
     return (
       (
@@ -300,29 +343,8 @@ export class GmailStore {
       const previous = this.cursor(email);
       if (previous && BigInt(previous) >= BigInt(history)) return;
       if (reset) this.invalidate(email);
-      else if (messages.length || threads.length) {
-        this.db
-          .prepare(
-            "INSERT INTO gmail_revision(email,revision) VALUES(?,1) ON CONFLICT(email) DO UPDATE SET revision=revision+1",
-          )
-          .run(email);
-        this.db
-          .prepare(
-            "DELETE FROM gmail_cache WHERE email=? AND (key LIKE 'page:%' OR key LIKE 'query:%' OR key LIKE 'labels:%')",
-          )
-          .run(email);
-        const del = this.db.prepare(
-          "DELETE FROM gmail_cache WHERE email=? AND key=?",
-        );
-        for (const id of messages) {
-          del.run(email, "message:v2:" + id);
-          del.run(email, "meta:v2:" + id);
-        }
-        for (const id of threads) {
-          del.run(email, "thread:v2:t_" + id);
-          del.run(email, "thread:v3:t_" + id);
-        }
-      }
+      else if (messages.length || threads.length)
+        this.drop(email, messages, threads);
       this.db
         .prepare(
           "INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history",
