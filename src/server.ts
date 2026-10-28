@@ -5,6 +5,7 @@ import cors from "@fastify/cors";
 import compress from "@fastify/compress";
 import { loadConfig } from "./util/config.js";
 import { log } from "./util/log.js";
+import { corsOptions } from "./util/cors.js";
 import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
@@ -62,7 +63,7 @@ const app = Fastify({
   routerOptions: { maxParamLength: 1024 },
 });
 
-await app.register(cors, { origin: true });
+await app.register(cors, corsOptions);
 // JMAP responses with bodyValues are large, highly compressible JSON —
 // hundreds of KB shrink to tens. The SSE route is unaffected: it writes to
 // reply.raw directly, bypassing the onSend hook this plugin uses.
