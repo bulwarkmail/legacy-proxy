@@ -176,32 +176,70 @@ function asEmail(s: string | undefined | null): string | null {
   return t;
 }
 
+// Whitespace, control characters and everything an address parser reads as
+// syntax: list separators, angle brackets, quotes, escapes, comments and the
+// colon of a group.
+const NOT_PLAIN = /[\s,;:<>"\\()\u0000-\u001f\u007f-\u009f]/u;
+
+/**
+ * A plain address: one "@" between a non-empty local part and a non-empty
+ * domain, and none of the characters in NOT_PLAIN. nodemailer parses every
+ * envelope string again before it writes MAIL FROM and RCPT TO; for a plain
+ * address every parser agrees on the mailbox, so what reaches the SMTP server
+ * is the address the user was shown, one entry being one recipient.
+ */
+export function isPlainAddress(s: string): boolean {
+  const at = s.indexOf("@");
+  return at > 0 && at === s.lastIndexOf("@") && at < s.length - 1 && !NOT_PLAIN.test(s);
+}
+
+/** Accept an envelope only when all its addresses are plain. */
+function checkedEnvelope(from: string, to: string[]): { from: string; to: string[] } {
+  const invalid = to.filter((a) => !isPlainAddress(a));
+  if (invalid.length > 0) {
+    throw new JmapError("invalidRecipients", "recipients must be plain email addresses", {
+      invalidRecipients: invalid,
+    });
+  }
+  if (!isPlainAddress(from)) {
+    throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
+  }
+  return { from, to };
+}
+
+type ParsedAddress = { address?: string; group?: ParsedAddress[] };
+
 async function resolveEnvelope(
   raw: Buffer,
   envelope: SubmissionCreate["envelope"],
 ): Promise<{ from: string; to: string[] }> {
   if (envelope?.mailFrom?.email && envelope?.rcptTo?.length) {
-    return {
-      from: envelope.mailFrom.email,
-      to: envelope.rcptTo.map((r) => r.email!).filter(Boolean),
-    };
+    return checkedEnvelope(
+      String(envelope.mailFrom.email).trim(),
+      envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email.trim() : "")),
+    );
   }
   // Spec §7: if no envelope is given, derive from headers - From for
-  // mailFrom, To+Cc+Bcc for rcptTo.
+  // mailFrom, To+Cc+Bcc for rcptTo. Each member of a group is a recipient.
   const parsed = await simpleParser(raw);
   const fromAddr =
     asEmail(parsed.from?.value?.[0]?.address) ?? asEmail(envelope?.mailFrom?.email) ?? null;
   const collect = (
-    field: { value?: { address?: string }[] } | { value?: { address?: string }[] }[] | undefined,
+    field: { value?: ParsedAddress[] } | { value?: ParsedAddress[] }[] | undefined,
   ): string[] => {
     if (!field) return [];
     const arr = Array.isArray(field) ? field : [field];
     const out: string[] = [];
-    for (const f of arr) {
-      for (const v of f.value ?? []) {
-        const e = asEmail(v.address);
-        if (e) out.push(e);
+    const add = (v: ParsedAddress): void => {
+      if (v.group) {
+        for (const member of v.group) add(member);
+        return;
       }
+      const e = asEmail(v.address);
+      if (e) out.push(e);
+    };
+    for (const f of arr) {
+      for (const v of f.value ?? []) add(v);
     }
     return out;
   };
@@ -212,7 +250,7 @@ async function resolveEnvelope(
   if (to.length === 0) {
     throw new JmapError("noRecipients", "no recipients in envelope or headers");
   }
-  return { from: fromAddr, to };
+  return checkedEnvelope(fromAddr, to);
 }
 
 export async function emailSubmissionSet(
