@@ -70,6 +70,50 @@ describe("credential generation", () => {
   });
 });
 
+describe("refused mark", () => {
+  it("is set after three refusals in a row and moves the generation", () => {
+    const store = storeIn(tempDir());
+    const moved: number[] = [];
+    store.setCredentialListener((id) => moved.push(id));
+    const { id } = store.upsertAccount(account());
+
+    expect(store.noteCredentialRefusal(id, 0)).toBe(false);
+    expect(store.noteCredentialRefusal(id, 0)).toBe(false);
+    expect(store.noteCredentialRefusal(id, 0)).toBe(true);
+    expect(store.getAccountById(id)).toMatchObject({ cred_refused: 1, cred_gen: 1 });
+    expect(moved).toEqual([id]);
+    expect(store.accountsWithActivePushSubs()).toEqual([]);
+  });
+
+  it("needs the refusals in a row", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    store.noteCredentialRefusal(id, 0);
+    store.noteCredentialRefusal(id, 0);
+    store.noteCredentialSuccess(id);
+    expect(store.noteCredentialRefusal(id, 0)).toBe(false);
+    expect(store.getAccountById(id)!.cred_refused).toBe(0);
+  });
+
+  it("does not count a refusal of credentials the row no longer holds", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    store.upsertAccount(account(true));
+    for (let i = 0; i < 5; i++) expect(store.noteCredentialRefusal(id, 0)).toBe(false);
+    expect(store.getAccountById(id)!.cred_refused).toBe(0);
+  });
+
+  it("is cleared by the next successful login, which tells the listener", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    for (let i = 0; i < 3; i++) store.noteCredentialRefusal(id, 0);
+    const told: number[] = [];
+    store.setCredentialListener((acc) => told.push(acc));
+    expect(store.upsertAccount(account(false))).toMatchObject({ cred_refused: 0, cred_refusals: 0, cred_gen: 1 });
+    expect(told).toEqual([id]);
+  });
+});
+
 describe("ended session tokens", () => {
   it("stay ended after a restart and are dropped once they would have expired", () => {
     const dir = tempDir();

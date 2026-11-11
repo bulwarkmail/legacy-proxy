@@ -228,6 +228,16 @@ again. Signing in again with the same password ends nothing. Tokens issued by
 versions before this check carry no generation and keep working until the
 account's password first changes.
 
+The proxy also notices a password that was changed at the mail server. When the
+server refuses the stored password three times in a row (when the push IDLE
+worker reconnects, or the pool opens a new connection), the stored credentials
+are marked refused: the proxy stops logging in with them, every token issued
+before is answered `401`, and the push IDLE worker stops. The mark is kept in
+the database across restarts and cleared by the next successful sign-in, which
+also starts the push worker again. A server that cannot be reached, or answers
+"try again later", is not a refusal and is retried with backoff, at most once a
+minute.
+
 `POST /api/logout` with `Authorization: Bearer <token>` ends that one token and
 answers `204`; the account's other sessions stay signed in. Ended tokens are
 kept in the database until they would have expired, so a restart does not

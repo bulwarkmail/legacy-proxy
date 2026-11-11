@@ -12,11 +12,22 @@ export interface AccountRow {
   created_at: number;
   /**
    * Credential generation. It moves when a login stores a different password
-   * for the account; session tokens carry the generation they were issued
-   * under and stop working once it has moved on.
+   * for the account, and when the mail server refuses the stored one; session
+   * tokens carry the generation they were issued under and stop working once
+   * it has moved on.
    */
   cred_gen: number;
+  /**
+   * 1 once the mail server refused the stored credentials: nothing logs in
+   * with them again until a login succeeds. Survives restarts.
+   */
+  cred_refused: number;
+  /** Refusals of the stored credentials in a row, while not yet marked refused. */
+  cred_refusals: number;
 }
+
+/** Refusals of the stored credentials in a row before they are marked refused. */
+export const STORED_CREDENTIAL_ATTEMPTS = 3;
 
 export interface MailboxRow {
   id: number;
@@ -193,6 +204,8 @@ CREATE TABLE IF NOT EXISTS ended_session (
 // Columns added to tables that existing databases already have.
 const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_refused", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_refusals", definition: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
 export class Store {
@@ -234,9 +247,10 @@ export class Store {
   }
 
   /**
-   * Store the credentials a successful login proved. `rotate` says they differ
-   * from what the row held: the credential generation then moves, which ends
-   * every session issued under the previous one.
+   * Store the credentials a successful login proved, which clears a refused
+   * mark. `rotate` says they differ from what the row held: the credential
+   * generation then moves, which ends every session issued under the previous
+   * one.
    */
   upsertAccount(p: {
     slug: string;
@@ -253,17 +267,45 @@ export class Store {
        VALUES(?,?,?,?,?,?)
        ON CONFLICT(slug) DO UPDATE SET kind=excluded.kind, host=excluded.host,
          username=excluded.username, vault=excluded.vault,
-         cred_gen = cred_gen + ?`,
+         cred_gen = cred_gen + ?, cred_refused = 0, cred_refusals = 0`,
     );
     stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, p.rotate ? 1 : 0);
     const row = this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
-    if (before && before.cred_gen !== row.cred_gen) this.credentialListener?.(row.id);
+    if (before && (before.cred_gen !== row.cred_gen || before.cred_refused)) this.credentialListener?.(row.id);
     return row;
   }
 
-  // Told when an account's credential generation moved, so the server can
-  // close what was opened under the old one (pooled connections, the IDLE
-  // worker, cached Basic logins).
+  /**
+   * The mail server refused the stored credentials of generation `gen`. After
+   * {@link STORED_CREDENTIAL_ATTEMPTS} refusals in a row they are marked
+   * refused and the generation moves. Returns true when the account is marked.
+   * A refusal of credentials the row no longer holds is not counted.
+   */
+  noteCredentialRefusal(accountId: number, gen: number): boolean {
+    this.prep(
+      `UPDATE account SET cred_refusals = cred_refusals + 1
+       WHERE id = ? AND cred_gen = ? AND cred_refused = 0`,
+    ).run(accountId, gen);
+    const row = this.getAccountById(accountId);
+    if (!row) return true;
+    if (row.cred_refused) return true;
+    if (row.cred_refusals < STORED_CREDENTIAL_ATTEMPTS) return false;
+    this.prep(
+      `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_gen = cred_gen + 1 WHERE id = ?`,
+    ).run(accountId);
+    this.credentialListener?.(accountId);
+    return true;
+  }
+
+  /** The stored credentials just worked: refusals so far were not in a row. */
+  noteCredentialSuccess(accountId: number): void {
+    this.prep(`UPDATE account SET cred_refusals = 0 WHERE id = ? AND cred_refusals > 0`).run(accountId);
+  }
+
+  // Told when an account's credential generation moved or its refused mark
+  // was cleared, so the server can close what was opened under the old
+  // credentials (pooled connections, cached Basic logins) and start the IDLE
+  // worker over.
   setCredentialListener(fn: ((accountId: number) => void) | undefined): void {
     this.credentialListener = fn;
   }
@@ -550,12 +592,14 @@ export class Store {
 
   // Distinct list of accounts that need an IDLE worker right now. Used by the
   // PushIdleManager on startup and after every PushSubscription/set mutation
-  // to recompute who needs a connection held open.
+  // to recompute who needs a connection held open. An account whose stored
+  // credentials the mail server refused gets none until a login succeeds.
   accountsWithActivePushSubs(): number[] {
     const now = Date.now();
     const rows = this.prep(
-        `SELECT DISTINCT account_id FROM push_subscription
-         WHERE verified = 1 AND (expires IS NULL OR expires > ?)`,
+        `SELECT DISTINCT p.account_id FROM push_subscription p
+         JOIN account a ON a.id = p.account_id
+         WHERE p.verified = 1 AND (p.expires IS NULL OR p.expires > ?) AND a.cred_refused = 0`,
       )
       .all(now) as { account_id: number }[];
     return rows.map((r) => r.account_id);

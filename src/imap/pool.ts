@@ -3,7 +3,7 @@ import type { Credentials } from "../auth/credentials.js";
 import type { AppConfig } from "../util/config.js";
 import { resolveProvider } from "../auth/providers.js";
 import { openCredentials } from "../auth/credentials.js";
-import { openImap } from "./client.js";
+import { isCredentialRefusal, openImap } from "./client.js";
 import type { Store, AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
 
@@ -126,9 +126,21 @@ export class ImapPool {
 
     if ((this.entries.get(key)?.length ?? 0) >= MAX_PER_ROLE[role]) return null;
 
-    const provider = resolveProvider(this.cfg, account.kind);
-    const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
-    const client = await openImap({ provider, creds });
+    // Dial with the credentials the row holds now, not the ones the request
+    // started with, and not at all once the mail server refused them: the
+    // next successful login clears that mark.
+    const current = this.store.getAccountById(account.id);
+    if (!current || current.cred_refused) throw new Error("stored credentials refused by the mail server");
+    const provider = resolveProvider(this.cfg, current.kind);
+    const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
+    let client: ImapFlow;
+    try {
+      client = await openImap({ provider, creds });
+    } catch (e) {
+      if (isCredentialRefusal(e)) this.store.noteCredentialRefusal(current.id, current.cred_gen);
+      throw e;
+    }
+    if (current.cred_refusals > 0) this.store.noteCredentialSuccess(current.id);
     const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
     this.attach(account, key, entry);
     return entry;
