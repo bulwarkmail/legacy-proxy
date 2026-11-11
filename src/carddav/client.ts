@@ -108,6 +108,11 @@ function rememberVCard(key: string, data: string): void {
 // HTTP methods that only read. Anything else invalidates the cached book list.
 const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
 
+// Redirects are followed by hand, at most this many hops, and only to the
+// configured origin (see absolutise).
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 4;
+
 /**
  * Drop every memoised discovery result and book list. Production code never
  * needs this — a given account keeps talking to the same server — but tests
@@ -240,6 +245,51 @@ export class CardDavClient {
     return out;
   }
 
+  /**
+   * Whether `resourceHref` names a resource inside the address book at
+   * `bookHref`. A ContactCard id carries both, so this keeps an id to a card
+   * of that book. The resource must be a path, or an absolute URL on the DAV
+   * origin, whose segments begin with the book's and add at least one more.
+   * Empty segments (`//`, a trailing slash), a backslash, a query, a fragment,
+   * control characters and `.` or `..` segments, also percent-encoded at any
+   * depth, are refused.
+   */
+  isInBook(bookHref: string, resourceHref: string): boolean {
+    const book = this.localPath(bookHref);
+    const resource = this.localPath(resourceHref);
+    if (book === null || resource === null) return false;
+    if (/[\\?#\u0000-\u001f\u007f]/.test(resource)) return false;
+    const bookSegs = book.split("/").filter((s) => s !== "");
+    const segs = resource.split("/").slice(1);
+    if (segs.length <= bookSegs.length || segs.some((s) => s === "")) return false;
+    for (let i = 0; i < bookSegs.length; i++) {
+      if (decodeSegment(segs[i]!) !== decodeSegment(bookSegs[i]!)) return false;
+    }
+    return segs.every((s) => {
+      const plain = unescapePathChars(s);
+      return plain !== null && plain.split(/[/\\]/).every((p) => p !== "." && p !== "..");
+    });
+  }
+
+  /** The path part of an href on this server; null for anything else. */
+  private localPath(href: string): string | null {
+    let path = href;
+    const abs = /^([a-z][a-z0-9+.-]*:)\/\/([^/?#\\]*)([\s\S]*)$/i.exec(href);
+    if (abs) {
+      let base: URL;
+      try {
+        base = new URL(`${abs[1]}//${abs[2]}/`);
+      } catch {
+        return null;
+      }
+      if (base.origin !== new URL(this.origin).origin || base.username || base.password) return null;
+      path = abs[3]!;
+    } else if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+      return null;
+    }
+    return path.startsWith("/") && !path.startsWith("//") ? path : null;
+  }
+
   /** Current etag for a resource, from the cached listing of its collection. */
   private knownEtag(bookHref: string, href: string): string | null {
     const key = `${this.cacheKey}|${bookHref}`;
@@ -347,7 +397,7 @@ export class CardDavClient {
     if (res.status === 207) {
       const text = await res.text();
       if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
-        throw new Error(`CardDAV MKCOL ${href} → property failure: ${text.slice(0, 200)}`);
+        throw new Error("CardDAV MKCOL: the server refused a property");
       }
     }
   }
@@ -375,7 +425,7 @@ export class CardDavClient {
     if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
     const text = await res.text();
     if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
-      throw new Error(`CardDAV PROPPATCH ${href} → property failure: ${text.slice(0, 200)}`);
+      throw new Error("CardDAV PROPPATCH: the server refused a property");
     }
   }
 
@@ -387,19 +437,45 @@ export class CardDavClient {
     body: string | null,
     headers: Record<string, string> = {},
   ): Promise<Response> {
-    const url = absolutise(this.origin, path);
+    let url = absolutise(this.origin, path);
     // Any write invalidates the cached book list before it is issued: a PUT or
     // DELETE moves the collection's ctag (and so its JMAP state), and MKCOL /
     // PROPPATCH change the set itself. Dropping it up front rather than after
     // means a write that fails midway can't leave a stale list behind.
     if (!READ_METHODS.has(method.toUpperCase())) bookListCache.delete(this.cacheKey);
-    const res = await fetch(url, {
-      method,
-      headers: { Authorization: this.authHeader, ...headers },
-      ...(body === null ? {} : { body }),
-    });
-    log.debug({ method, url, status: res.status }, "carddav request");
-    return res;
+    // Redirects are followed here rather than by fetch, so every hop goes
+    // through absolutise: the request and its Authorization header stay on
+    // the configured origin, which also rules out a switch from https to http.
+    for (let hop = 0; ; hop++) {
+      const res = await fetch(url, {
+        method,
+        headers: { Authorization: this.authHeader, ...headers },
+        ...(body === null ? {} : { body }),
+        redirect: "manual",
+      });
+      log.debug({ method, url, status: res.status }, "carddav request");
+      const location = REDIRECT_STATUSES.has(res.status) ? res.headers.get("location") : null;
+      if (!location) return res;
+      await res.body?.cancel().catch(() => {});
+      if (hop >= MAX_REDIRECTS) throw new Error("CardDAV: too many redirects");
+      url = this.redirectTarget(url, location);
+      // As fetch does: 303 turns the request into a GET without a body.
+      if (res.status === 303 && method !== "HEAD") {
+        method = "GET";
+        body = null;
+      }
+    }
+  }
+
+  /** Where a redirect from `current` leads; throws when it leaves the origin. */
+  private redirectTarget(current: string, location: string): string {
+    let target: string;
+    try {
+      target = new URL(location, current).href;
+    } catch {
+      throw new Error("CardDAV: invalid redirect");
+    }
+    return absolutise(this.origin, target);
   }
 
   private async followToCollection(path: string): Promise<string> {
@@ -415,7 +491,7 @@ export class CardDavClient {
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
-        url = absolutise(this.origin, loc);
+        url = this.redirectTarget(url, loc);
         continue;
       }
       // surface auth/server errors here so callers see a useful message
@@ -466,10 +542,12 @@ export class CardDavConflict extends Error {
   }
 }
 
+// The message reaches JMAP clients as an error description, so it carries the
+// status code only: nothing of the server's answer, not even its reason phrase.
 async function httpError(method: string, path: string, res: Response): Promise<Error> {
-  const text = await res.text().catch(() => "");
+  await res.body?.cancel().catch(() => {});
   log.warn({ method, path, status: res.status }, "carddav request failed");
-  return new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
+  return new Error(`CardDAV ${method} failed with status ${res.status}`);
 }
 
 // -----------------------------------------------------------------------
@@ -491,10 +569,51 @@ function buildAuth(c: Credentials): string {
   throw new Error(`unsupported carddav auth mech: ${c.mech}`);
 }
 
+/**
+ * The URL a request for `pathOrUrl` goes to. A path is taken relative to the
+ * configured origin. An absolute URL, whether it came from the server (a
+ * multistatus href, a Location header) or anywhere else, is accepted only
+ * when it has the same scheme, host and port and no user name; anything else
+ * throws, so no request is sent.
+ */
 function absolutise(origin: string, pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  if (!pathOrUrl.startsWith("/")) pathOrUrl = "/" + pathOrUrl;
-  return origin + pathOrUrl;
+  const raw = /^[a-z][a-z0-9+.-]*:/i.test(pathOrUrl)
+    ? pathOrUrl
+    : origin + (pathOrUrl.startsWith("/") ? "" : "/") + pathOrUrl;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("CardDAV: invalid address");
+  }
+  if (url.origin !== new URL(origin).origin || url.username || url.password) {
+    throw new Error("CardDAV: refused an address outside the configured server");
+  }
+  return url.href;
+}
+
+/** One path segment, percent-decoded once; as it is when it doesn't decode. */
+function decodeSegment(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * Undo percent-encoding of `.`, `/`, `\` and `%` until nothing changes, so a
+ * dot segment shows however often it was encoded. Null when it is still
+ * changing after more rounds than any server decodes.
+ */
+function unescapePathChars(s: string): string | null {
+  let cur = s;
+  for (let i = 0; i < 5; i++) {
+    const next = cur.replace(/%(2e|2f|5c|25)/gi, (m) => String.fromCharCode(parseInt(m.slice(1), 16)));
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return null;
 }
 
 function leafName(href: string): string {
