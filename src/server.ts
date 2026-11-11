@@ -206,7 +206,7 @@ app.post("/api/logout", async (req, reply) => {
   const h = req.headers["authorization"];
   const token = typeof h === "string" && h.startsWith("Bearer ") ? h.slice("Bearer ".length).trim() : "";
   const session = token ? bearerSession(token) : null;
-  if (!session) return send401(reply);
+  if (!session) return send401(req, reply);
   store.endSession(tokenHash(token), session.token.exp * 1000);
   return reply.code(204).send();
 });
@@ -254,8 +254,11 @@ app.get("/.well-known/jmap", async (_req, reply) => {
   reply.redirect(`${cfg.publicUrl}/jmap/session`);
 });
 
-function send401(reply: import("fastify").FastifyReply) {
-  reply.header("WWW-Authenticate", 'Basic realm="legacy-proxy", Bearer');
+// A request with an Origin header comes from a web page: offering Basic there
+// makes the browser put up its own password prompt and then send what the
+// user typed to this origin by itself. Web clients authenticate with a header.
+function send401(req: { headers: Record<string, string | string[] | undefined> }, reply: import("fastify").FastifyReply) {
+  reply.header("WWW-Authenticate", req.headers["origin"] ? 'Bearer realm="legacy-proxy"' : 'Basic realm="legacy-proxy", Bearer');
   return reply.code(401).send({ error: "unauthorized" });
 }
 
@@ -359,6 +362,7 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
       if (!upload) return reply.code(404).send({ error: "upload not found" });
       reply.header("Content-Type", allowedType ?? upload.ctype);
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      reply.header("X-Content-Type-Options", "nosniff");
       return reply.send(upload.body);
     }
 
@@ -391,6 +395,7 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     if (cachedBlob) {
       reply.header("Content-Type", allowedType ?? cachedBlob.ctype ?? "application/octet-stream");
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      reply.header("X-Content-Type-Options", "nosniff");
       return reply.send(cachedBlob.body);
     }
 
@@ -492,6 +497,7 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
 
       reply.header("Content-Type", allowedType ?? contentType);
       reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      reply.header("X-Content-Type-Options", "nosniff");
       return reply.send(tee);
     } catch (e) {
       release();
@@ -606,7 +612,7 @@ async function requireAccount(
 ): Promise<AccountRow | null> {
   const outcome = await authn(req);
   if (outcome.ok) return outcome.account;
-  if (outcome.status === 401) send401(reply);
+  if (outcome.status === 401) send401(req, reply);
   else sendLimited(reply, outcome);
   return null;
 }

@@ -261,6 +261,12 @@ The first request in a 5 minute window costs one IMAP probe; subsequent
 requests reuse the cached account. Useful for compliance suite runs and
 servers that already terminate auth at a reverse proxy.
 
+A `401` offers Basic (`WWW-Authenticate: Basic realm="legacy-proxy", Bearer`)
+only to callers that are not web pages. A request that carries an `Origin`
+header is offered `Bearer` alone, so a browser never puts up its own password
+prompt for the proxy; a web client that sends Basic credentials in the
+`Authorization` header itself is still accepted.
+
 Basic auth carries no explicit provider, so the proxy selects one from the
 email domain of the username (see [Provider selection](#provider-selection)).
 This is what lets a JMAP client like the Bulwark webmail front several IMAP

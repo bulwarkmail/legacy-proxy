@@ -129,6 +129,51 @@ describe("bridge secrets on the JMAP routes", () => {
     expect(post.statusCode).toBe(401);
   });
 
+  it("offers a web page's browser Bearer only, so it never puts up its own password prompt", async () => {
+    const { app } = await bridgeInFront();
+    const fromPage = await app.inject({
+      method: "GET",
+      url: "/jmap/session",
+      headers: { authorization: basic(EMAIL, "gmap_wrong"), origin: "https://other.example" },
+    });
+    const fromClient = await app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: basic(EMAIL, "gmap_wrong") } });
+    await app.close();
+    expect(fromPage.statusCode).toBe(401);
+    expect(String(fromPage.headers["www-authenticate"])).not.toMatch(/basic/i);
+    expect(String(fromClient.headers["www-authenticate"])).toMatch(/basic/i);
+  });
+
+  it("serves a download as an attachment that must not be sniffed", async () => {
+    const store = await connectedStore();
+    const { accessToken } = store.issueTokens(EMAIL, "webmail");
+    const app = Fastify();
+    registerGmailBackend(
+      app,
+      { publicUrl: "https://bridge.test", limits: { maxCallsInRequest: 16 } } as never,
+      { allowedEmails: new AllowList([EMAIL]) } as unknown as GmailConfig,
+      store,
+      {} as never,
+      {},
+      () =>
+        ({
+          accountId: "a1",
+          writable: async () => false,
+          canCompose: async () => false,
+          download: async () => ({ body: Buffer.from("<script></script>"), type: "application/octet-stream" }),
+        }) as never,
+    );
+    app.get("/jmap/download/:accountId/:blobId/:type/:name", async () => ({ legacy: true }));
+    const res = await app.inject({
+      method: "GET",
+      url: "/jmap/download/a1/blob/text%2Fhtml/page.html",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    await app.close();
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(String(res.headers["content-disposition"])).toMatch(/^attachment/);
+  });
+
   it("leaves a password that only looks like one in upper case to the legacy backend", async () => {
     const { app, legacy } = await bridgeInFront();
     const res = await app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: basic(EMAIL, "GMAP_not-a-bridge-secret") } });
