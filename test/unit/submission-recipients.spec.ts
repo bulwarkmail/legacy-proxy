@@ -13,7 +13,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { ImapFlow } from "imapflow";
 import { Store, type AccountRow } from "../../src/state/store.js";
 import { sealCredentials } from "../../src/auth/credentials.js";
-import { emailSubmissionSet, isPlainAddress } from "../../src/jmap/methods/submission.js";
+import { emailSubmissionGet, emailSubmissionSet, isPlainAddress } from "../../src/jmap/methods/submission.js";
 import { encodeEmailId } from "../../src/mapping/ids.js";
 import type { AppConfig } from "../../src/util/config.js";
 
@@ -211,6 +211,23 @@ describe("a recipient is delivered to the address the user was shown", () => {
     const res = await send();
     expect(res.notCreated?.s?.type).toBe("noRecipients");
     expect(smtpLines).toEqual([]);
+  });
+});
+
+describe("EmailSubmission ids", () => {
+  it("are made by the proxy, whatever the client's creation id holds", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const tempId = 'k"<b>/../x y';
+    const res = await emailSubmissionSet(
+      { accountId: String(account.id), create: { [tempId]: { emailId } } },
+      { cfg, account, client, store },
+    );
+    const id = res.created?.[tempId]?.id ?? "";
+    // RFC 8620 §1.2: 1 to 255 characters of the URL-safe base64 alphabet.
+    expect(id).toMatch(/^[A-Za-z0-9_-]{1,255}$/);
+    expect(id).not.toContain("<b>");
+    const got = await emailSubmissionGet({ accountId: String(account.id), ids: [id] }, { account, store });
+    expect(got.list.map((s) => s.id)).toEqual([id]);
   });
 });
 

@@ -303,7 +303,8 @@ export async function emailSubmissionSet(
       };
       if (result.rejected.length > 0) log.warn(sendLog, "submission: SMTP server rejected some recipients");
       else log.info(sendLog, "submission: accepted by SMTP server");
-      const id = `s-${ctx.account.id}-${Date.now()}-${tempId}`;
+      // Made here, from nothing the client sent: JMAP ids are server-set.
+      const id = `s-${randomUUID()}`;
       const sub: SubmissionResult = {
         id,
         emailId: payload.emailId,
