@@ -107,7 +107,7 @@ export function validateProviders(providers: Record<string, ProviderConfig>): vo
 
 export function resolveProvider(cfg: AppConfig, name?: string): ProviderConfig {
   const key = name ?? cfg.defaultProvider;
-  const p = cfg.providers[key];
+  const p = Object.hasOwn(cfg.providers, key) ? cfg.providers[key] : undefined;
   if (!p) throw new Error(`Unknown provider: ${key}`);
   return interpolate(p);
 }

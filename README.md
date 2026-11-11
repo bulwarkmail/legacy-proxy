@@ -223,6 +223,12 @@ from the email domain of `username` (see [Provider selection](#provider-selectio
 falling back to `DEFAULT_PROVIDER`. For OAuth providers, pass `accessToken`
 instead of `password` and the proxy will use `XOAUTH2`.
 
+Every field is a string: `username` (up to 512 characters), `password` or
+`accessToken`, an optional `provider` that must be a key of `providers.json`,
+and an optional `mech` (`PLAIN`, `LOGIN` or `XOAUTH2`). Any other body is
+answered `400`. A failed login is answered `401` without the mail server's
+reply, which goes to the log instead.
+
 ### HTTP Basic
 
 `Authorization: Basic <base64(user:pass)>` works on every JMAP endpoint.
@@ -235,6 +241,32 @@ email domain of the username (see [Provider selection](#provider-selection)).
 This is what lets a JMAP client like the Bulwark webmail front several IMAP
 backends through one proxy without any client-side change: the user just types
 their email, and the domain routes them to the right provider.
+
+### Login limits
+
+Every login the proxy makes at the mail server for a caller without a session
+(`/api/login`, and HTTP Basic when the header is not in the 5-minute cache) is
+checked first:
+
+- 10 failed logins for one user name from one client address within 15 minutes
+  hold further logins for that pair, and 50 failed logins from one address,
+  across user names, hold the address. A held login is answered `429` with
+  `Retry-After`, and nothing is sent to the mail server, the right password
+  included, until the oldest of those failures is 15 minutes old. A successful
+  login clears its pair's count.
+- Only a refusal of the credentials counts. A mail server that cannot be
+  reached, or answers "try again later", does not.
+- At most 20 such logins run at once; more wait up to 5 seconds and are then
+  answered `503`.
+- Requests with a Bearer token are not limited, so a user with a session keeps
+  working while their login is held.
+- Failed Gmail bridge logins on the JMAP routes count against the same budget.
+
+The counters live in memory, are bounded in size and start from zero when the
+proxy restarts. IPv6 clients are counted per /64. The limits count by client
+address, so behind a reverse proxy set `TRUST_PROXY` (see
+[Configuration](#configuration)): without it every caller has the reverse
+proxy's address and all of them share one budget.
 
 ### Provider selection
 
@@ -647,7 +679,9 @@ Google setup references: [OAuth web flow](https://developers.google.com/identity
 The proxy only speaks plain HTTP. Put Caddy, Traefik, or nginx in front of it
 and set `PUBLIC_URL` to whatever URL clients see. The Session resource bakes
 URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
-`eventSourceUrl`, so a wrong value silently breaks every client.
+`eventSourceUrl`, so a wrong value silently breaks every client. Set
+`TRUST_PROXY` too (usually `1`), so the [login limits](#login-limits) count by
+the client's address and not the reverse proxy's.
 
 ## Configuration
 
@@ -670,6 +704,15 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
+| `TRUST_PROXY`              | unset                              | client address from `X-Forwarded-For`; see below     |
+
+`TRUST_PROXY` decides which reverse proxies may name the client's address in
+`X-Forwarded-For`, which the [login limits](#login-limits) count by. Unset (or
+`false`), the socket's address is the client's. A number trusts that many proxy
+hops in front of the proxy (`1` for a single Caddy, Traefik or nginx); a
+comma-separated list of addresses or CIDR ranges trusts those proxies; `true`
+trusts every hop, which is only safe when nothing but your reverse proxy can
+reach the proxy.
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.

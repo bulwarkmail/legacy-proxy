@@ -31,6 +31,12 @@ export interface ProviderConfig {
 export interface AppConfig {
   port: number;
   publicUrl: string;
+  /**
+   * Fastify's `trustProxy`: which reverse proxies may name the client address
+   * in X-Forwarded-For. The login limits count per client address, so behind a
+   * reverse proxy this must be set or every caller shares the proxy's address.
+   */
+  trustProxy: boolean | number | string;
   dataDir: string;
   vaultKey: Buffer;
   sessionHmacKey: Buffer;
@@ -60,6 +66,20 @@ function b64Key(name: string, fallback: string | null): Buffer {
   return buf;
 }
 
+/**
+ * `TRUST_PROXY`: unset or `false` trusts no one (the socket's address is the
+ * client's); `true` trusts every hop; a number trusts that many hops in front
+ * of the proxy; anything else is a comma-separated list of proxy addresses or
+ * CIDR ranges.
+ */
+export function parseTrustProxy(value: string | undefined): boolean | number | string {
+  const v = (value ?? "").trim();
+  if (v === "" || /^(false|no|off)$/i.test(v)) return false;
+  if (/^(true|yes|on)$/i.test(v)) return true;
+  if (/^\d+$/.test(v)) return Number(v);
+  return v;
+}
+
 export function loadConfig(): AppConfig {
   const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -74,6 +94,7 @@ export function loadConfig(): AppConfig {
   return {
     port: Number(process.env.PORT ?? 8080),
     publicUrl: process.env.PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 8080}`,
+    trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
     dataDir,
     vaultKey: b64Key("VAULT_KEY", null),
     sessionHmacKey: b64Key("SESSION_HMAC_KEY", null),

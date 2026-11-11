@@ -16,7 +16,8 @@ import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
-import { imapErrorDetails, openImap } from "./imap/client.js";
+import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
+import { LoginLimiter } from "./auth/loginLimit.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -56,6 +57,9 @@ const app = Fastify({
   loggerInstance: log,
   bodyLimit: cfg.limits.maxSizeRequest,
   disableRequestLogging: false,
+  // Behind a reverse proxy the socket address is the proxy's; TRUST_PROXY lets
+  // `req.ip` be the client's, which the login limits count by.
+  trustProxy: cfg.trustProxy,
   // The download URL carries the attachment's file name as a path segment.
   // Fastify's default cap of 100 characters answers longer ones with a 404,
   // which a client shows as an empty attached message; percent-encoding
@@ -69,6 +73,10 @@ await app.register(cors, corsOptions);
 // reply.raw directly, bypassing the onSend hook this plugin uses.
 await app.register(compress, { global: true, threshold: 1024 });
 
+// Failed logins by callers without a session are counted before anything
+// reaches the mail server (see auth/loginLimit.ts).
+const logins = new LoginLimiter();
+
 const gmailConfig = loadGmailConfig(cfg.publicUrl);
 const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
 // Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
@@ -77,23 +85,57 @@ app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.sche
 
 if (gmailConfig && gmailStore) {
   const connection = new GmailConnection(gmailConfig, gmailStore);
-  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection, gmailHooks);
+  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection, gmailHooks, undefined, logins);
   await app.register(registerGmailRoutes, { config: gmailConfig, connection, store: gmailStore, tokens: gmailStore });
   app.addHook("onClose", async () => gmailStore.close());
 }
 
-app.post("/api/login", async (req, reply) => {
-  const body = req.body as {
-    username: string;
-    password?: string;
-    accessToken?: string;
-    provider?: string;
-    mech?: "PLAIN" | "LOGIN" | "XOAUTH2";
-  };
-  if (!body?.username) return reply.code(400).send({ error: "username required" });
+function sendLimited(reply: import("fastify").FastifyReply, gate: { status: 429 | 503; retryAfterSec: number }) {
+  reply.header("Retry-After", String(gate.retryAfterSec));
+  return reply
+    .code(gate.status)
+    .send({ error: gate.status === 429 ? "too many failed logins" : "too many logins in progress" });
+}
 
-  const providerName = resolveProviderName(cfg, { explicit: body.provider, username: body.username });
-  const provider = resolveProvider(cfg, providerName);
+// Login names and secrets longer than this are not credentials anyone uses.
+const MAX_USERNAME_LENGTH = 512;
+const MAX_SECRET_LENGTH = 16_384;
+const LOGIN_MECHS = new Set(["PLAIN", "LOGIN", "XOAUTH2"]);
+
+interface LoginBody {
+  username: string;
+  password?: string;
+  accessToken?: string;
+  provider?: string;
+  mech?: "PLAIN" | "LOGIN" | "XOAUTH2";
+}
+
+/** The `/api/login` body when every field has the expected type, else null. */
+function parseLoginBody(body: unknown): LoginBody | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  const optional = (v: unknown, max: number) => v === undefined || (typeof v === "string" && v.length <= max);
+  if (typeof b.username !== "string" || b.username === "" || b.username.length > MAX_USERNAME_LENGTH) return null;
+  if (!optional(b.password, MAX_SECRET_LENGTH) || !optional(b.accessToken, MAX_SECRET_LENGTH)) return null;
+  if (b.provider !== undefined && (typeof b.provider !== "string" || !Object.hasOwn(cfg.providers, b.provider))) {
+    return null;
+  }
+  if (b.mech !== undefined && (typeof b.mech !== "string" || !LOGIN_MECHS.has(b.mech))) return null;
+  return b as unknown as LoginBody;
+}
+
+app.post("/api/login", async (req, reply) => {
+  const body = parseLoginBody(req.body);
+  if (!body) return reply.code(400).send({ error: "invalid login request" });
+
+  let providerName: string;
+  let provider;
+  try {
+    providerName = resolveProviderName(cfg, { explicit: body.provider, username: body.username });
+    provider = resolveProvider(cfg, providerName);
+  } catch {
+    return reply.code(400).send({ error: "invalid login request" });
+  }
   const creds: Credentials = {
     mech: body.mech ?? (body.accessToken ? "XOAUTH2" : "PLAIN"),
     username: body.username,
@@ -101,13 +143,19 @@ app.post("/api/login", async (req, reply) => {
     accessToken: body.accessToken,
   };
 
+  const gate = await logins.begin(req.ip, body.username);
+  if (!gate.ok) return sendLimited(reply, gate);
   // verify by opening an IMAP session once
   let probe;
   try {
     probe = await openImap({ provider, creds });
   } catch (e) {
-    return reply.code(401).send({ error: "auth failed", detail: (e as Error).message });
+    gate.finish(isCredentialRefusal(e) ? "refused" : "error");
+    log.warn({ ...imapErrorDetails(e), provider: providerName }, "login IMAP probe failed");
+    // The mail server's answer stays in the log: a caller without a session learns only that it failed.
+    return reply.code(401).send({ error: "auth failed" });
   }
+  gate.finish("accepted");
 
   const vault = await sealCredentials(cfg.vaultKey, creds);
   const slug = `${providerName}:${body.username}`;
@@ -135,8 +183,8 @@ function send401(reply: import("fastify").FastifyReply) {
 }
 
 app.get("/jmap/session", async (req, reply) => {
-  const account = await authn(req);
-  if (!account) return send401(reply);
+  const account = await requireAccount(req, reply);
+  if (!account) return reply;
   let provider;
   try {
     provider = resolveProvider(cfg, account.kind);
@@ -147,8 +195,8 @@ app.get("/jmap/session", async (req, reply) => {
 });
 
 app.post("/jmap", async (req, reply) => {
-  const account = await authn(req);
-  if (!account) return send401(reply);
+  const account = await requireAccount(req, reply);
+  if (!account) return reply;
   const env = req.body as RequestEnvelope;
   if (!env || !Array.isArray(env.methodCalls) || !Array.isArray(env.using)) {
     return reply.code(400).send({ error: "malformed JMAP request" });
@@ -192,8 +240,8 @@ const BLOB_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
 app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
   "/jmap/download/:accountId/:blobId/:type/:name",
   async (req, reply) => {
-    const account = await authn(req);
-    if (!account) return send401(reply);
+    const account = await requireAccount(req, reply);
+    if (!account) return reply;
     if (req.params.accountId !== String(account.id)) return reply.code(404).send({ error: "not found" });
 
     const { decodeBlobId, decodeEmailId } = await import("./mapping/ids.js");
@@ -375,8 +423,8 @@ app.post<{ Params: { accountId: string } }>(
   "/jmap/upload/:accountId",
   { bodyLimit: cfg.limits.maxSizeUpload },
   async (req, reply) => {
-    const account = await authn(req);
-    if (!account) return send401(reply);
+    const account = await requireAccount(req, reply);
+    if (!account) return reply;
     if (req.params.accountId !== String(account.id)) {
       return reply.code(404).send({ error: "not found" });
     }
@@ -409,8 +457,8 @@ app.post<{ Params: { accountId: string } }>(
 app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>(
   "/jmap/eventsource",
   async (req, reply) => {
-    const account = await authn(req);
-    if (!account) return send401(reply);
+    const account = await requireAccount(req, reply);
+    if (!account) return reply;
     const origin = (req.headers["origin"] as string | undefined) ?? null;
     // Per RFC 8620 §7.3, `types=*` means all; an explicit comma-separated list
     // is a server-side filter. `closeafter=state` ends the stream after one
@@ -432,59 +480,104 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
 // raw header so we never log or persist plaintext. TTL keeps memory bounded.
 const basicAuthCache = new Map<string, { accountId: number; expires: number }>();
 const BASIC_TTL_MS = 5 * 60_000;
+// Basic logins in progress, by the same key: requests that arrive together
+// with one header share one login at the mail server.
+const basicLogins = new Map<string, Promise<AuthOutcome>>();
+
+type AccountRow = import("./state/store.js").AccountRow;
+type AuthOutcome =
+  | { ok: true; account: AccountRow }
+  | { ok: false; status: 401 }
+  | { ok: false; status: 429 | 503; retryAfterSec: number };
+const UNAUTHORIZED: AuthOutcome = { ok: false, status: 401 };
+
+/** The caller's account, or null after answering 401, 429 or 503. */
+async function requireAccount(
+  req: { headers: Record<string, string | string[] | undefined>; ip: string },
+  reply: import("fastify").FastifyReply,
+): Promise<AccountRow | null> {
+  const outcome = await authn(req);
+  if (outcome.ok) return outcome.account;
+  if (outcome.status === 401) send401(reply);
+  else sendLimited(reply, outcome);
+  return null;
+}
 
 async function authn(req: {
   headers: Record<string, string | string[] | undefined>;
-}): Promise<import("./state/store.js").AccountRow | null> {
+  ip: string;
+}): Promise<AuthOutcome> {
   const h = req.headers["authorization"];
-  if (typeof h !== "string") return null;
+  if (typeof h !== "string") return UNAUTHORIZED;
 
   if (h.startsWith("Bearer ")) {
     const token = h.slice("Bearer ".length).trim();
     const sess = verifySession(cfg.sessionHmacKey, token);
-    if (!sess) return null;
-    return store.getAccount(sess.accountSlug) ?? null;
+    if (!sess) return UNAUTHORIZED;
+    const account = store.getAccount(sess.accountSlug);
+    return account ? { ok: true, account } : UNAUTHORIZED;
   }
 
   if (h.startsWith("Basic ")) {
     const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
     const cached = basicAuthCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
-      return store.getAccountById(cached.accountId) ?? null;
+      const account = store.getAccountById(cached.accountId);
+      return account ? { ok: true, account } : UNAUTHORIZED;
     }
-    const decoded = Buffer.from(h.slice("Basic ".length).trim(), "base64").toString("utf8");
-    const colon = decoded.indexOf(":");
-    if (colon < 1) return null;
-    const username = decoded.slice(0, colon);
-    const password = decoded.slice(colon + 1);
-
-    const providerName = resolveProviderName(cfg, { username });
-    const provider = resolveProvider(cfg, providerName);
-    const creds: Credentials = { mech: "PLAIN", username, password };
-
-    let probe;
-    try {
-      probe = await openImap({ provider, creds });
-    } catch (e) {
-      log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
-      return null;
+    let running = basicLogins.get(cacheKey);
+    if (!running) {
+      running = basicLogin(h, cacheKey, req.ip).finally(() => basicLogins.delete(cacheKey));
+      basicLogins.set(cacheKey, running);
     }
-    const vault = await sealCredentials(cfg.vaultKey, creds);
-    const account = store.upsertAccount({
-      slug: `${providerName}:${username}`,
-      kind: providerName,
-      host: provider.imap.host,
-      username,
-      vault,
-    });
-    // Keep the validated connection: the JMAP request this auth is for will
-    // need one immediately.
-    pool.adopt(account, probe);
-    basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
-    return account;
+    return running;
   }
 
-  return null;
+  return UNAUTHORIZED;
+}
+
+async function basicLogin(h: string, cacheKey: string, ip: string): Promise<AuthOutcome> {
+  const decoded = Buffer.from(h.slice("Basic ".length).trim(), "base64").toString("utf8");
+  const colon = decoded.indexOf(":");
+  if (colon < 1) return UNAUTHORIZED;
+  const username = decoded.slice(0, colon);
+  const password = decoded.slice(colon + 1);
+  if (username.length > MAX_USERNAME_LENGTH || password.length > MAX_SECRET_LENGTH) return UNAUTHORIZED;
+
+  let providerName: string;
+  let provider;
+  try {
+    providerName = resolveProviderName(cfg, { username });
+    provider = resolveProvider(cfg, providerName);
+  } catch {
+    return UNAUTHORIZED;
+  }
+  const creds: Credentials = { mech: "PLAIN", username, password };
+
+  const gate = await logins.begin(ip, username);
+  if (!gate.ok) return gate;
+  let probe;
+  try {
+    probe = await openImap({ provider, creds });
+  } catch (e) {
+    gate.finish(isCredentialRefusal(e) ? "refused" : "error");
+    log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
+    return UNAUTHORIZED;
+  }
+  gate.finish("accepted");
+  const vault = await sealCredentials(cfg.vaultKey, creds);
+  const account = store.upsertAccount({
+    slug: `${providerName}:${username}`,
+    kind: providerName,
+    host: provider.imap.host,
+    username,
+    vault,
+  });
+  // Keep the validated connection: the JMAP request this auth is for will
+  // need one immediately.
+  pool.adopt(account, probe);
+  basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
+  return { ok: true, account };
 }
 
 const port = cfg.port;

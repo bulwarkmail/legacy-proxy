@@ -6,6 +6,7 @@ import type {
   RawReplyDefaultExpression,
 } from "fastify";
 import type { AppConfig } from "../util/config.js";
+import type { LoginLimiter } from "../auth/loginLimit.js";
 import {
   CORE_CAPABILITY,
   EMAIL_PUSH_CAPABILITY,
@@ -49,6 +50,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       !!google.push,
       google.labelTags ?? true,
     ),
+  logins?: LoginLimiter,
 ): void {
   const accounts = new Map<string, GmailMail>();
   const account = (email: string) => {
@@ -135,7 +137,20 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     // password for the same address, stays with the legacy backend.
     const signedIn = password.startsWith("gmat_") && !username;
     if (!password.startsWith("gmap_") && !signedIn) return;
-    const email = signedIn ? store.authenticateToken(password) : store.authenticate(password, username);
+    // Failed bridge logins count against the same per-address budget as mail logins.
+    const gate = logins ? await logins.begin(req.ip, username ?? "") : null;
+    if (gate && !gate.ok) {
+      return reply
+        .header("Retry-After", String(gate.retryAfterSec))
+        .code(gate.status)
+        .send({ error: gate.status === 429 ? "too many failed logins" : "too many logins in progress" });
+    }
+    let email: string | null = null;
+    try {
+      email = signedIn ? store.authenticateToken(password) : store.authenticate(password, username);
+    } finally {
+      gate?.finish(email ? "accepted" : "refused");
+    }
     if (
       !email ||
       !google.allowedEmails.has(email) ||
