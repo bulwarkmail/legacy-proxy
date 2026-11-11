@@ -10,7 +10,13 @@ import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
-import { makeSession, signSession, verifySession } from "./auth/session.js";
+import {
+  makeSession,
+  sessionGeneration,
+  signSession,
+  verifySession,
+  type SessionToken,
+} from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
@@ -44,6 +50,14 @@ store.setStateListener((accountId, kind, state) => dispatcher.onBump(accountId, 
 // changed so it can spin up or tear down INBOX IDLE workers without needing
 // to sweep the DB on every JMAP call.
 dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
+
+// When an account's credential generation moves, nothing logged in with the
+// old credentials keeps serving it: pooled connections close and the IDLE
+// worker starts over. Cached Basic logins check the generation themselves.
+store.setCredentialListener((accountId) => {
+  pool.retire(accountId);
+  idleManager.onCredentialsChanged(accountId);
+});
 
 // Spin up idle workers for any verified subscription that survived a previous
 // run. Failure here is non-fatal (the next reconnect will try again), so we
@@ -165,13 +179,67 @@ app.post("/api/login", async (req, reply) => {
     host: provider.imap.host,
     username: body.username,
     vault,
+    rotate: await credentialsChanged(slug, creds),
   });
   // Reuse the probe as the account's pooled connection instead of logging out
   // and paying a second TCP+TLS+LOGIN when the client's first JMAP call lands.
   pool.adopt(account, probe);
-  const token = signSession(cfg.sessionHmacKey, makeSession({ accountSlug: slug, username: body.username }));
+  const token = signSession(
+    cfg.sessionHmacKey,
+    makeSession({ accountSlug: slug, username: body.username, gen: account.cred_gen }),
+  );
   return { token, accountId: String(account.id), apiUrl: `${cfg.publicUrl}/jmap` };
 });
+
+// Ends the caller's own session token. Other sessions of the account, and the
+// account's stored credentials, stay as they are.
+app.post("/api/logout", async (req, reply) => {
+  const h = req.headers["authorization"];
+  const token = typeof h === "string" && h.startsWith("Bearer ") ? h.slice("Bearer ".length).trim() : "";
+  const session = token ? bearerSession(token) : null;
+  if (!session) return send401(reply);
+  store.endSession(tokenHash(token), session.token.exp * 1000);
+  return reply.code(204).send();
+});
+
+/**
+ * True when `creds` differ from what the account row holds: another password
+ * or user name, or OAuth instead of a password. PLAIN and LOGIN are two ways
+ * to send the same password. An OAuth access token is not a password and
+ * renews by itself, so a new one alone does not count.
+ */
+async function credentialsChanged(slug: string, creds: Credentials): Promise<boolean> {
+  const existing = store.getAccount(slug);
+  if (!existing) return false;
+  const oauth = (c: Credentials) => c.mech === "XOAUTH2";
+  try {
+    const stored = await openCredentials(cfg.vaultKey, existing.vault);
+    return (
+      oauth(stored) !== oauth(creds) ||
+      stored.username !== creds.username ||
+      (stored.password ?? null) !== (creds.password ?? null)
+    );
+  } catch {
+    return true;
+  }
+}
+
+function tokenHash(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+/**
+ * The account and token behind a Bearer token, or null when the token is
+ * forged, expired, ended, or was issued under an older credential generation.
+ */
+function bearerSession(token: string): { account: AccountRow; token: SessionToken } | null {
+  const sess = verifySession(cfg.sessionHmacKey, token);
+  if (!sess) return null;
+  const account = store.getAccount(sess.accountSlug);
+  if (!account || sessionGeneration(sess) !== account.cred_gen) return null;
+  if (store.isSessionEnded(tokenHash(token))) return null;
+  return { account, token: sess };
+}
 
 app.get("/.well-known/jmap", async (_req, reply) => {
   reply.redirect(`${cfg.publicUrl}/jmap/session`);
@@ -478,7 +546,7 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
 
 // Cache of validated Basic-auth credentials → account. Keyed by sha256 of the
 // raw header so we never log or persist plaintext. TTL keeps memory bounded.
-const basicAuthCache = new Map<string, { accountId: number; expires: number }>();
+const basicAuthCache = new Map<string, { accountId: number; gen: number; expires: number }>();
 const BASIC_TTL_MS = 5 * 60_000;
 // Basic logins in progress, by the same key: requests that arrive together
 // with one header share one login at the mail server.
@@ -511,11 +579,8 @@ async function authn(req: {
   if (typeof h !== "string") return UNAUTHORIZED;
 
   if (h.startsWith("Bearer ")) {
-    const token = h.slice("Bearer ".length).trim();
-    const sess = verifySession(cfg.sessionHmacKey, token);
-    if (!sess) return UNAUTHORIZED;
-    const account = store.getAccount(sess.accountSlug);
-    return account ? { ok: true, account } : UNAUTHORIZED;
+    const session = bearerSession(h.slice("Bearer ".length).trim());
+    return session ? { ok: true, account: session.account } : UNAUTHORIZED;
   }
 
   if (h.startsWith("Basic ")) {
@@ -523,7 +588,9 @@ async function authn(req: {
     const cached = basicAuthCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       const account = store.getAccountById(cached.accountId);
-      return account ? { ok: true, account } : UNAUTHORIZED;
+      // A header validated under an older credential generation is asked again.
+      if (account && account.cred_gen === cached.gen) return { ok: true, account };
+      basicAuthCache.delete(cacheKey);
     }
     let running = basicLogins.get(cacheKey);
     if (!running) {
@@ -566,17 +633,19 @@ async function basicLogin(h: string, cacheKey: string, ip: string): Promise<Auth
   }
   gate.finish("accepted");
   const vault = await sealCredentials(cfg.vaultKey, creds);
+  const slug = `${providerName}:${username}`;
   const account = store.upsertAccount({
-    slug: `${providerName}:${username}`,
+    slug,
     kind: providerName,
     host: provider.imap.host,
     username,
     vault,
+    rotate: await credentialsChanged(slug, creds),
   });
   // Keep the validated connection: the JMAP request this auth is for will
   // need one immediately.
   pool.adopt(account, probe);
-  basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
+  basicAuthCache.set(cacheKey, { accountId: account.id, gen: account.cred_gen, expires: Date.now() + BASIC_TTL_MS });
   return { ok: true, account };
 }
 

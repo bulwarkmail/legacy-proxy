@@ -14,6 +14,9 @@ interface PoolEntry {
   // per socket, so handing one connection to two concurrent callers would
   // queue them behind each other — exactly what the pool exists to avoid.
   busy: boolean;
+  // Logged in with credentials that are no longer the account's: closed as
+  // soon as its borrower gives it back.
+  retired?: boolean;
 }
 
 // Skip the sanity-NOOP if the connection was used within this window.
@@ -143,6 +146,10 @@ export class ImapPool {
         // A caller that killed the socket (or found it dead) must not leave a
         // corpse in the pool for the next borrower to trip over.
         if (!entry.client.usable) this.drop(key, entry);
+        else if (entry.retired) {
+          this.drop(key, entry);
+          entry.client.logout().catch(() => {});
+        }
         this.wake(key);
       },
     };
@@ -177,6 +184,26 @@ export class ImapPool {
     }
     this.attach(account, key, { client, lastUsed: Date.now(), busy: false });
     this.wake(key);
+  }
+
+  /**
+   * Close every connection of the account: idle ones now, borrowed ones when
+   * they are given back. Called when the account's credentials change, so no
+   * connection logged in with the old ones keeps serving requests.
+   */
+  retire(accountId: number): void {
+    for (const role of Object.keys(MAX_PER_ROLE) as PoolRole[]) {
+      const key = `${accountId}:${role}`;
+      for (const entry of [...(this.entries.get(key) ?? [])]) {
+        if (entry.busy) {
+          entry.retired = true;
+          continue;
+        }
+        this.drop(key, entry);
+        entry.client.logout().catch(() => {});
+      }
+      this.wake(key);
+    }
   }
 
   private attach(account: AccountRow, key: string, entry: PoolEntry): void {

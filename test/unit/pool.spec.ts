@@ -192,6 +192,49 @@ describe("ImapPool", () => {
     }
   });
 
+  it("closes an account's idle connections when it retires them", async () => {
+    const pool = makePool();
+    const a = await pool.acquire(account, "interactive");
+    const b = await pool.acquire(account, "bulk");
+    a.release();
+    b.release();
+    pool.retire(account.id);
+    await settle();
+    expect(opened.map((c) => c.loggedOut)).toEqual([true, true]);
+
+    // The next borrower gets a fresh connection, not a retired one.
+    const c = await pool.acquire(account, "interactive");
+    expect(c.client).not.toBe(a.client);
+    expect(opened).toHaveLength(3);
+  });
+
+  it("closes a retired connection that was borrowed when its borrower gives it back", async () => {
+    const pool = makePool();
+    const held = await pool.acquire(account, "interactive");
+    pool.retire(account.id);
+    await settle();
+    expect((held.client as unknown as FakeClient).loggedOut).toBe(false);
+
+    held.release();
+    await settle();
+    expect((held.client as unknown as FakeClient).loggedOut).toBe(true);
+    const next = await pool.acquire(account, "interactive");
+    expect(next.client).not.toBe(held.client);
+  });
+
+  it("leaves other accounts' connections alone when one retires", async () => {
+    const pool = makePool();
+    const other = { ...account, id: 2, slug: "test:v" } as AccountRow;
+    const mine = await pool.acquire(account, "interactive");
+    const theirs = await pool.acquire(other, "interactive");
+    mine.release();
+    theirs.release();
+    pool.retire(account.id);
+    await settle();
+    expect((theirs.client as unknown as FakeClient).loggedOut).toBe(false);
+    expect((await pool.acquire(other, "interactive")).client).toBe(theirs.client);
+  });
+
   it("frees a parked caller when a held connection closes", async () => {
     const pool = makePool();
     const held = [

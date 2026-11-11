@@ -6,6 +6,18 @@ export interface SessionToken {
   username: string;
   iat: number;
   exp: number;
+  /**
+   * The account's credential generation when the token was issued. Tokens
+   * issued before generations existed carry none and count as generation 0.
+   */
+  gen?: number;
+  /** Random per token, so two sign-ins in the same second get tokens that can be ended one by one. */
+  sid?: string;
+}
+
+/** The credential generation a token was issued under. */
+export function sessionGeneration(t: SessionToken): number {
+  return typeof t.gen === "number" && Number.isInteger(t.gen) ? t.gen : 0;
 }
 
 export function signSession(key: Buffer, t: SessionToken): string {
@@ -33,12 +45,19 @@ export function verifySession(key: Buffer, token: string): SessionToken | null {
   return parsed;
 }
 
-export function makeSession(opts: { accountSlug: string; username: string; ttlSec?: number }): SessionToken {
+export function makeSession(opts: {
+  accountSlug: string;
+  username: string;
+  gen?: number;
+  ttlSec?: number;
+}): SessionToken {
   const now = Math.floor(Date.now() / 1000);
   return {
     accountSlug: opts.accountSlug,
     username: opts.username,
     iat: now,
     exp: now + (opts.ttlSec ?? 60 * 60 * 24 * 7),
+    gen: opts.gen ?? 0,
+    sid: b64uEncode(crypto.randomBytes(12)),
   };
 }

@@ -10,6 +10,12 @@ export interface AccountRow {
   username: string;
   vault: Buffer;
   created_at: number;
+  /**
+   * Credential generation. It moves when a login stores a different password
+   * for the account; session tokens carry the generation they were issued
+   * under and stop working once it has moved on.
+   */
+  cred_gen: number;
 }
 
 export interface MailboxRow {
@@ -175,7 +181,19 @@ CREATE TABLE IF NOT EXISTS push_subscription (
   last_push_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS push_sub_account_idx ON push_subscription(account_id);
+
+-- Session tokens their holder ended with /api/logout, by SHA-256 of the token,
+-- kept until the token would have expired anyway.
+CREATE TABLE IF NOT EXISTS ended_session (
+  token_hash TEXT    PRIMARY KEY,
+  expires    INTEGER NOT NULL
+);
 `;
+
+// Columns added to tables that existing databases already have.
+const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
+  { table: "account", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
+];
 
 export class Store {
   readonly db: DB;
@@ -193,6 +211,12 @@ export class Store {
   constructor(dataDir: string) {
     this.db = new Database(path.join(dataDir, "proxy.db"));
     this.db.exec(SCHEMA);
+    for (const { table, column, definition } of ADDED_COLUMNS) {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      if (!columns.some((c) => c.name === column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      }
+    }
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */
@@ -209,16 +233,50 @@ export class Store {
     this.db.close();
   }
 
-  upsertAccount(p: { slug: string; kind: string; host: string; username: string; vault: Buffer }): AccountRow {
+  /**
+   * Store the credentials a successful login proved. `rotate` says they differ
+   * from what the row held: the credential generation then moves, which ends
+   * every session issued under the previous one.
+   */
+  upsertAccount(p: {
+    slug: string;
+    kind: string;
+    host: string;
+    username: string;
+    vault: Buffer;
+    rotate?: boolean;
+  }): AccountRow {
     const now = Date.now();
+    const before = this.getAccount(p.slug);
     const stmt = this.prep(
       `INSERT INTO account(slug, kind, host, username, vault, created_at)
        VALUES(?,?,?,?,?,?)
        ON CONFLICT(slug) DO UPDATE SET kind=excluded.kind, host=excluded.host,
-         username=excluded.username, vault=excluded.vault`,
+         username=excluded.username, vault=excluded.vault,
+         cred_gen = cred_gen + ?`,
     );
-    stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now);
-    return this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
+    stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, p.rotate ? 1 : 0);
+    const row = this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
+    if (before && before.cred_gen !== row.cred_gen) this.credentialListener?.(row.id);
+    return row;
+  }
+
+  // Told when an account's credential generation moved, so the server can
+  // close what was opened under the old one (pooled connections, the IDLE
+  // worker, cached Basic logins).
+  setCredentialListener(fn: ((accountId: number) => void) | undefined): void {
+    this.credentialListener = fn;
+  }
+  private credentialListener?: (accountId: number) => void;
+
+  /** Remember that a session token was ended, until it would have expired. */
+  endSession(tokenHash: string, expiresMs: number): void {
+    this.prep(`DELETE FROM ended_session WHERE expires <= ?`).run(Date.now());
+    this.prep(`INSERT OR REPLACE INTO ended_session(token_hash, expires) VALUES(?,?)`).run(tokenHash, expiresMs);
+  }
+
+  isSessionEnded(tokenHash: string): boolean {
+    return this.prep(`SELECT 1 FROM ended_session WHERE token_hash = ?`).get(tokenHash) !== undefined;
   }
 
   getAccount(slug: string): AccountRow | undefined {

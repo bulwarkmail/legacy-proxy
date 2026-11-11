@@ -266,6 +266,7 @@ export class GmailPush {
       username: email,
       vault: Buffer.alloc(0),
       created_at: 0,
+      cred_gen: 0,
     };
   }
 }

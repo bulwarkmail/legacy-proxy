@@ -75,6 +75,14 @@ export class PushIdleManager {
     void this.sync();
   };
 
+  // The account's stored credentials changed: a worker logged in with the old
+  // ones starts over with the new ones.
+  onCredentialsChanged = (accountId: number): void => {
+    const worker = this.workers.get(accountId);
+    if (!worker) return;
+    void this.stop(accountId, worker).then(() => this.sync());
+  };
+
   async closeAll(): Promise<void> {
     for (const [accountId, worker] of this.workers) {
       await this.stop(accountId, worker);

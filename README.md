@@ -218,6 +218,21 @@ The response carries `{ token, accountId, apiUrl }`. Use the token as
 opens a probe IMAP session with the supplied credentials, seals them into the
 vault, and only mints a token if IMAP accepts.
 
+A token is valid for 7 days. It ends earlier when the password behind it is
+replaced: the first sign-in that stores a different password for the account
+(through `/api/login` or HTTP Basic) moves the account's credential generation,
+and from then on every token issued before it is answered `401`. The IMAP
+connections that logged in with the old password, the push IDLE connection
+included, are closed, and cached Basic logins are checked against the server
+again. Signing in again with the same password ends nothing. Tokens issued by
+versions before this check carry no generation and keep working until the
+account's password first changes.
+
+`POST /api/logout` with `Authorization: Bearer <token>` ends that one token and
+answers `204`; the account's other sessions stay signed in. Ended tokens are
+kept in the database until they would have expired, so a restart does not
+bring them back.
+
 `provider` is the key into `providers.json`. When omitted, the proxy picks it
 from the email domain of `username` (see [Provider selection](#provider-selection)),
 falling back to `DEFAULT_PROVIDER`. For OAuth providers, pass `accessToken`

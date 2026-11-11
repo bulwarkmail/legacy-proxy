@@ -1,0 +1,124 @@
+// LPROXY-04: a session token (and a cached Basic header) names an account, not
+// a credential. After the mailbox password changed and the owner signed in
+// with the new one, everything issued for the old password still works, and
+// there is no way to end a session. Belongs in test/unit/.
+//
+// Fails on fe595e1: the old token and the old Basic header still get 200.
+
+import fs from "node:fs";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { FastifyInstance } from "fastify";
+import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+
+let imap: FakeImap;
+let app: FastifyInstance;
+let dir: string;
+beforeAll(async () => {
+  imap = await startFakeImap({ "alice@test.local": "old-password", "erin@test.local": "old-password" });
+  ({ app, dir } = await bootProxy(imap));
+});
+afterAll(async () => {
+  await app.close();
+  await imap.close();
+  // The server keeps proxy.db open until the process ends (Windows refuses the unlink).
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* left for the OS temp cleanup */
+  }
+});
+
+const basic = (user: string, pass: string) => "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
+const login = (username: string, password: string) =>
+  app.inject({ method: "POST", url: "/api/login", payload: { username, password } });
+const session = (authorization: string) =>
+  app.inject({ method: "GET", url: "/jmap/session", headers: { authorization } });
+
+describe("sessions end when the password they were made with is replaced (LPROXY-04)", () => {
+  it("refuses a token issued for the old password once the owner signed in with the new one", async () => {
+    const oldToken = (await login("alice@test.local", "old-password")).json().token as string;
+    expect((await session(`Bearer ${oldToken}`)).statusCode).toBe(200);
+
+    imap.users["alice@test.local"] = "new-password";
+    const fresh = await login("alice@test.local", "new-password");
+    expect(fresh.statusCode).toBe(200);
+
+    expect((await session(`Bearer ${fresh.json().token as string}`)).statusCode).toBe(200);
+    expect((await session(`Bearer ${oldToken}`)).statusCode).toBe(401);
+  });
+
+  it("refuses a cached Basic header once the owner signed in with the new password", async () => {
+    expect((await session(basic("erin@test.local", "old-password"))).statusCode).toBe(200);
+
+    imap.users["erin@test.local"] = "new-password";
+    expect((await session(basic("erin@test.local", "new-password"))).statusCode).toBe(200);
+
+    expect((await session(basic("erin@test.local", "old-password"))).statusCode).toBe(401);
+  });
+});
+
+const tokenOf = async (username: string, password: string) => {
+  const res = await login(username, password);
+  expect(res.statusCode).toBe(200);
+  return res.json().token as string;
+};
+const logout = (authorization?: string) =>
+  app.inject({ method: "POST", url: "/api/logout", headers: authorization ? { authorization } : {} });
+
+describe("what a password change and a sign-out leave working", () => {
+  it("keeps two devices signed in with the same password working", async () => {
+    imap.users["gina@test.local"] = "same-password";
+    const a = await tokenOf("gina@test.local", "same-password");
+    const b = await tokenOf("gina@test.local", "same-password");
+    expect((await session(`Bearer ${a}`)).statusCode).toBe(200);
+    expect((await session(`Bearer ${b}`)).statusCode).toBe(200);
+  });
+
+  it("keeps a device's token when it signs in again with the same password", async () => {
+    imap.users["hank@test.local"] = "same-password";
+    const first = await tokenOf("hank@test.local", "same-password");
+    await tokenOf("hank@test.local", "same-password");
+    expect((await session(`Bearer ${first}`)).statusCode).toBe(200);
+  });
+
+  it("closes the connections logged in with the old password", async () => {
+    imap.users["ivy@test.local"] = "old-password";
+    await tokenOf("ivy@test.local", "old-password");
+    const logouts = () => imap.lines.filter((l) => / LOGOUT$/i.test(l)).length;
+    const before = logouts();
+    imap.users["ivy@test.local"] = "new-password";
+    await tokenOf("ivy@test.local", "new-password");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(logouts()).toBeGreaterThan(before);
+  });
+
+  it("keeps a token issued before generations existed until the password changes", async () => {
+    imap.users["jay@test.local"] = "old-password";
+    await tokenOf("jay@test.local", "old-password");
+    const { signSession } = await import("../../src/auth/session.js");
+    const now = Math.floor(Date.now() / 1000);
+    const legacy = signSession(Buffer.from(process.env.SESSION_HMAC_KEY!, "base64"), {
+      accountSlug: "generic:jay@test.local",
+      username: "jay@test.local",
+      iat: now,
+      exp: now + 3600,
+    });
+    expect((await session(`Bearer ${legacy}`)).statusCode).toBe(200);
+
+    imap.users["jay@test.local"] = "new-password";
+    await tokenOf("jay@test.local", "new-password");
+    expect((await session(`Bearer ${legacy}`)).statusCode).toBe(401);
+  });
+
+  it("ends the caller's own token on /api/logout and nothing else", async () => {
+    imap.users["kim@test.local"] = "pw";
+    const mine = await tokenOf("kim@test.local", "pw");
+    const other = await tokenOf("kim@test.local", "pw");
+
+    expect((await logout()).statusCode).toBe(401);
+    expect((await logout(`Bearer ${mine}`)).statusCode).toBe(204);
+    expect((await session(`Bearer ${mine}`)).statusCode).toBe(401);
+    expect((await logout(`Bearer ${mine}`)).statusCode).toBe(401);
+    expect((await session(`Bearer ${other}`)).statusCode).toBe(200);
+  });
+});
