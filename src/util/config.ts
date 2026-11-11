@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { validateProviders } from "../auth/providers.js";
 
 export interface ProviderConfig {
   /**
@@ -10,13 +11,17 @@ export interface ProviderConfig {
    * client having to name the provider explicitly.
    */
   domains?: string[];
-  imap: { host: string; port: number; secure?: boolean; starttls?: boolean };
-  smtp: { host: string; port: number; secure?: boolean; starttls?: boolean };
-  sieve: { host: string; port: number; secure?: boolean; starttls?: boolean } | null;
+  // `secure`: implicit TLS. `starttls`: plain connection that must be upgraded
+  // before credentials are sent. A connection with neither is refused unless
+  // the host is loopback or `allowPlaintext` is true (see auth/providers.ts).
+  imap: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean };
+  smtp: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean };
+  sieve: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean } | null;
   carddav: {
     host: string;
     port: number;
     secure?: boolean;
+    allowPlaintext?: boolean;
     basePath?: string;
     principalPath?: string;
   } | null;
@@ -64,6 +69,7 @@ export function loadConfig(): AppConfig {
   if (fs.existsSync(providersFile)) {
     providers = JSON.parse(fs.readFileSync(providersFile, "utf8"));
   }
+  validateProviders(providers);
 
   return {
     port: Number(process.env.PORT ?? 8080),

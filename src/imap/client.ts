@@ -1,5 +1,6 @@
 import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
+import { assertTransport, transportOf } from "../auth/providers.js";
 import type { ProviderConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
@@ -18,10 +19,16 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
   } else {
     throw new Error("openImap: no credentials supplied");
   }
+  // Refuse a plain connection the provider entry does not allow, and make
+  // STARTTLS a requirement when the entry asks for it: imapflow then fails the
+  // connect, before any credential is sent, if the server does not offer it.
+  assertTransport("imap", provider.imap);
+  const { secure, starttls } = transportOf("imap", provider.imap);
   const client = new ImapFlow({
     host: provider.imap.host,
     port: provider.imap.port,
-    secure: provider.imap.secure ?? true,
+    secure,
+    ...(starttls ? { doSTARTTLS: true } : {}),
     auth,
     logger: imapflowLogger,
   });

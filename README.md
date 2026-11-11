@@ -679,6 +679,36 @@ the underlying ManageSieve error. An optional `domains` array on a provider
 opts it into domain-based [provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
 
+### Encryption to the mail server
+
+Each `imap`, `smtp` and `sieve` entry in `providers.json` says how the proxy
+reaches that server:
+
+- `"secure": true`: implicit TLS from the first byte (IMAP 993, SMTP 465).
+- `"starttls": true`: a plain connection that must be upgraded with STARTTLS
+  before the proxy logs in. If the server does not offer STARTTLS, or the
+  upgrade fails, the connection is dropped and no credentials are sent.
+- neither: a plain connection, and the password crosses the network in clear.
+
+When `secure` is left out it means implicit TLS for IMAP, implicit TLS on port
+465 for SMTP, and plain for ManageSieve; with `"starttls": true` it means plain
+plus the required upgrade. `"secure": true` together with `"starttls": true` is
+a configuration error. For `carddav`, `"secure": true` means https; anything
+else means Basic auth over plain http.
+
+A plain connection is accepted only when the host is loopback (`localhost`,
+`127.0.0.0/8`, `::1`) or the entry says `"allowPlaintext": true`. The providers
+file is checked at start, and an entry that would send a password in clear stops
+the proxy with a message that names the provider and the service. An existing
+deployment with such an entry (IMAP on 143 with `"secure": false`, or SMTP on
+587 without `"starttls": true`, which used to upgrade only when the server
+offered it) has three ways out:
+
+1. implicit TLS: `"secure": true` on the server's TLS port;
+2. required STARTTLS: `"starttls": true`, with `"secure": false` or no `secure`;
+3. a plain connection on purpose: `"allowPlaintext": true`, for a server on a
+   network you trust.
+
 ## Tests
 
 ```bash

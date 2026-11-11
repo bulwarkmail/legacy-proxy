@@ -8,12 +8,14 @@
 import { TLSSocket, connect as tlsConnect } from "node:tls";
 import { Socket, connect as netConnect } from "node:net";
 import type { Credentials } from "../auth/credentials.js";
+import { assertTransport, transportOf } from "../auth/providers.js";
 
 interface SieveOpts {
   host: string;
   port: number;
   starttls?: boolean;
   secure?: boolean;
+  allowPlaintext?: boolean;
   creds: Credentials;
   servername?: string;
 }
@@ -35,9 +37,13 @@ export class SieveClient {
   }
 
   async connect(): Promise<void> {
+    // AUTHENTICATE PLAIN carries the password: it goes only over implicit TLS,
+    // a completed STARTTLS, or a plain connection the provider entry allows.
+    assertTransport("sieve", this.opts);
+    const { secure, starttls } = transportOf("sieve", this.opts);
     await new Promise<void>((resolve, reject) => {
       const onErr = (e: Error) => reject(e);
-      this.sock = this.opts.secure
+      this.sock = secure
         ? tlsConnect({ host: this.opts.host, port: this.opts.port, servername: this.opts.servername ?? this.opts.host }, () => {
             this.sock.off("error", onErr);
             resolve();
@@ -60,8 +66,9 @@ export class SieveClient {
       });
     });
     await this.readGreeting();
-    if (this.opts.starttls && !(this.sock instanceof TLSSocket)) {
+    if (starttls) {
       await this.startTls();
+      if (!(this.sock instanceof TLSSocket)) throw new Error("ManageSieve: STARTTLS did not complete");
     }
     await this.authenticate();
   }
