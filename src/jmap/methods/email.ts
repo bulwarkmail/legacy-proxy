@@ -1606,7 +1606,10 @@ export async function emailParse(
       continue;
     }
     try {
-      const m = await simpleParser(upload.body);
+      // Without the text-to-HTML step (it linkifies the text, which costs far
+      // more than the size of the text). Email/parse returns `text` and
+      // `html`, not mailparser's `textAsHtml`.
+      const m = await simpleParser(upload.body, { skipTextToHtml: true });
       const collect = (
         f: { value?: { name?: string; address?: string }[] }
           | { value?: { name?: string; address?: string }[] }[]

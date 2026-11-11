@@ -221,7 +221,8 @@ async function resolveEnvelope(
   }
   // Spec §7: if no envelope is given, derive from headers - From for
   // mailFrom, To+Cc+Bcc for rcptTo. Each member of a group is a recipient.
-  const parsed = await simpleParser(raw);
+  // Only the headers are read, so none of the body conversions run.
+  const parsed = await simpleParser(raw, { skipTextToHtml: true, skipHtmlToText: true, skipImageLinks: true });
   const fromAddr =
     asEmail(parsed.from?.value?.[0]?.address) ?? asEmail(envelope?.mailFrom?.email) ?? null;
   const collect = (
