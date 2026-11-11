@@ -159,7 +159,8 @@ describe("a recipient is delivered to the address the user was shown", () => {
     draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example, ${CONFUSING}`);
     const derived = await send();
     expect(derived.created).toBeNull();
-    expect(derived.notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: [CONFUSING.replace(/"/g, "")] });
+    // Named as the message wrote it, whichever mail library version is installed.
+    expect(derived.notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: [CONFUSING] });
 
     const given = await send({
       mailFrom: { email: "alice@corp.example" },
@@ -210,6 +211,80 @@ describe("a recipient is delivered to the address the user was shown", () => {
     draft = mail(`From: alice@corp.example`);
     const res = await send();
     expect(res.notCreated?.s?.type).toBe("noRecipients");
+    expect(smtpLines).toEqual([]);
+  });
+});
+
+describe("the envelope derived from the headers", () => {
+  it.each([
+    ['"Doe, Jane" <jane@corp.example>', ["jane@corp.example"]],
+    ['"a@evil.example" <b@corp.example>', ["b@corp.example"]],
+    ['"a" b <c@corp.example>', ["c@corp.example"]],
+    ["Jane Doe <jane@corp.example>", ["jane@corp.example"]],
+    ["Jane Doe < jane@corp.example >", ["jane@corp.example"]],
+    ["jane@corp.example (Jane)", ["jane@corp.example"]],
+    ["(Jane) jane@corp.example", ["jane@corp.example"]],
+    ["=?utf-8?Q?J=C3=B6rg_M=C3=BCller?= <joerg@corp.example>", ["joerg@corp.example"]],
+    ["Team: a@corp.example, b@corp.example;", ["a@corp.example", "b@corp.example"]],
+    ["a@corp.example,,b@corp.example,", ["a@corp.example", "b@corp.example"]],
+    ["a@[192.0.2.1]", ["a@[192.0.2.1]"]],
+  ])("sends To: %s to %j", async (to, expected) => {
+    draft = mail(`From: alice@corp.example\r\nTo: ${to}`);
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(res.created?.s?.envelope.rcptTo.map((r) => r.email)).toEqual(expected);
+    expect(rcpts()).toEqual(expected.map((a) => `RCPT TO:<${a}>`));
+  });
+
+  it.each([
+    ['"attacker@evil.example x"@corp.example', '"attacker@evil.example x"@corp.example'],
+    ['"<attacker@evil.example>"@corp.example', '"<attacker@evil.example>"@corp.example'],
+    ['"jane"@corp.example', '"jane"@corp.example'],
+    ['a"b"@corp.example', 'a"b"@corp.example'],
+    ["attacker@evil.example x@corp.example", "attacker@evil.example x@corp.example"],
+    ["<attacker@evil.example>@corp.example", "<attacker@evil.example>@corp.example"],
+    ["Jane Doe jane@corp.example", "Jane Doe jane@corp.example"],
+    ["jane @ corp.example", "jane @ corp.example"],
+    ["jane(x)@corp.example", "jane(x)@corp.example"],
+    ["<a@corp.example> b@evil.example", "<a@corp.example> b@evil.example"],
+    ["a@corp.example <b@evil.example>", "a@corp.example <b@evil.example>"],
+    ["<a@corp.example> <b@evil.example>", "<a@corp.example> <b@evil.example>"],
+    ["<@route.example:a@corp.example>", "<@route.example:a@corp.example>"],
+    ['"a b" <"c d"@corp.example>', '"c d"@corp.example'],
+    ["=?utf-8?Q?a=40evil.example?=", "=?utf-8?Q?a=40evil.example?="],
+    ["a@corp.example;b@evil.example", "a@corp.example;b@evil.example"],
+    ["Team: a@corp.example", "Team: a@corp.example"],
+    ["John", "John"],
+    ["<a@corp.example", "<a@corp.example"],
+    ["a@corp.example>", "a@corp.example>"],
+    ["a@corp.example\r\n\tb@evil.example", "a@corp.example\tb@evil.example"],
+  ])("refuses To: %j, naming %j, and sends nothing", async (to, named) => {
+    draft = mail(`From: alice@corp.example\r\nTo: ok@corp.example, ${to}`);
+    const res = await send();
+    expect(res.created).toBeNull();
+    expect(res.notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: [named] });
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("reads every To, Cc and Bcc header, unfolded, and nothing from the body", async () => {
+    draft = Buffer.from(
+      "From: Alice <alice@corp.example>\r\nTo: a@corp.example,\r\n b@corp.example\r\nX-To: x@evil.example\r\n" +
+        "Cc: c@corp.example\r\nTo: d@corp.example\r\nBcc: e@corp.example\r\n\r\nTo: body@evil.example\r\n",
+    );
+    const res = await send();
+    expect(res.created?.s?.envelope).toEqual({
+      mailFrom: { email: "alice@corp.example" },
+      rcptTo: ["a", "b", "d", "c", "e"].map((l) => ({ email: `${l}@corp.example` })),
+    });
+    expect(mailFroms()).toEqual(["MAIL FROM:<alice@corp.example>"]);
+  });
+
+  it("refuses a From that isn't one plain mailbox", async () => {
+    for (const from of ["Jane Doe jane@corp.example", "a@corp.example <b@evil.example>", '"x y"@corp.example']) {
+      draft = mail(`From: ${from}\r\nTo: bob@corp.example`);
+      const res = await send();
+      expect(res.notCreated?.s?.type, from).toBe("forbiddenMailFrom");
+    }
     expect(smtpLines).toEqual([]);
   });
 });

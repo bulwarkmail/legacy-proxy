@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { ImapFlow } from "imapflow";
-import { simpleParser } from "mailparser";
 import type { AccountRow, Store } from "../../state/store.js";
 import type { AppConfig } from "../../util/config.js";
 import { decodeEmailId } from "../../mapping/ids.js";
@@ -178,8 +177,8 @@ function asEmail(s: string | undefined | null): string | null {
 
 // Whitespace, control characters and everything an address parser reads as
 // syntax: list separators, angle brackets, quotes, escapes, comments and the
-// colon of a group.
-const NOT_PLAIN = /[\s,;:<>"\\()\u0000-\u001f\u007f-\u009f]/u;
+// colon of a group. U+FFFD stands for header bytes that weren't UTF-8.
+const NOT_PLAIN = /[\s,;:<>"\\()\u0000-\u001f\u007f-\u009f\ufffd]/u;
 
 /**
  * A plain address: one "@" between a non-empty local part and a non-empty
@@ -193,21 +192,185 @@ export function isPlainAddress(s: string): boolean {
   return at > 0 && at === s.lastIndexOf("@") && at < s.length - 1 && !NOT_PLAIN.test(s);
 }
 
+function refuseRecipients(invalid: string[]): never {
+  throw new JmapError("invalidRecipients", "recipients must be plain email addresses", {
+    invalidRecipients: invalid,
+  });
+}
+
 /** Accept an envelope only when all its addresses are plain. */
 function checkedEnvelope(from: string, to: string[]): { from: string; to: string[] } {
   const invalid = to.filter((a) => !isPlainAddress(a));
-  if (invalid.length > 0) {
-    throw new JmapError("invalidRecipients", "recipients must be plain email addresses", {
-      invalidRecipients: invalid,
-    });
-  }
+  if (invalid.length > 0) refuseRecipients(invalid);
   if (!isPlainAddress(from)) {
     throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
   }
   return { from, to };
 }
 
-type ParsedAddress = { address?: string; group?: ParsedAddress[] };
+/** Every value of a header field (name in lower case), unfolded, from the message's header block. */
+export function headerValues(raw: Buffer, name: string): string[] {
+  const crlf = raw.indexOf("\r\n\r\n");
+  const lf = raw.indexOf("\n\n");
+  const ends = [crlf, lf].filter((i) => i >= 0);
+  const head = raw.subarray(0, ends.length ? Math.min(...ends) : raw.length).toString("utf8");
+  const out: string[] = [];
+  for (const m of head.matchAll(/^([!-9;-~]+)[ \t]*:([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/gm)) {
+    if (m[1]!.toLowerCase() === name) out.push(m[2]!.replace(/\r?\n(?=[ \t])/g, ""));
+  }
+  return out;
+}
+
+/** One entry of an address list: the mailbox's address as written, or null when the entry isn't one mailbox. */
+export interface AddressEntry {
+  address: string | null;
+  /** The entry as the header wrote it, trimmed: what an error names when there is no address. */
+  written: string;
+}
+
+type Token = { kind: "word" | "quoted" | "literal" | "space" | "bad" | "<" | ">" | "," | ";" | ":"; start: number; end: number };
+
+function tokenize(s: string): Token[] {
+  const out: Token[] = [];
+  let i = 0;
+  // Skips a quoted string, comment or domain literal; returns the index after it, or -1 if it never closes.
+  const skip = (open: number, close: string, nests: boolean): number => {
+    let depth = 0;
+    for (let j = open; j < s.length; j++) {
+      const c = s[j]!;
+      if (c === "\\") j++;
+      else if (j > open && c === close && depth === 0) return j + 1;
+      else if (nests && j > open && c === "(") depth++;
+      else if (nests && c === ")") depth--;
+    }
+    return -1;
+  };
+  while (i < s.length) {
+    const c = s[i]!;
+    const start = i;
+    if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === "(") {
+      // Whitespace and comments separate words; neither is part of an address.
+      while (i < s.length) {
+        const d = s[i]!;
+        if (d === " " || d === "\t" || d === "\r" || d === "\n") i++;
+        else if (d === "(") {
+          const end = skip(i, ")", true);
+          if (end < 0) {
+            out.push({ kind: "bad", start, end: s.length });
+            return out;
+          }
+          i = end;
+        } else break;
+      }
+      out.push({ kind: "space", start, end: i });
+    } else if (c === '"' || c === "[") {
+      const end = skip(i, c === '"' ? '"' : "]", false);
+      if (end < 0) {
+        out.push({ kind: "bad", start, end: s.length });
+        return out;
+      }
+      out.push({ kind: c === '"' ? "quoted" : "literal", start, end });
+      i = end;
+    } else if (c === "<" || c === ">" || c === "," || c === ";" || c === ":") {
+      out.push({ kind: c, start, end: i + 1 });
+      i++;
+    } else {
+      while (i < s.length && !/[ \t\r\n("[<>,;:]/.test(s[i]!)) i++;
+      out.push({ kind: "word", start, end: i });
+    }
+  }
+  return out;
+}
+
+/**
+ * An RFC 5322 address list (To, Cc, Bcc, From), read strictly. An entry is
+ * an address, or a display name followed by an address in angle brackets,
+ * with comments and whitespace only around them; a group's members are
+ * entries of their own. The address is kept as written. Anything else (two
+ * addresses without a comma, text after the angle brackets, an unquoted "@"
+ * or ";" in the wrong place, an unclosed quote, bracket or group) is an entry
+ * without an address, named as written, so the envelope check refuses it
+ * instead of guessing a mailbox.
+ */
+export function parseAddressList(value: string): AddressEntry[] {
+  const tokens = tokenize(value);
+  const entries: AddressEntry[] = [];
+  const text = (ts: Token[]) => (ts.length ? value.slice(ts[0]!.start, ts[ts.length - 1]!.end) : "");
+  // A display name (of a mailbox or a group): words and quoted strings, no unquoted "@".
+  const isName = (ts: Token[]) =>
+    ts.every((t) => t.kind === "space" || t.kind === "quoted" || (t.kind === "word" && !value.slice(t.start, t.end).includes("@")));
+
+  let current: Token[] = [];
+  let valid = true;
+  let depth = 0;
+  let group: { start: number } | null = null;
+  const finish = () => {
+    const ts = trimSpace(current);
+    if (ts.length > 0) entries.push({ address: valid ? mailboxOf(ts, value, isName) : null, written: text(ts).trim() });
+    current = [];
+    valid = true;
+    depth = 0;
+  };
+
+  for (const t of tokens) {
+    if (t.kind === "bad") valid = false;
+    if (t.kind === "<") depth++;
+    if (t.kind === ">") depth--;
+    if (t.kind === "," && depth === 0) {
+      finish();
+    } else if (t.kind === ":" && depth === 0 && !group && isName(current)) {
+      // The display name of a group; its members follow, up to the ";".
+      const name = trimSpace(current);
+      group = { start: name.length ? name[0]!.start : t.start };
+      current = [];
+      valid = true;
+    } else if (t.kind === ";" && depth === 0 && group) {
+      finish();
+      group = null;
+    } else {
+      // A ":" or ";" anywhere else makes the entry something other than a mailbox.
+      if (t.kind === ":" || t.kind === ";") valid = false;
+      current.push(t);
+    }
+  }
+  if (group) {
+    // A group that never closes: none of it counts as an address.
+    entries.push({ address: null, written: value.slice(group.start).trim() });
+    current = [];
+  }
+  finish();
+  return entries;
+}
+
+function trimSpace(ts: Token[]): Token[] {
+  let a = 0;
+  let b = ts.length;
+  while (a < b && ts[a]!.kind === "space") a++;
+  while (b > a && ts[b - 1]!.kind === "space") b--;
+  return ts.slice(a, b);
+}
+
+/**
+ * The address of one entry (tokens without leading or trailing space): a bare
+ * address, or a display name and one address in angle brackets with nothing
+ * after them. Null for anything else. The address is one run of words, quoted
+ * strings and a domain literal, with no space inside and brackets only around
+ * the domain.
+ */
+function mailboxOf(ts: Token[], value: string, isName: (ts: Token[]) => boolean): string | null {
+  let parts = ts;
+  const open = ts.findIndex((t) => t.kind === "<");
+  if (open >= 0) {
+    const close = ts.findIndex((t) => t.kind === ">");
+    const angles = ts.filter((t) => t.kind === "<" || t.kind === ">").length;
+    if (close !== ts.length - 1 || angles !== 2 || !isName(ts.slice(0, open))) return null;
+    parts = trimSpace(ts.slice(open + 1, close));
+  }
+  if (parts.length === 0 || parts.some((t) => t.kind !== "word" && t.kind !== "quoted" && t.kind !== "literal")) return null;
+  const address = parts.map((t) => value.slice(t.start, t.end)).join("");
+  if (/[[\]]/.test(address) && !/^[^[\]]+@\[[^[\]]*\]$/.test(address)) return null;
+  return address;
+}
 
 async function resolveEnvelope(
   raw: Buffer,
@@ -221,30 +384,19 @@ async function resolveEnvelope(
   }
   // Spec §7: if no envelope is given, derive from headers - From for
   // mailFrom, To+Cc+Bcc for rcptTo. Each member of a group is a recipient.
-  // Only the headers are read, so none of the body conversions run.
-  const parsed = await simpleParser(raw, { skipTextToHtml: true, skipHtmlToText: true, skipImageLinks: true });
-  const fromAddr =
-    asEmail(parsed.from?.value?.[0]?.address) ?? asEmail(envelope?.mailFrom?.email) ?? null;
-  const collect = (
-    field: { value?: ParsedAddress[] } | { value?: ParsedAddress[] }[] | undefined,
-  ): string[] => {
-    if (!field) return [];
-    const arr = Array.isArray(field) ? field : [field];
-    const out: string[] = [];
-    const add = (v: ParsedAddress): void => {
-      if (v.group) {
-        for (const member of v.group) add(member);
-        return;
-      }
-      const e = asEmail(v.address);
-      if (e) out.push(e);
-    };
-    for (const f of arr) {
-      for (const v of f.value ?? []) add(v);
-    }
-    return out;
-  };
-  const to = [...collect(parsed.to), ...collect(parsed.cc), ...collect(parsed.bcc)];
+  // The headers are read here, not by a mail library, so every address is
+  // taken as the message wrote it whatever library version is installed.
+  const entries = (name: string) => headerValues(raw, name).flatMap(parseAddressList);
+  const fromEntry = entries("from")[0];
+  if (fromEntry && fromEntry.address === null) {
+    throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
+  }
+  const fromAddr = fromEntry ? fromEntry.address : asEmail(envelope?.mailFrom?.email);
+  const recipients = ["to", "cc", "bcc"].flatMap(entries);
+  // An entry that isn't one plain mailbox is refused, named as the message wrote it.
+  const invalid = recipients.filter((e) => e.address === null || !isPlainAddress(e.address));
+  if (invalid.length > 0) refuseRecipients(invalid.map((e) => e.address ?? e.written));
+  const to = recipients.map((e) => e.address!);
   if (!fromAddr) {
     throw new JmapError("invalidEmail", "could not derive envelope From");
   }
