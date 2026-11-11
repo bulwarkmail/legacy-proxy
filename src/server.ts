@@ -351,8 +351,10 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     // RFC 8620 §6.2: clients pass a desired Content-Type via the {type} URL
     // template variable. Honor it (after a sanity check) so the test suite's
     // download-respects-type-param case passes — we don't trust user input
-    // implicitly, just allow the small standard set used by JMAP clients.
-    const requestedType = decodeURIComponent(req.params.type ?? "");
+    // implicitly, just allow the small standard set used by JMAP clients. The
+    // router has already decoded the segment; decoding it again would turn a
+    // literal `%` into an error.
+    const requestedType = req.params.type ?? "";
     const allowedType = /^[\w.+-]+\/[\w.+-]+$/.test(requestedType) ? requestedType : null;
 
     // Uploaded blobs are served straight from SQLite. Email-backed blobs need
