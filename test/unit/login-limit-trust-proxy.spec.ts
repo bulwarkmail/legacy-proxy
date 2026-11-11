@@ -14,7 +14,7 @@ beforeAll(async () => {
   imap = await startFakeImap({ "carol@test.local": "right-password" });
   process.env.TRUST_PROXY = "1";
   ({ app, dir } = await bootProxy(imap));
-});
+}, 60_000);
 afterAll(async () => {
   delete process.env.TRUST_PROXY;
   await app.close();

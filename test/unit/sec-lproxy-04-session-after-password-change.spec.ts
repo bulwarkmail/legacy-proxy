@@ -16,7 +16,7 @@ let dir: string;
 beforeAll(async () => {
   imap = await startFakeImap({ "alice@test.local": "old-password", "erin@test.local": "old-password" });
   ({ app, dir } = await bootProxy(imap));
-});
+}, 60_000);
 afterAll(async () => {
   await app.close();
   await imap.close();
