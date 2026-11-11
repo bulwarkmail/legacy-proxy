@@ -8,6 +8,7 @@ import type { AccountRow, PushSubscriptionRow, Store } from "../../state/store.j
 import type { PushDispatcher } from "../../push/dispatcher.js";
 import { encodeCounterState } from "../../state/states.js";
 import { log } from "../../util/log.js";
+import { PushTargetError, resolvePushTarget } from "../../util/pushTarget.js";
 
 interface SetError {
   type: string;
@@ -161,6 +162,18 @@ export async function pushSubscriptionSet(
       notCreated[creationKey] = validated.error;
       continue;
     }
+    // The same check every delivery makes: https, a name that resolves, and
+    // only to public addresses (see PUSH_ALLOW_PRIVATE_URLS).
+    try {
+      await resolvePushTarget(validated.url);
+    } catch (err) {
+      notCreated[creationKey] = {
+        type: "invalidProperties",
+        properties: ["url"],
+        description: err instanceof PushTargetError ? err.message : "push URL refused",
+      };
+      continue;
+    }
 
     const id = crypto.randomUUID();
     const row: PushSubscriptionRow = {
@@ -285,7 +298,7 @@ function validateCreate(raw: Record<string, unknown>): CreateValid | { error: Se
       error: {
         type: "invalidProperties",
         properties: ["url"],
-        description: "url must be an http(s) URL",
+        description: "url must be an https URL",
       },
     };
   }
