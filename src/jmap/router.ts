@@ -27,7 +27,39 @@ export type MethodTable = Readonly<Record<string, (args: Record<string, unknown>
 export interface DispatchContext {
   methods: MethodTable;
   maxCallsInRequest: number;
+  /** The session's `maxObjectsInGet` and `maxObjectsInSet`, enforced before a method runs. */
+  maxObjectsInGet?: number;
+  maxObjectsInSet?: number;
   sessionState: string;
+}
+
+const countList = (v: unknown) => (Array.isArray(v) ? v.length : 0);
+const countMap = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v) ? Object.keys(v).length : 0);
+
+/**
+ * RFC 8620 §5.1 and §5.3: a call that names more objects than the session
+ * advertises is answered `requestTooLarge` before its method runs. Counted
+ * after result references are resolved. `ids: null` is left to the method.
+ */
+function checkObjectLimits(name: string, args: Record<string, unknown>, ctx: DispatchContext): void {
+  if (ctx.maxObjectsInGet !== undefined) {
+    let n = 0;
+    if (name === "SearchSnippet/get") n = countList(args.emailIds);
+    else if (name.endsWith("/get")) n = countList(args.ids);
+    else if (name === "Email/parse") n = countList(args.blobIds);
+    if (n > ctx.maxObjectsInGet) {
+      throw new JmapError("requestTooLarge", `${n} objects in one ${name}; maxObjectsInGet is ${ctx.maxObjectsInGet}`);
+    }
+  }
+  if (ctx.maxObjectsInSet !== undefined) {
+    let n = 0;
+    if (name.endsWith("/set")) n = countMap(args.create) + countMap(args.update) + countList(args.destroy);
+    else if (name.endsWith("/copy")) n = countMap(args.create);
+    else if (name === "Email/import") n = countMap(args.emails);
+    if (n > ctx.maxObjectsInSet) {
+      throw new JmapError("requestTooLarge", `${n} objects in one ${name}; maxObjectsInSet is ${ctx.maxObjectsInSet}`);
+    }
+  }
 }
 
 // RFC 8620 §3.6.1: each method requires a specific capability in `using`. If
@@ -166,6 +198,7 @@ async function runCall(
       // to the negotiated capability set.
       throw unknownMethod(name);
     }
+    checkObjectLimits(name, args, ctx);
     const result = await handler(args);
     const ms = Date.now() - t0;
     if (ms >= 250) log.info({ method: name, callId, ms }, "jmap method slow");

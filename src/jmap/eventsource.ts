@@ -18,8 +18,13 @@ interface Subscriber {
   ping: NodeJS.Timeout;
 }
 
+/** Open event streams per account; a new one past this closes the oldest. */
+export const MAX_STREAMS_PER_ACCOUNT = 10;
+
 export class EventSourceHub {
   private clients = new Map<number, Set<Subscriber>>();
+
+  constructor(private readonly maxStreamsPerAccount = MAX_STREAMS_PER_ACCOUNT) {}
 
   add(
     account: AccountRow,
@@ -32,6 +37,17 @@ export class EventSourceHub {
     if (!set) {
       set = new Set();
       this.clients.set(account.id, set);
+    }
+    // A Set iterates in insertion order, so the first entry is the oldest stream.
+    for (const oldest of set) {
+      if (set.size < this.maxStreamsPerAccount) break;
+      set.delete(oldest);
+      clearInterval(oldest.ping);
+      try {
+        oldest.reply.raw.end();
+      } catch {
+        // already gone
+      }
     }
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache, no-transform");

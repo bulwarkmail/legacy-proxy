@@ -271,6 +271,9 @@ app.get("/jmap/session", async (req, reply) => {
   return buildSession(cfg, account, provider);
 });
 
+// `/jmap` requests being answered, per account.
+const jmapRequestsInFlight = new Map<number, number>();
+
 app.post("/jmap", async (req, reply) => {
   const account = await requireAccount(req, reply);
   if (!account) return reply;
@@ -287,10 +290,25 @@ app.post("/jmap", async (req, reply) => {
       });
     }
   }
+  // RFC 8620 §3.6.1: a request over the account's maxConcurrentRequests is
+  // refused before any method runs, so the client may replay it. Same answer
+  // as Stalwart gives, which JMAP clients already back off and retry on.
+  const running = jmapRequestsInFlight.get(account.id) ?? 0;
+  if (running >= cfg.limits.maxConcurrentRequests) {
+    return reply.code(400).send({
+      type: "urn:ietf:params:jmap:error:limit",
+      status: 400,
+      limit: "maxConcurrentRequests",
+      detail: `At most ${cfg.limits.maxConcurrentRequests} requests per account at a time`,
+    });
+  }
+  jmapRequestsInFlight.set(account.id, running + 1);
   try {
     const out = await dispatch(env, {
       methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher }),
       maxCallsInRequest: cfg.limits.maxCallsInRequest,
+      maxObjectsInGet: cfg.limits.maxObjectsInGet,
+      maxObjectsInSet: cfg.limits.maxObjectsInSet,
       sessionState: `s${account.id}`,
     });
     if (process.env.JMAP_DEBUG === "1") {
@@ -303,6 +321,10 @@ app.post("/jmap", async (req, reply) => {
   } catch (e) {
     log.error({ err: (e as Error).message }, "jmap dispatch error");
     return reply.code(500).send({ error: "internal" });
+  } finally {
+    const left = (jmapRequestsInFlight.get(account.id) ?? 1) - 1;
+    if (left > 0) jmapRequestsInFlight.set(account.id, left);
+    else jmapRequestsInFlight.delete(account.id);
   }
 });
 
@@ -518,10 +540,19 @@ app.post<{ Params: { accountId: string } }>(
     if (body.length > cfg.limits.maxSizeUpload) {
       return reply.code(413).send({ type: "tooLarge" });
     }
+    // Opportunistic GC: cheap when the upload table is small, no-op when empty.
+    // Runs first so expired uploads do not count against the account's budget.
+    store.pruneUploads(UPLOAD_RETENTION_MS);
+    if (store.uploadBytes(account.id) + body.length > cfg.limits.maxUploadStoragePerAccount) {
+      return reply.code(413).send({
+        type: "urn:ietf:params:jmap:error:limit",
+        status: 413,
+        limit: "maxUploadStoragePerAccount",
+        detail: `Pending uploads are limited to ${cfg.limits.maxUploadStoragePerAccount} bytes per account; they expire 24 hours after upload.`,
+      });
+    }
     const blobId = "U" + crypto.randomUUID().replace(/-/g, "");
     store.putUpload({ id: blobId, accountId: account.id, ctype, body });
-    // Opportunistic GC: cheap when the upload table is small, no-op when empty.
-    store.pruneUploads(UPLOAD_RETENTION_MS);
     return {
       accountId: String(account.id),
       blobId,

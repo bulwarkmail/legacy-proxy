@@ -47,6 +47,8 @@ export interface AppConfig {
     maxObjectsInGet: number;
     maxObjectsInSet: number;
     maxSizeUpload: number;
+    /** Bytes of pending uploads one account may have stored at a time. */
+    maxUploadStoragePerAccount: number;
     maxSizeRequest: number;
     maxCallsInRequest: number;
   };
@@ -105,6 +107,7 @@ export function loadConfig(): AppConfig {
       maxObjectsInGet: Number(process.env.MAX_OBJECTS_IN_GET ?? 500),
       maxObjectsInSet: Number(process.env.MAX_OBJECTS_IN_SET ?? 500),
       maxSizeUpload: Number(process.env.MAX_SIZE_UPLOAD ?? 50_000_000),
+      maxUploadStoragePerAccount: Number(process.env.MAX_UPLOAD_STORAGE_PER_ACCOUNT ?? 100_000_000),
       maxSizeRequest: Number(process.env.MAX_SIZE_REQUEST ?? 10_000_000),
       maxCallsInRequest: Number(process.env.MAX_CALLS_IN_REQUEST ?? 64),
     },

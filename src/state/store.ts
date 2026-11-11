@@ -504,6 +504,13 @@ export class Store {
       .run(p.id, p.accountId, p.ctype, p.body.length, p.body, Date.now());
   }
 
+  /** Bytes of uploads the account has stored now. */
+  uploadBytes(accountId: number): number {
+    return (
+      this.prep(`SELECT COALESCE(SUM(size), 0) AS n FROM upload WHERE account_id = ?`).get(accountId) as { n: number }
+    ).n;
+  }
+
   getUpload(id: string, accountId: number): { ctype: string; body: Buffer } | null {
     const row = this.prep(`SELECT ctype, body FROM upload WHERE id = ? AND account_id = ?`)
       .get(id, accountId) as { ctype: string; body: Buffer } | undefined;

@@ -723,16 +723,38 @@ the client's address and not the reverse proxy's.
 | `DEFAULT_PROVIDER`         | `generic`                          | provider key when `/api/login` omits one             |
 | `PROVIDERS_FILE`           | `/etc/legacy-proxy/providers.json` | provider catalogue                                   |
 | `LOG_LEVEL`                | `info`                             | pino level                                           |
-| `MAX_CONCURRENT_REQUESTS`  | `10`                               | advertised on `coreCapabilityProps`                  |
-| `MAX_OBJECTS_IN_GET`       | `500`                              | advertised on `coreCapabilityProps`                  |
-| `MAX_OBJECTS_IN_SET`       | `500`                              | advertised on `coreCapabilityProps`                  |
+| `MAX_CONCURRENT_REQUESTS`  | `10`                               | per account, advertised and enforced (see below)     |
+| `MAX_OBJECTS_IN_GET`       | `500`                              | advertised and enforced (see below)                  |
+| `MAX_OBJECTS_IN_SET`       | `500`                              | advertised and enforced (see below)                  |
 | `MAX_SIZE_UPLOAD`          | `50_000_000` (50 MB)               | upload endpoint body limit, advertised in caps       |
+| `MAX_UPLOAD_STORAGE_PER_ACCOUNT` | `100_000_000` (100 MB)       | pending uploads one account may have stored          |
 | `MAX_SIZE_REQUEST`         | `10_000_000` (10 MB)               | JMAP POST body limit, advertised in caps             |
 | `MAX_CALLS_IN_REQUEST`     | `64`                               | per-envelope method-call cap                         |
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
 | `TRUST_PROXY`              | unset                              | client address from `X-Forwarded-For`; see below     |
+
+The limits the Session resource advertises are the ones the proxy enforces:
+
+- A `/get` with more `ids` than `MAX_OBJECTS_IN_GET` (counted after result
+  references are resolved; `SearchSnippet/get` counts `emailIds`, `Email/parse`
+  counts `blobIds`) and a `/set` whose `create`, `update` and `destroy` together
+  exceed `MAX_OBJECTS_IN_SET` (`Email/copy` counts `create`, `Email/import`
+  counts `emails`) are answered `requestTooLarge` before the method runs.
+  `ids: null` is left to the method.
+- A `POST /jmap` while the account already has `MAX_CONCURRENT_REQUESTS`
+  requests running is answered `400` with the `urn:ietf:params:jmap:error:limit`
+  problem and `"limit": "maxConcurrentRequests"`, before any method runs, so the
+  client can retry it.
+- Uploads: one account may have at most `MAX_UPLOAD_STORAGE_PER_ACCOUNT` bytes
+  of pending uploads stored (they expire after 24 hours). An upload past that is
+  answered `413` with the `urn:ietf:params:jmap:error:limit` problem and
+  `"limit": "maxUploadStoragePerAccount"`.
+- Event streams: at most 10 open per account. The eleventh closes the oldest.
+
+The Gmail backend advertises and enforces its own object limits (100 per get,
+20 per set).
 
 `TRUST_PROXY` decides which reverse proxies may name the client's address in
 `X-Forwarded-For`, which the [login limits](#login-limits) count by. Unset (or

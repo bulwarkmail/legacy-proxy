@@ -25,6 +25,10 @@ import { GmailApi } from "./api.js";
 import { GmailMail } from "./mail.js";
 import { GmailPush } from "./push.js";
 
+// The object limits the Gmail session advertises, and the dispatcher enforces.
+const GMAIL_MAX_OBJECTS_IN_GET = 100;
+const GMAIL_MAX_OBJECTS_IN_SET = 20;
+
 /** Bridge passwords (`gmap_`), sign-in tokens (`gmat_`) and refresh tokens (`gmrt_`). */
 export function isBridgeSecret(secret: string | undefined): boolean {
   return typeof secret === "string" && /^gm(?:ap|at|rt)_/.test(secret);
@@ -230,8 +234,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         capabilities: {
           [CORE_CAPABILITY]: {
             ...coreCapabilityProps(cfg),
-            maxObjectsInGet: 100,
-            maxObjectsInSet: 20,
+            maxObjectsInGet: GMAIL_MAX_OBJECTS_IN_GET,
+            maxObjectsInSet: GMAIL_MAX_OBJECTS_IN_SET,
             maxSizeUpload: 25_000_000,
           },
           [MAIL_CAPABILITY]: {},
@@ -353,6 +357,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         await dispatch(env, {
           methods: mail.methods(),
           maxCallsInRequest: cfg.limits.maxCallsInRequest,
+          maxObjectsInGet: GMAIL_MAX_OBJECTS_IN_GET,
+          maxObjectsInSet: GMAIL_MAX_OBJECTS_IN_SET,
           sessionState,
         }),
       );
