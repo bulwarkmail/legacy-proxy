@@ -66,6 +66,10 @@ function resolveArgsInner(
       const real = createdIds.get(k.slice(1));
       if (real !== undefined) outKey = real;
     }
+    // Assigning `__proto__` on a plain object replaces its prototype instead
+    // of adding a property, and no JMAP object has such a property: skip it,
+    // whether it arrives as a key, a result reference or a creation id.
+    if (outKey === "__proto__" || (topLevel && k === "#__proto__")) continue;
     if (topLevel && k.startsWith("#")) {
       const ref = v as ResultRef;
       const r = prior[ref.resultOf];

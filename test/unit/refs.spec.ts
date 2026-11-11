@@ -49,6 +49,30 @@ describe("JMAP back-references", () => {
       create: { sub1: { emailId: "real-id-42" } },
     });
   });
+  it("never lets a __proto__ key set the prototype of a resolved object", () => {
+    const isPlain = (o: unknown) => Object.getPrototypeOf(o) === Object.prototype;
+    // A key parsed from JSON, at the top and nested.
+    const parsed = JSON.parse('{"accountId":"1","__proto__":{"polluted":true},"update":{"__proto__":{"polluted":true}}}');
+    const a = resolveArgs(parsed, {}) as Record<string, Record<string, unknown>>;
+    expect(isPlain(a) && isPlain(a.update)).toBe(true);
+    expect("polluted" in a || "polluted" in a.update!).toBe(false);
+
+    // A creation id the client named "__proto__" in the request's createdIds.
+    const b = resolveArgs({ update: { "#x": { polluted: true } } }, {}, new Map([["x", "__proto__"]])) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(isPlain(b.update)).toBe(true);
+    expect("polluted" in b.update!).toBe(false);
+
+    // A top-level result reference named #__proto__.
+    const c = resolveArgs(
+      { "#__proto__": { resultOf: "c1", name: "Email/query", path: "/ids" } },
+      { c1: { name: "Email/query", result: { ids: { polluted: true } } } },
+    ) as Record<string, unknown>;
+    expect(isPlain(c)).toBe(true);
+    expect("polluted" in c).toBe(false);
+  });
 });
 
 describe("harvestCreatedIds", () => {
