@@ -9,14 +9,14 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { startFakeImap, type FakeImap } from "./fake-imap.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;
 let dir: string;
 beforeAll(async () => {
   imap = await startFakeImap({ "pat@test.local": "right-password" });
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), "lproxy-gmail-login-"));
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-proxy-gmail-login-"));
   fs.writeFileSync(
     path.join(dir, "providers.json"),
     JSON.stringify({

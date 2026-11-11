@@ -6,8 +6,8 @@
 //   for that pair (or from that address) are answered before anything is sent
 //   to the mail server, the right password included, until the oldest failure
 //   leaves the window. A successful login clears its pair's count.
-// - Attempts that are still running count against the budget too, so a burst
-//   of parallel requests cannot get past it.
+// - Attempts that are still running count against the budget too, so parallel
+//   requests are counted when they start, not when they end.
 // - At most `maxInFlight` such logins run at once; more wait briefly for a
 //   slot and are then refused.
 //

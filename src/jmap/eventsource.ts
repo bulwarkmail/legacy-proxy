@@ -54,8 +54,8 @@ export class EventSourceHub {
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.setHeader("X-Accel-Buffering", "no");
     // Readable from any origin that authenticates with a header, like every
-    // other route. Never with Allow-Credentials: a browser would then attach
-    // credentials it holds for this origin to another site's request.
+    // other route. Never with Allow-Credentials: clients read the stream with
+    // an Authorization header, not with cookies or credentials the browser holds.
     if (origin) {
       reply.raw.setHeader("Access-Control-Allow-Origin", origin);
       reply.raw.setHeader("Vary", "Origin");

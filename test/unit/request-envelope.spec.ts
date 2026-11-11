@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { dispatch, isRequestEnvelope } from "../../src/jmap/router.js";
-import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 
 const CORE = "urn:ietf:params:jmap:core";
 const MALFORMED: unknown[] = [

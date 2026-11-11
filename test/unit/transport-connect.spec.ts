@@ -112,7 +112,7 @@ describe("ManageSieve", () => {
   let port = 0;
   const received: string[] = [];
   beforeAll(async () => {
-    // Greets without STARTTLS and refuses it, like a server whose capability was stripped.
+    // Greets without STARTTLS and refuses it.
     server = net.createServer((sock) => {
       sock.on("error", () => {});
       sock.write('"IMPLEMENTATION" "fake"\r\n"SASL" "PLAIN"\r\nOK ready\r\n');

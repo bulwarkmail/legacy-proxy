@@ -1,17 +1,9 @@
-// LPROXY-06: the push IDLE worker retries a refused login forever (every 60 s after the backoff),
-// from the proxy's address, for as long as the account has a verified push subscription.
-// Belongs in test/unit/.
+// The push IDLE worker and a mail server that refuses the stored password: after the server says
+// the credentials are wrong, the worker makes at most 3 attempts in all, however long it waits,
+// and comes back after the next successful login. A server that can't be reached, or asks to try
+// again later, is still retried with backoff.
 //
-// Repaired version of sec-lproxy-06-idle-auth-loop.spec.ts. What changed and why:
-//   - the original replaced src/imap/client.js with two exports. A fix that imports anything else
-//     from that module in idle.ts got `undefined`. Now the real module is kept and only openImap is
-//     replaced.
-//   - the bound is the brief's: after a refusal that says "wrong credentials" the worker makes at
-//     most 3 attempts in all, however long it waits.
-//   - a control: a server that can't be reached is still retried, so the fix can't be "give up on
-//     any error".
-//
-// On fe595e1: 365 login attempts in six hours for one account.
+// The real IMAP client module is kept; only openImap is replaced.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -67,7 +59,7 @@ let store: Store;
 const dirs: string[] = [];
 
 beforeEach(async () => {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), "lproxy-idle-"));
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-proxy-idle-"));
   dirs.push(dir);
   store = new Store(dir);
   const username = "u@test.local";
@@ -116,7 +108,7 @@ async function attemptsOver(hours: number): Promise<number> {
   return attempts;
 }
 
-describe("the IDLE worker and a mail server that refuses the stored password (LPROXY-06)", () => {
+describe("the IDLE worker and a mail server that refuses the stored password", () => {
   it("stops logging in once the server says the credentials are wrong", async () => {
     vi.mocked(openImap).mockImplementation(async () => refused());
     expect(await attemptsOver(6)).toBeLessThanOrEqual(3);

@@ -1,14 +1,11 @@
-// LPROXY-04: a session token (and a cached Basic header) names an account, not
-// a credential. After the mailbox password changed and the owner signed in
-// with the new one, everything issued for the old password still works, and
-// there is no way to end a session. Belongs in test/unit/.
-//
-// Fails on fe595e1: the old token and the old Basic header still get 200.
+// A session token and a cached Basic login belong to the password they were
+// made with: once the owner signs in with a new password, the ones made with
+// the old password are refused. /api/logout ends the caller's own token.
 
 import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;
@@ -34,7 +31,7 @@ const login = (username: string, password: string) =>
 const session = (authorization: string) =>
   app.inject({ method: "GET", url: "/jmap/session", headers: { authorization } });
 
-describe("sessions end when the password they were made with is replaced (LPROXY-04)", () => {
+describe("sessions end when the password they were made with is replaced", () => {
   it("refuses a token issued for the old password once the owner signed in with the new one", async () => {
     const oldToken = (await login("alice@test.local", "old-password")).json().token as string;
     expect((await session(`Bearer ${oldToken}`)).statusCode).toBe(200);

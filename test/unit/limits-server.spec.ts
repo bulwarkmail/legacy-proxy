@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;

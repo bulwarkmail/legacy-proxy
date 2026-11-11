@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;
@@ -37,11 +37,11 @@ const login = (client: string, password: string) =>
 
 describe("TRUST_PROXY", () => {
   it("counts each forwarded client on its own", async () => {
-    for (let i = 0; i < 10; i++) expect((await login("203.0.113.1", `guess-${i}`)).statusCode).toBe(401);
-    expect((await login("203.0.113.1", "guess")).statusCode).toBe(429);
+    for (let i = 0; i < 10; i++) expect((await login("203.0.113.1", `wrong-${i}`)).statusCode).toBe(401);
+    expect((await login("203.0.113.1", "wrong")).statusCode).toBe(429);
 
     const before = imap.failedLogins;
-    expect((await login("203.0.113.2", "guess")).statusCode).toBe(401);
+    expect((await login("203.0.113.2", "wrong")).statusCode).toBe(401);
     expect(imap.failedLogins - before).toBe(1);
   });
 });

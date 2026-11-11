@@ -1,6 +1,6 @@
-// Test helper for the LPROXY security specs: a tiny plain-TCP IMAP server that
-// records what it receives, and a loader that boots src/server.ts against it.
-// Belongs in test/unit/ (it is not a spec, vitest does not pick it up).
+// Test helper: a tiny plain-TCP IMAP server on loopback that knows users and
+// passwords and records what it receives, and a loader that boots
+// src/server.ts against it. Not a spec; vitest does not pick it up.
 
 import net from "node:net";
 import fs from "node:fs";
@@ -38,7 +38,7 @@ export async function startFakeImap(users: Record<string, string>): Promise<Fake
         send(`${tag} NO [AUTHENTICATIONFAILED] no`);
       }
     };
-    // No STARTTLS and no LOGINDISABLED: what a client sees when the capability was stripped on the way.
+    // No STARTTLS and no LOGINDISABLED: a server that offers no upgrade.
     send("* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN UIDPLUS IDLE] ready");
     sock.on("data", (chunk) => {
       buf += chunk.toString("latin1");
@@ -137,7 +137,7 @@ export async function startFakeImap(users: Record<string, string>): Promise<Fake
  * Call once per spec file: the module starts listening when it is imported.
  */
 export async function bootProxy(imap: FakeImap): Promise<{ app: import("fastify").FastifyInstance; dir: string }> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lproxy-sec-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-proxy-test-"));
   const providers = {
     generic: {
       imap: { host: "127.0.0.1", port: imap.port, secure: false },

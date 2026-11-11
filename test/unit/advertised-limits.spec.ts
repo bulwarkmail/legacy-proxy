@@ -1,15 +1,6 @@
-// LPROXY-09: the IMAP backend advertises maxObjectsInGet / maxObjectsInSet and enforces neither.
-// Belongs in test/unit/ (next to dispatch.spec.ts).
-//
-// Repaired version of the two "refuses" cases in sec-lproxy-09-10-limits-vacation.spec.ts.
-// What changed and why: the original called emailGet and emailSet directly with a context that has
-// no config. The limits live in the config and the check belongs in the dispatcher, where every
-// method passes; a check there left the original red, and only a number hard-coded in two handlers
-// turned it green. This version goes through the dispatcher with the limits in its context, next to
-// maxCallsInRequest, and asks for every /get and /set method, not just Email.
-//
-// The context fields are named like the capability properties: maxObjectsInGet, maxObjectsInSet.
-// (The vacation case of the original file is unchanged and stays where it is.)
+// The dispatcher enforces the maxObjectsInGet and maxObjectsInSet the session advertises, for
+// every /get and /set method, before the handler runs. The limits are in the dispatch context next
+// to maxCallsInRequest, named like the capability properties.
 
 import { describe, expect, it } from "vitest";
 import { dispatch, type MethodCall } from "../../src/jmap/router.js";
@@ -57,7 +48,7 @@ const errorType = (response: unknown) => {
   return name === "error" ? body.type : `no error (${name})`;
 };
 
-describe("LPROXY-09: advertised limits are enforced", () => {
+describe("advertised limits are enforced", () => {
   it("advertises the limits it enforces", () => {
     const props = coreCapabilityProps({ limits } as AppConfig);
     expect(props.maxObjectsInGet).toBe(500);

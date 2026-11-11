@@ -153,7 +153,7 @@ describe("loading a providers file with a plain entry", () => {
   });
 
   it("stops the start with a message that names the provider, the service and the ways out", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lproxy-providers-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-proxy-providers-"));
     const file = path.join(dir, "providers.json");
     fs.writeFileSync(
       file,

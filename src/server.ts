@@ -254,9 +254,9 @@ app.get("/.well-known/jmap", async (_req, reply) => {
   reply.redirect(`${cfg.publicUrl}/jmap/session`);
 });
 
-// A request with an Origin header comes from a web page: offering Basic there
-// makes the browser put up its own password prompt and then send what the
-// user typed to this origin by itself. Web clients authenticate with a header.
+// A request with an Origin header comes from a web page, and web clients
+// authenticate with a header: it is offered Bearer only, so the browser never
+// shows its own password prompt for the proxy.
 function send401(req: { headers: Record<string, string | string[] | undefined> }, reply: import("fastify").FastifyReply) {
   reply.header("WWW-Authenticate", req.headers["origin"] ? 'Bearer realm="legacy-proxy"' : 'Basic realm="legacy-proxy", Bearer');
   return reply.code(401).send({ error: "unauthorized" });

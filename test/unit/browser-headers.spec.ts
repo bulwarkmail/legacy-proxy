@@ -1,20 +1,13 @@
-// LPROXY-15: three response headers that matter when the caller is a web page in somebody's browser.
-// Belongs in test/unit/ (it needs sec-fake-imap.ts, the helper the other sec-lproxy specs use).
-//
-// The proxy authenticates by header, not by cookie. Two things can still make a browser attach
-// credentials by itself: its own password prompt (asked for by `WWW-Authenticate: Basic`), after
-// which it sends Basic credentials to the proxy's origin on every request, and a response that says
-// credentialed cross-origin reads are welcome. And a download served with the type the URL asks for
-// must not be sniffed into something else.
-//
-// The brief's decisions: the event stream never sends Access-Control-Allow-Credentials; a 401 to a
-// request that carries an Origin header offers Bearer only; downloads carry nosniff.
+// Three response headers for callers that are web pages. Web clients authenticate with a header,
+// not with cookies or the browser's own password prompt: the event stream never sends
+// Access-Control-Allow-Credentials, a 401 to a request that carries an Origin header offers Bearer
+// only, and every download carries nosniff next to its attachment disposition.
 
 import fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;
@@ -40,7 +33,7 @@ afterAll(async () => {
   }
 });
 
-describe("what the proxy tells a browser (LPROXY-15)", () => {
+describe("what the proxy tells a browser", () => {
   it("does not ask a web page's browser for a Basic password", async () => {
     for (const url of ["/jmap/session", "/jmap", `/jmap/download/1/Uxyz/text%2Fplain/x.txt`, "/jmap/eventsource?types=*&closeafter=state&ping=0"]) {
       const res = await app.inject({ method: url === "/jmap" ? "POST" : "GET", url, headers: { origin: "https://other.example" }, payload: url === "/jmap" ? {} : undefined });
@@ -61,7 +54,7 @@ describe("what the proxy tells a browser (LPROXY-15)", () => {
       method: "POST",
       url: `/jmap/upload/${accountId}`,
       headers: { authorization: `Bearer ${token}`, "content-type": "application/octet-stream" },
-      payload: Buffer.from("<script>document.title = 'ran'</script>"),
+      payload: Buffer.from("<p>hello</p>"),
     });
     expect(upload.statusCode).toBeLessThan(300);
     const { blobId } = upload.json() as { blobId: string };
@@ -77,7 +70,7 @@ describe("what the proxy tells a browser (LPROXY-15)", () => {
     }
   });
 
-  it("does not invite credentialed reads of the event stream from another origin", async () => {
+  it("serves the event stream to another origin without Allow-Credentials", async () => {
     if (!app.server.listening) await app.listen({ port: 0, host: "127.0.0.1" });
     const { port } = app.server.address() as AddressInfo;
     const abort = new AbortController();

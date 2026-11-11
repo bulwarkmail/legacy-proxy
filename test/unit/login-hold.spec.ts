@@ -1,12 +1,11 @@
-// LPROXY-03: every unauthenticated request with credentials becomes an IMAP
-// login from the proxy's address, without limit. Belongs in test/unit/.
-//
-// Fails on fe595e1: 30 wrong passwords give 30 IMAP logins and no 429.
+// Logins for callers without a session are held after ten wrong passwords for
+// one user from one address: further logins are answered 429 and not sent to
+// the mail server. The /api/login body must have the expected types.
 
 import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { bootProxy, startFakeImap, type FakeImap } from "./sec-fake-imap.js";
+import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;
@@ -28,15 +27,15 @@ afterAll(async () => {
 
 const basic = (user: string, pass: string) => "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
 
-describe("failed logins are limited before they reach the mail server (LPROXY-03)", () => {
-  it("stops forwarding wrong passwords for one user on /api/login", async () => {
+describe("failed logins are limited before they reach the mail server", () => {
+  it("holds logins for one user on /api/login after ten wrong passwords", async () => {
     const before = imap.failedLogins;
     const statuses: number[] = [];
     for (let i = 0; i < 30; i++) {
       const res = await app.inject({
         method: "POST",
         url: "/api/login",
-        payload: { username: "carol@test.local", password: `guess-${i}` },
+        payload: { username: "carol@test.local", password: `wrong-${i}` },
       });
       statuses.push(res.statusCode);
     }
@@ -44,14 +43,14 @@ describe("failed logins are limited before they reach the mail server (LPROXY-03
     expect(statuses).toContain(429);
   });
 
-  it("stops forwarding wrong passwords for one user over Basic", async () => {
+  it("holds logins for one user over Basic after ten wrong passwords", async () => {
     const before = imap.failedLogins;
     const statuses: number[] = [];
     for (let i = 0; i < 30; i++) {
       const res = await app.inject({
         method: "GET",
         url: "/jmap/session",
-        headers: { authorization: basic("dave@test.local", `guess-${i}`) },
+        headers: { authorization: basic("dave@test.local", `wrong-${i}`) },
       });
       statuses.push(res.statusCode);
     }
@@ -59,7 +58,7 @@ describe("failed logins are limited before they reach the mail server (LPROXY-03
     expect(statuses).toContain(429);
   });
 
-  it("does not tell an unauthenticated caller why the server failed", async () => {
+  it("answers an unknown provider with 400 and no internal error text", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/login",
@@ -71,12 +70,12 @@ describe("failed logins are limited before they reach the mail server (LPROXY-03
 });
 
 // Each case below comes from an address of its own, so the counts of one case
-// do not leak into the next.
+// do not carry over into the next.
 const loginFrom = (remoteAddress: string, payload: unknown) =>
   app.inject({ method: "POST", url: "/api/login", payload: payload as Record<string, unknown>, remoteAddress });
 const failTenTimes = async (remoteAddress: string, username: string) => {
   for (let i = 0; i < 10; i++) {
-    expect((await loginFrom(remoteAddress, { username, password: `guess-${i}` })).statusCode).toBe(401);
+    expect((await loginFrom(remoteAddress, { username, password: `wrong-${i}` })).statusCode).toBe(401);
   }
 };
 
@@ -116,7 +115,7 @@ describe("what the login limits hold and what they leave alone", () => {
   });
 
   it("clears a pair's count on a successful login", async () => {
-    for (let i = 0; i < 9; i++) await loginFrom("10.1.0.5", { username: "dave@test.local", password: `guess-${i}` });
+    for (let i = 0; i < 9; i++) await loginFrom("10.1.0.5", { username: "dave@test.local", password: `wrong-${i}` });
     expect((await loginFrom("10.1.0.5", { username: "dave@test.local", password: "right-password" })).statusCode).toBe(200);
     for (let i = 0; i < 9; i++) {
       expect((await loginFrom("10.1.0.5", { username: "dave@test.local", password: `again-${i}` })).statusCode).toBe(401);
@@ -145,7 +144,7 @@ describe("what the login limits hold and what they leave alone", () => {
       { username: 42, password: "x" },
       { username: ["carol@test.local"], password: "x" },
       { username: "u".repeat(10_000), password: "x" },
-      { username: "carol@test.local", password: { $ne: "" } },
+      { username: "carol@test.local", password: { value: "x" } },
       { username: "carol@test.local", password: "x", provider: "toString" },
       { username: "carol@test.local", password: "x", provider: "nope" },
       ["carol@test.local", "x"],

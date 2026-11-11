@@ -36,10 +36,10 @@ async function connectedStore() {
 
 const basic = (user: string, pass: string) => "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
 
-// Helpers of the delivered case below, as they were written for it.
+// A store of its own with one connected account, for the first case below.
 const profile = (emailAddress: string) => ({ emailAddress, historyId: "5", messagesTotal: 1, threadsTotal: 1 });
 function open(key = crypto.randomBytes(32)) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-sec-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-bridge-"));
   const store = new GmailStore(dir, key);
   cleanup.push(() => {
     store.close();
@@ -55,7 +55,7 @@ async function connect(store: GmailStore, email: string) {
   );
 }
 
-describe("GB-L2: a bridge secret never reaches the IMAP login", () => {
+describe("a bridge secret never reaches the IMAP login", () => {
   it("answers 401 to Basic user:gmat_... instead of handing it to the legacy backend", async () => {
     const { store } = open();
     await connect(store, EMAIL);
@@ -159,7 +159,7 @@ describe("bridge secrets on the JMAP routes", () => {
           accountId: "a1",
           writable: async () => false,
           canCompose: async () => false,
-          download: async () => ({ body: Buffer.from("<script></script>"), type: "application/octet-stream" }),
+          download: async () => ({ body: Buffer.from("<p>hello</p>"), type: "application/octet-stream" }),
         }) as never,
     );
     app.get("/jmap/download/:accountId/:blobId/:type/:name", async () => ({ legacy: true }));

@@ -21,7 +21,7 @@ afterEach(() => {
   }
 });
 const tempDir = () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lproxy-cred-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-proxy-cred-"));
   dirs.push(d);
   return d;
 };
