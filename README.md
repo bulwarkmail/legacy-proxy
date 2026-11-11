@@ -460,7 +460,10 @@ Reissuing it immediately revokes the previous bridge password. Basic auth with
 that username/password or Bearer auth with the bridge password is supported;
 Google tokens stay on the server. Only passwords starting with `gmap_` select the
 Gmail API backend; any other password for the same address, such as an IMAP App
-Password, is handled by the regular IMAP backend. Removing the email from the
+Password, is handled by the regular IMAP backend. A credential that starts with
+`gmap_`, `gmat_` or `gmrt_` and is not a valid bridge login (a sign-in token sent
+as a Basic password, a refresh token sent as a Bearer token, a revoked one) is
+answered `401` and is never offered to an IMAP server, on `/api/login` neither. Removing the email from the
 allowlist and restarting also blocks access, including to cached data.
 
 Expose `/jmap`, `/jmap/*` and `/.well-known/jmap` alongside the OAuth routes at

@@ -30,7 +30,7 @@ import { PushIdleManager } from "./push/idle.js";
 import { loadGmailConfig } from "./gmail/config.js";
 import { GmailStore } from "./gmail/store.js";
 import { GmailConnection } from "./gmail/connection.js";
-import { registerGmailBackend } from "./gmail/backend.js";
+import { isBridgeSecret, registerGmailBackend } from "./gmail/backend.js";
 import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfig();
@@ -138,9 +138,18 @@ function parseLoginBody(body: unknown): LoginBody | null {
   return b as unknown as LoginBody;
 }
 
+/**
+ * With the Gmail backend configured, a bridge secret is never a mail password:
+ * it is answered 401 and is not offered to an IMAP server.
+ */
+function bridgeSecretOffered(...secrets: (string | undefined)[]): boolean {
+  return !!gmailConfig && secrets.some((s) => isBridgeSecret(s));
+}
+
 app.post("/api/login", async (req, reply) => {
   const body = parseLoginBody(req.body);
   if (!body) return reply.code(400).send({ error: "invalid login request" });
+  if (bridgeSecretOffered(body.password, body.accessToken)) return reply.code(401).send({ error: "auth failed" });
 
   let providerName: string;
   let provider;
@@ -610,6 +619,7 @@ async function basicLogin(h: string, cacheKey: string, ip: string): Promise<Auth
   const username = decoded.slice(0, colon);
   const password = decoded.slice(colon + 1);
   if (username.length > MAX_USERNAME_LENGTH || password.length > MAX_SECRET_LENGTH) return UNAUTHORIZED;
+  if (bridgeSecretOffered(password)) return UNAUTHORIZED;
 
   let providerName: string;
   let provider;

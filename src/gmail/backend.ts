@@ -25,6 +25,20 @@ import { GmailApi } from "./api.js";
 import { GmailMail } from "./mail.js";
 import { GmailPush } from "./push.js";
 
+/** Bridge passwords (`gmap_`), sign-in tokens (`gmat_`) and refresh tokens (`gmrt_`). */
+export function isBridgeSecret(secret: string | undefined): boolean {
+  return typeof secret === "string" && /^gm(?:ap|at|rt)_/.test(secret);
+}
+
+/**
+ * The path pattern of the route the router matched. When no route matched,
+ * the raw path: such a request can only be answered here or with a 404, so no
+ * other backend serves it.
+ */
+function routedPath(req: { routeOptions?: { url?: string }; url: string }): string {
+  return req.routeOptions?.url ?? req.url.split("?")[0]!;
+}
+
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(
   app: FastifyInstance<
@@ -120,7 +134,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     { email: string; mail: GmailMail; uploadType?: string }
   >();
   app.addHook("onRequest", async (req, reply) => {
-    const path = req.url.split("?")[0]!;
+    // The route the router matched, not the raw request line: the router
+    // decodes the path, so `/%6Amap` is served as `/jmap` and must be seen so.
+    const path = routedPath(req);
     if (path !== "/jmap" && !path.startsWith("/jmap/")) return;
     const auth = req.headers.authorization ?? "";
     let username: string | undefined,
@@ -133,10 +149,12 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         password = decoded.slice(colon + 1);
       }
     } else if (/^Bearer /i.test(auth)) password = auth.slice(7).trim();
-    // Only bridge passwords and bridge sign-in tokens select Gmail. Anything else, such as an IMAP app
-    // password for the same address, stays with the legacy backend.
+    // Only bridge secrets select Gmail. Anything else, such as an IMAP app password for the same
+    // address, stays with the legacy backend. A bridge secret that is not a valid bridge login (a
+    // sign-in token sent as a Basic password, a refresh token sent as a Bearer token, a wrong or
+    // revoked one) is answered here and never reaches the legacy backend's IMAP login.
+    if (!isBridgeSecret(password)) return;
     const signedIn = password.startsWith("gmat_") && !username;
-    if (!password.startsWith("gmap_") && !signedIn) return;
     // Failed bridge logins count against the same per-address budget as mail logins.
     const gate = logins ? await logins.begin(req.ip, username ?? "") : null;
     if (gate && !gate.ok) {
@@ -147,7 +165,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     }
     let email: string | null = null;
     try {
-      email = signedIn ? store.authenticateToken(password) : store.authenticate(password, username);
+      if (signedIn) email = store.authenticateToken(password);
+      else if (password.startsWith("gmap_")) email = store.authenticate(password, username);
     } finally {
       gate?.finish(email ? "accepted" : "refused");
     }
@@ -179,7 +198,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     const selected = authenticated.get(req);
     if (!selected) return;
     const { email, mail } = selected;
-    const path = req.url.split("?")[0]!;
+    const path = routedPath(req);
     const writable = await mail.writable();
     const canCompose = await mail.canCompose();
     const submissionProps = google.schedule
