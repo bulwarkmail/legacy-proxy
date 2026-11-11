@@ -723,14 +723,24 @@ export function pickHref(xml: string, parentLocalName: string): string | null {
   return extractHref(m[1]);
 }
 
+const NAMED_ENTITIES: Record<string, string> = { lt: "<", gt: ">", quot: '"', apos: "'", amp: "&" };
+
+/**
+ * Element text as XML defines it, in one pass: a CDATA section is taken as it
+ * is, and each entity or character reference outside one is decoded once. A
+ * character reference that names no XML character (beyond U+10FFFF, a
+ * surrogate, U+0000) stays as written.
+ */
 function decodeXmlText(s: string): string {
-  return s
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_m, p1: string) => p1)
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_m, h: string) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_m, d: string) => String.fromCodePoint(parseInt(d, 10)))
-    .replace(/&amp;/g, "&");
+  return s.replace(
+    /<!\[CDATA\[([\s\S]*?)\]\]>|&(lt|gt|quot|apos|amp|#x[0-9a-fA-F]+|#[0-9]+);/g,
+    (m, cdata: string | undefined, ref: string) => {
+      if (cdata !== undefined) return cdata;
+      const named = NAMED_ENTITIES[ref];
+      if (named !== undefined) return named;
+      const cp = ref[1] === "x" ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
+      const valid = cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff);
+      return valid ? String.fromCodePoint(cp) : m;
+    },
+  );
 }
