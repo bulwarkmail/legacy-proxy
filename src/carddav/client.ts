@@ -12,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import { JmapError } from "../jmap/errors.js";
 import { log } from "../util/log.js";
 
 export interface CardDavOpts {
@@ -112,6 +113,56 @@ const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
 // configured origin (see absolutise).
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 4;
+
+/**
+ * Bounds on one exchange with the address book server: the deadline covers
+ * the request, its redirects and reading the answer; the size is that of the
+ * answer's body. Hitting either answers the JMAP call with serverUnavailable.
+ * Tests lower them.
+ */
+export const cardDavLimits = { timeoutMs: 30_000, maxResponseBytes: 20 * 1024 * 1024 };
+
+const isAbort = (e: unknown) =>
+  (e as { name?: unknown } | null)?.name === "TimeoutError" || (e as { name?: unknown } | null)?.name === "AbortError";
+const tooSlow = () => new JmapError("serverUnavailable", "the contacts server did not answer in time");
+const tooLarge = () => new JmapError("serverUnavailable", "the contacts server's answer is too large");
+
+async function fetchInTime(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    throw isAbort(e) ? tooSlow() : e;
+  }
+}
+
+/** The answer's body as text, refused once it passes cardDavLimits.maxResponseBytes. */
+async function readText(res: Response): Promise<string> {
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (declared > cardDavLimits.maxResponseBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooLarge();
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cardDavLimits.maxResponseBytes) {
+        await reader.cancel().catch(() => {});
+        throw tooLarge();
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    if (e instanceof JmapError) throw e;
+    throw isAbort(e) ? tooSlow() : e;
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
 
 /**
  * Drop every memoised discovery result and book list. Production code never
@@ -395,7 +446,7 @@ export class CardDavClient {
     if (!res.ok) throw await httpError("MKCOL", href, res);
     // 207 from an extended MKCOL means some property failed to set.
     if (res.status === 207) {
-      const text = await res.text();
+      const text = await readText(res);
       if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
         throw new Error("CardDAV MKCOL: the server refused a property");
       }
@@ -423,7 +474,7 @@ export class CardDavClient {
       `</D:propertyupdate>`;
     const res = await this.raw("PROPPATCH", href, body, { "Content-Type": "application/xml; charset=utf-8" });
     if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
-    const text = await res.text();
+    const text = await readText(res);
     if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
       throw new Error("CardDAV PROPPATCH: the server refused a property");
     }
@@ -446,12 +497,16 @@ export class CardDavClient {
     // Redirects are followed here rather than by fetch, so every hop goes
     // through absolutise: the request and its Authorization header stay on
     // the configured origin, which also rules out a switch from https to http.
+    // The signal stays on the returned response, so the deadline also covers
+    // the caller reading its body.
+    const signal = AbortSignal.timeout(cardDavLimits.timeoutMs);
     for (let hop = 0; ; hop++) {
-      const res = await fetch(url, {
+      const res = await fetchInTime(url, {
         method,
         headers: { Authorization: this.authHeader, ...headers },
         ...(body === null ? {} : { body }),
         redirect: "manual",
+        signal,
       });
       log.debug({ method, url, status: res.status }, "carddav request");
       const location = REDIRECT_STATUSES.has(res.status) ? res.headers.get("location") : null;
@@ -480,14 +535,18 @@ export class CardDavClient {
 
   private async followToCollection(path: string): Promise<string> {
     let url = absolutise(this.origin, path);
+    const signal = AbortSignal.timeout(cardDavLimits.timeoutMs);
     for (let i = 0; i < 4; i++) {
-      const res = await fetch(url, {
+      const res = await fetchInTime(url, {
         method: "PROPFIND",
         headers: { Authorization: this.authHeader, Depth: "0", "Content-Type": "application/xml" },
         body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
         redirect: "manual",
+        signal,
       });
       log.debug({ url, status: res.status }, "carddav discovery probe");
+      // Only the status and Location are used.
+      await res.body?.cancel().catch(() => {});
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
@@ -531,7 +590,7 @@ export class CardDavClient {
       ...extra,
     });
     if (!res.ok && res.status !== 207) throw await httpError(method, path, res);
-    return await res.text();
+    return await readText(res);
   }
 }
 
