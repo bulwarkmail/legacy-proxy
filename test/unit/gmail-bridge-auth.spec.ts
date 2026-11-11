@@ -174,6 +174,31 @@ describe("bridge secrets on the JMAP routes", () => {
     expect(String(res.headers["content-disposition"])).toMatch(/^attachment/);
   });
 
+  it("answers a body that is not a JMAP Request object with notRequest", async () => {
+    const store = await connectedStore();
+    const { accessToken } = store.issueTokens(EMAIL, "webmail");
+    const app = Fastify();
+    registerGmailBackend(
+      app,
+      { publicUrl: "https://bridge.test", limits: { maxCallsInRequest: 16 } } as never,
+      { allowedEmails: new AllowList([EMAIL]) } as unknown as GmailConfig,
+      store,
+      {} as never,
+      {},
+      () => ({ accountId: "a1", writable: async () => false, canCompose: async () => false }) as never,
+    );
+    app.post("/jmap", async () => ({ legacy: true }));
+    const res = await app.inject({
+      method: "POST",
+      url: "/jmap",
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { using: ["urn:ietf:params:jmap:core"], methodCalls: [[1, null, "x"]] },
+    });
+    await app.close();
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ type: "urn:ietf:params:jmap:error:notRequest" });
+  });
+
   it("leaves a password that only looks like one in upper case to the legacy backend", async () => {
     const { app, legacy } = await bridgeInFront();
     const res = await app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: basic(EMAIL, "GMAP_not-a-bridge-secret") } });

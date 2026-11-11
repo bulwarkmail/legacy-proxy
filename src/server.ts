@@ -19,7 +19,7 @@ import {
 } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
-import { dispatch, type RequestEnvelope } from "./jmap/router.js";
+import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
@@ -280,12 +280,10 @@ const jmapRequestsInFlight = new Map<number, number>();
 app.post("/jmap", async (req, reply) => {
   const account = await requireAccount(req, reply);
   if (!account) return reply;
-  const env = req.body as RequestEnvelope;
-  if (!env || !Array.isArray(env.methodCalls) || !Array.isArray(env.using)) {
-    return reply.code(400).send({ error: "malformed JMAP request" });
-  }
+  const env = req.body;
+  if (!isRequestEnvelope(env)) return reply.code(400).send(NOT_REQUEST_PROBLEM);
   for (const cap of env.using) {
-    if (typeof cap !== "string" || !KNOWN_CAPABILITIES.has(cap)) {
+    if (!KNOWN_CAPABILITIES.has(cap)) {
       return reply.code(400).send({
         type: "urn:ietf:params:jmap:error:unknownCapability",
         status: 400,

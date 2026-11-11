@@ -16,7 +16,7 @@ import {
   submissionCapabilityProps,
   coreCapabilityProps,
 } from "../jmap/capabilities.js";
-import { dispatch, type RequestEnvelope } from "../jmap/router.js";
+import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "../jmap/router.js";
 import { JmapError } from "../jmap/errors.js";
 import type { GmailConfig } from "./config.js";
 import { GmailStore } from "./store.js";
@@ -313,24 +313,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       return;
     }
     if (req.method === "POST" && path === "/jmap") {
-      const env = req.body as RequestEnvelope;
-      if (
-        !env ||
-        !Array.isArray(env.using) ||
-        !Array.isArray(env.methodCalls) ||
-        env.methodCalls.some(
-          (c) =>
-            !Array.isArray(c) ||
-            c.length !== 3 ||
-            typeof c[0] !== "string" ||
-            !c[1] ||
-            typeof c[1] !== "object" ||
-            Array.isArray(c[1]) ||
-            typeof c[2] !== "string",
-        )
-      ) {
-        return reply.code(400).send({ error: "malformed JMAP request" });
-      }
+      const env = req.body;
+      if (!isRequestEnvelope(env)) return reply.code(400).send(NOT_REQUEST_PROBLEM);
       if (
         env.using.some(
           (c) =>

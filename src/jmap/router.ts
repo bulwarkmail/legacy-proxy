@@ -15,6 +15,38 @@ export interface RequestEnvelope {
   createdIds?: Record<string, string>;
 }
 
+/**
+ * RFC 8620 §3.3: a Request object has `using` (strings), `methodCalls` (each a
+ * [name, arguments object, call id] triple) and optionally `createdIds` (an
+ * object). Anything else is answered with the `notRequest` problem.
+ */
+export function isRequestEnvelope(env: unknown): env is RequestEnvelope {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return false;
+  const e = env as Record<string, unknown>;
+  if (!Array.isArray(e.using) || !e.using.every((c) => typeof c === "string")) return false;
+  if (!Array.isArray(e.methodCalls)) return false;
+  const isCall = (c: unknown) =>
+    Array.isArray(c) &&
+    c.length === 3 &&
+    typeof c[0] === "string" &&
+    !!c[1] &&
+    typeof c[1] === "object" &&
+    !Array.isArray(c[1]) &&
+    typeof c[2] === "string";
+  if (!e.methodCalls.every(isCall)) return false;
+  if (e.createdIds !== undefined && (!e.createdIds || typeof e.createdIds !== "object" || Array.isArray(e.createdIds))) {
+    return false;
+  }
+  return true;
+}
+
+/** The problem answer for a body that is not a JMAP Request object. */
+export const NOT_REQUEST_PROBLEM = {
+  type: "urn:ietf:params:jmap:error:notRequest",
+  status: 400,
+  detail: "The request body is not a valid JMAP Request object",
+} as const;
+
 export interface ResponseEnvelope {
   methodResponses: MethodCall[];
   createdIds?: Record<string, string>;
@@ -225,7 +257,7 @@ async function runCall(
 }
 
 export async function dispatch(env: RequestEnvelope, ctx: DispatchContext): Promise<ResponseEnvelope> {
-  if (!Array.isArray(env.methodCalls)) throw invalidArguments("methodCalls must be an array");
+  if (!isRequestEnvelope(env)) throw new JmapError("notRequest", NOT_REQUEST_PROBLEM.detail);
   if (env.methodCalls.length > ctx.maxCallsInRequest) {
     throw invalidArguments("too many method calls");
   }
