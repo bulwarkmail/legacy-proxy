@@ -1020,8 +1020,28 @@ sign-in tokens are stored only as SHA-256 hashes.
 Each database keeps a value sealed under the key. A start with a `VAULT_KEY` that
 opens neither it nor any stored credential stops with one line,
 `legacy-proxy: VAULT_KEY does not open the sealed values in <file>: ...`, before
-any row is changed; `npm run gmail:password` stops the same way. Keep the key with
-the backups of `DATA_DIR`.
+any row is changed; `npm run gmail:password` stops the same way.
+
+Keep `VAULT_KEY` safe and apart from the backups of `DATA_DIR`: a backup stored
+together with its key gives whoever takes it everything the proxy sealed. Without
+the key nothing sealed can be restored: every IMAP user signs in again, every
+Gmail account reconnects at `/auth/google/start`, the Gmail cache is fetched
+again and pending uploads are attached again. To start over without the key,
+move `proxy.db` and `gmail.sqlite3` out of `DATA_DIR`.
+
+### Upgrading and rolling back
+
+- The first start of this version rewrites what earlier versions sealed (see
+  above); nothing else to do.
+- Gmail bridge sign-ins made before the upgrade are dated at the upgrade, so all
+  of them end in the same minute one year after it; those users then sign in
+  again.
+- Rolling back to an earlier version: it can't open what this version sealed, so
+  IMAP users sign in again, Gmail accounts reconnect, the cache refills, and
+  uploads from the last day are attached again. It also accepts retired refresh
+  tokens again (kept up to 180 days so that a copy can be recognised), since it
+  doesn't rotate them. Coming back to this version after that: what the earlier
+  version sealed in the meantime doesn't open (sign in, reconnect, attach again).
 
 ## Tests
 
