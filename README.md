@@ -791,12 +791,23 @@ The Gmail backend advertises and enforces its own object limits (100 per get,
 20 per set).
 
 `TRUST_PROXY` decides which reverse proxies may name the client's address in
-`X-Forwarded-For`, which the [login limits](#login-limits) count by. Unset (or
-`false`), the socket's address is the client's. A number trusts that many proxy
-hops in front of the proxy (`1` for a single Caddy, Traefik or nginx); a
-comma-separated list of addresses or CIDR ranges trusts those proxies; `true`
-trusts every hop, which is only safe when nothing but your reverse proxy can
-reach the proxy.
+`X-Forwarded-For`, which the [login limits](#login-limits) count by:
+
+- Unset (or `false`): the socket's address is the client's. Behind a reverse
+  proxy that is the proxy's address, so everyone behind it shares one budget:
+  ten wrong passwords from anyone hold that user name for everyone, and 50 hold
+  every login. Docker's userland proxy (Docker Desktop, published IPv6 ports)
+  hides client addresses the same way.
+- A number: trust that many proxy hops in front of the proxy. Caddy, Traefik
+  and nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
+  append the address they saw to whatever the client sent; `TRUST_PROXY=1`
+  takes that last entry, the one your proxy wrote. This is the right value for
+  one reverse proxy; use `2` for two in a row (a CDN in front of nginx, say).
+- A comma-separated list of addresses or CIDR ranges: trust those proxies.
+- `true`: trust every entry and take the leftmost. The leftmost entry is the one
+  the client wrote itself when the reverse proxy appends, so every request could
+  name its own address and the limits would count nothing. Do not use `true`
+  behind an appending reverse proxy.
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.

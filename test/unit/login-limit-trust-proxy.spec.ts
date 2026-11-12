@@ -36,6 +36,23 @@ const login = (client: string, password: string) =>
   });
 
 describe("TRUST_PROXY", () => {
+  it("counts by the entry the reverse proxy appended, whatever the client wrote before it", async () => {
+    imap.users["dan@test.local"] = "right-password";
+    const viaProxy = (clientWrote: string, password: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/login",
+        // The reverse proxy connects from 10.4.0.1 and appends the client it saw, 192.0.2.77.
+        remoteAddress: "10.4.0.1",
+        headers: { "x-forwarded-for": `${clientWrote}, 192.0.2.77` },
+        payload: { username: "dan@test.local", password },
+      });
+    for (let i = 0; i < 10; i++) expect((await viaProxy(`198.51.100.${i}`, `wrong-${i}`)).statusCode).toBe(401);
+    const before = imap.failedLogins;
+    expect((await viaProxy("198.51.100.200", "wrong")).statusCode).toBe(429);
+    expect(imap.failedLogins).toBe(before);
+  });
+
   it("counts each forwarded client on its own", async () => {
     for (let i = 0; i < 10; i++) expect((await login("203.0.113.1", `wrong-${i}`)).statusCode).toBe(401);
     expect((await login("203.0.113.1", "wrong")).statusCode).toBe(429);
