@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GmailStore } from "../../src/gmail/store.js";
+import { GmailMail } from "../../src/gmail/mail.js";
 import { GMAIL_READONLY } from "../../src/gmail/config.js";
 import { Store } from "../../src/state/store.js";
 import {
@@ -118,7 +119,7 @@ describe("a sealed value copied into another row", () => {
     expect((await store.load(ANNA))?.credentials.refreshToken).toBe("fake-refresh-" + ANNA);
   });
 
-  it("Gmail upload: another account's upload copied into a row does not open there", async () => {
+  it("Gmail upload: another account's upload copied into a row is no upload there, and asking for it fails like an unknown one", async () => {
     const dir = tempDir();
     const store = gmailStore(dir, crypto.randomBytes(32));
     await connect(store, ANNA);
@@ -129,8 +130,12 @@ describe("a sealed value copied into another row", () => {
     const annas = (db.prepare("SELECT body FROM gmail_upload WHERE email=? AND id=?").get(ANNA, annasId) as { body: Buffer }).body;
     db.prepare("UPDATE gmail_upload SET body=? WHERE email=? AND id=?").run(annas, BEN, bensId);
 
-    expect(store.uploaded(BEN, bensId)?.body.toString("latin1") ?? "").not.toContain("Anna's attachment");
+    expect(store.uploaded(BEN, bensId)).toBeNull();
     expect(store.uploaded(ANNA, annasId)?.body.toString()).toBe("Anna's attachment");
+    const bens = new GmailMail(BEN, {} as never, store);
+    await expect(bens.download(bensId)).rejects.toMatchObject({ type: "notFound" });
+    await expect(bens.download("gu_never_uploaded")).rejects.toMatchObject({ type: "notFound" });
+    expect((await new GmailMail(ANNA, {} as never, store).download(annasId)).body.toString()).toBe("Anna's attachment");
   });
 
   it("IMAP backend: another account's stored password copied into a row does not open there", async () => {

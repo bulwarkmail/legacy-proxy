@@ -6,6 +6,7 @@ import {
   openCredentials,
   seal,
   sealCredentials,
+  inCurrentForm,
   sealPlace,
   unsealValue,
   type Credentials,
@@ -587,16 +588,18 @@ export class GmailStore {
       .get(email, id, Date.now()) as
       { body: Buffer; type: string } | undefined;
     if (!row) return null;
+    // An upload stored before uploads were sealed keeps its bytes as they came
+    // for the day it lives.
+    if (!inCurrentForm(row.body)) return { body: row.body, type: row.type };
     try {
       const opened = unsealValue(this.vaultKey, sealPlace.gmailUpload(email, id), row.body);
       if (!opened.legacy) return { body: opened.plain, type: row.type };
     } catch {
-      // Not sealed for this row.
+      // Not sealed for this row, or under another key.
     }
-    // An upload stored before uploads were sealed keeps its bytes as they came
-    // for the day it lives; a body sealed for another row comes back as the
-    // sealed bytes, which reveal nothing.
-    return { body: row.body, type: row.type };
+    // A body that doesn't open here is no upload of this account: it is
+    // answered like an unknown one.
+    return null;
   }
   rememberDraft(
     email: string,

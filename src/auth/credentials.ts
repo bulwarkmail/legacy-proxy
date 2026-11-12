@@ -79,6 +79,11 @@ export function seal(key: Buffer, place: SealPlace, plain: Buffer): Buffer {
   return Buffer.concat([Buffer.of(VERSION), nonce, cipher.getAuthTag(), ct]);
 }
 
+/** True when `value` is laid out like a value sealed in the current format (says nothing about where it opens). */
+export function inCurrentForm(value: Buffer): boolean {
+  return value.length >= 1 + NONCE_LEN + TAG_LEN && value[0] === VERSION;
+}
+
 function decrypt(key: Buffer, body: Buffer, aad: Buffer | null): Buffer {
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, body.subarray(0, NONCE_LEN));
   decipher.setAuthTag(body.subarray(NONCE_LEN, NONCE_LEN + TAG_LEN));
