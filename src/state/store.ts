@@ -24,6 +24,12 @@ export interface AccountRow {
   cred_refused: number;
   /** Refusals of the stored credentials in a row, while not yet marked refused. */
   cred_refusals: number;
+  /**
+   * The credential tag of the sign-in that moved the generation last, when a
+   * sign-in did: sessions made with those credentials stay valid under the new
+   * generation. Null otherwise.
+   */
+  cred_rotated_by: string | null;
 }
 
 /** Refusals of the stored credentials in a row before they are marked refused. */
@@ -206,6 +212,7 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_refused", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_refusals", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_rotated_by", definition: "TEXT" },
 ];
 
 export class Store {
@@ -248,9 +255,9 @@ export class Store {
 
   /**
    * Store the credentials a successful login proved, which clears a refused
-   * mark. `rotate` says they differ from what the row held: the credential
+   * mark. `rotate` says they replaced what the row held: the credential
    * generation then moves, which ends every session issued under the previous
-   * one.
+   * one except those made with the new credentials (tag `rotatedBy`).
    */
   upsertAccount(p: {
     slug: string;
@@ -259,6 +266,7 @@ export class Store {
     username: string;
     vault: Buffer;
     rotate?: boolean;
+    rotatedBy?: string | null;
   }): AccountRow {
     const now = Date.now();
     const before = this.getAccount(p.slug);
@@ -267,9 +275,11 @@ export class Store {
        VALUES(?,?,?,?,?,?)
        ON CONFLICT(slug) DO UPDATE SET kind=excluded.kind, host=excluded.host,
          username=excluded.username, vault=excluded.vault,
-         cred_gen = cred_gen + ?, cred_refused = 0, cred_refusals = 0`,
+         cred_gen = cred_gen + ?, cred_refused = 0, cred_refusals = 0,
+         cred_rotated_by = CASE WHEN ? THEN ? ELSE cred_rotated_by END`,
     );
-    stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, p.rotate ? 1 : 0);
+    const rotate = p.rotate ? 1 : 0;
+    stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, rotate, rotate, p.rotatedBy ?? null);
     const row = this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
     if (before && (before.cred_gen !== row.cred_gen || before.cred_refused)) this.credentialListener?.(row.id);
     return row;
@@ -291,7 +301,8 @@ export class Store {
     if (row.cred_refused) return true;
     if (row.cred_refusals < STORED_CREDENTIAL_ATTEMPTS) return false;
     this.prep(
-      `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_gen = cred_gen + 1 WHERE id = ?`,
+      `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_gen = cred_gen + 1, cred_rotated_by = NULL
+       WHERE id = ?`,
     ).run(accountId);
     this.credentialListener?.(accountId);
     return true;

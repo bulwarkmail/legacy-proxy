@@ -85,7 +85,8 @@ describe("what a password change and a sign-out leave working", () => {
     const before = logouts();
     imap.users["ivy@test.local"] = "new-password";
     await tokenOf("ivy@test.local", "new-password");
-    await new Promise((r) => setTimeout(r, 50));
+    // The stored password is checked after the sign-in is answered.
+    for (let i = 0; i < 100 && logouts() <= before; i++) await new Promise((r) => setTimeout(r, 20));
     expect(logouts()).toBeGreaterThan(before);
   });
 

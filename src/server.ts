@@ -3,7 +3,7 @@ import { Transform, pipeline, type Readable } from "node:stream";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import compress from "@fastify/compress";
-import { loadConfig } from "./util/config.js";
+import { loadConfig, type ProviderConfig } from "./util/config.js";
 import { log } from "./util/log.js";
 import { corsOptions } from "./util/cors.js";
 import { Store } from "./state/store.js";
@@ -11,6 +11,8 @@ import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import {
+  credentialTag,
+  generationValid,
   makeSession,
   sessionGeneration,
   signSession,
@@ -180,22 +182,15 @@ app.post("/api/login", async (req, reply) => {
   }
   gate.finish("accepted");
 
-  const vault = await sealCredentials(cfg.vaultKey, creds);
   const slug = `${providerName}:${body.username}`;
-  const account = store.upsertAccount({
-    slug,
-    kind: providerName,
-    host: provider.imap.host,
-    username: body.username,
-    vault,
-    rotate: await credentialsChanged(slug, creds),
-  });
+  const tag = credentialTag(cfg.vaultKey, creds);
+  const account = await recordSignIn({ slug, providerName, provider, creds, ip: req.ip, tag });
   // Reuse the probe as the account's pooled connection instead of logging out
   // and paying a second TCP+TLS+LOGIN when the client's first JMAP call lands.
   pool.adopt(account, probe);
   const token = signSession(
     cfg.sessionHmacKey,
-    makeSession({ accountSlug: slug, username: body.username, gen: account.cred_gen }),
+    makeSession({ accountSlug: slug, username: body.username, gen: account.cred_gen, cf: tag }),
   );
   return { token, accountId: String(account.id), apiUrl: `${cfg.publicUrl}/jmap` };
 });
@@ -217,9 +212,7 @@ app.post("/api/logout", async (req, reply) => {
  * to send the same password. An OAuth access token is not a password and
  * renews by itself, so a new one alone does not count.
  */
-async function credentialsChanged(slug: string, creds: Credentials): Promise<boolean> {
-  const existing = store.getAccount(slug);
-  if (!existing) return false;
+async function credentialsChanged(existing: AccountRow, creds: Credentials): Promise<boolean> {
   const oauth = (c: Credentials) => c.mech === "XOAUTH2";
   try {
     const stored = await openCredentials(cfg.vaultKey, existing.vault);
@@ -231,6 +224,93 @@ async function credentialsChanged(slug: string, creds: Credentials): Promise<boo
   } catch {
     return true;
   }
+}
+
+// Checks of an account's stored password, by account. A sign-in that offers a
+// password other than the stored one starts one after it is answered: the
+// stored password is tried once at the mail server. If the server refuses it,
+// the offered password replaced it and the credential generation moves; the
+// sessions made with the offered password stay valid. If the server still
+// accepts it, both are valid (one app password per device) and nothing
+// changes. While a check runs, the account's sessions made with other
+// credentials wait for its result, at most STORED_CHECK_WAIT_MS.
+const storedChecks = new Map<number, { tag: string; done: Promise<void> }>();
+const STORED_CHECK_WAIT_MS = 10_000;
+
+/** Wait for a check of the account's stored password, unless `tag` started it. */
+async function awaitStoredCheck(accountId: number, tag: string | undefined): Promise<void> {
+  const check = storedChecks.get(accountId);
+  if (!check || check.tag === tag) return;
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([check.done, new Promise<void>((resolve) => (timer = setTimeout(resolve, STORED_CHECK_WAIT_MS)))]);
+  clearTimeout(timer);
+}
+
+interface SignIn {
+  slug: string;
+  providerName: string;
+  provider: ProviderConfig;
+  creds: Credentials;
+  ip: string;
+  /** `credentialTag` of `creds`. */
+  tag: string;
+}
+
+/** Record what a successful sign-in proved; returns the row its session belongs to. */
+async function recordSignIn(s: SignIn): Promise<AccountRow> {
+  const existing = store.getAccount(s.slug);
+  const vault = await sealCredentials(cfg.vaultKey, s.creds);
+  const save = (rotate: boolean) =>
+    store.upsertAccount({
+      slug: s.slug,
+      kind: s.providerName,
+      host: s.provider.imap.host,
+      username: s.creds.username,
+      vault,
+      rotate,
+      rotatedBy: rotate ? s.tag : null,
+    });
+  if (!existing) return save(false);
+  const changed = await credentialsChanged(existing, s.creds);
+  // The same password, or the server already refused the stored one.
+  if (!changed || existing.cred_refused) return save(changed);
+  // One check at a time; the sessions of a sign-in that did not start it are
+  // decided by the one running.
+  if (!storedChecks.has(existing.id)) checkStoredPassword(existing, s, () => save(true));
+  return existing;
+}
+
+function checkStoredPassword(existing: AccountRow, s: SignIn, replace: () => AccountRow): void {
+  const done: Promise<void> = (async () => {
+    let stored: Credentials;
+    try {
+      stored = await openCredentials(cfg.vaultKey, existing.vault);
+    } catch {
+      replace();
+      return;
+    }
+    // The check is a login like any other: never for a held address, and a
+    // refusal counts.
+    const gate = await logins.begin(s.ip, s.creds.username);
+    if (!gate.ok) return;
+    try {
+      const probe = await openImap({ provider: s.provider, creds: stored });
+      gate.finish("accepted");
+      pool.adopt(existing, probe);
+    } catch (e) {
+      if (!isCredentialRefusal(e)) {
+        gate.finish("error");
+        return;
+      }
+      gate.finish("refused");
+      replace();
+    }
+  })()
+    .catch((err) => log.warn({ err: (err as Error).message }, "stored password check failed"))
+    .finally(() => {
+      if (storedChecks.get(existing.id)?.done === done) storedChecks.delete(existing.id);
+    });
+  storedChecks.set(existing.id, { tag: s.tag, done });
 }
 
 function tokenHash(token: string): string {
@@ -245,7 +325,8 @@ function bearerSession(token: string): { account: AccountRow; token: SessionToke
   const sess = verifySession(cfg.sessionHmacKey, token);
   if (!sess) return null;
   const account = store.getAccount(sess.accountSlug);
-  if (!account || sessionGeneration(sess) !== account.cred_gen) return null;
+  if (!account) return null;
+  if (!generationValid(sessionGeneration(sess), sess.cf, account.cred_gen, account.cred_rotated_by)) return null;
   if (store.isSessionEnded(tokenHash(token))) return null;
   return { account, token: sess };
 }
@@ -592,7 +673,7 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
 
 // Cache of validated Basic-auth credentials → account. Keyed by sha256 of the
 // raw header so we never log or persist plaintext. TTL keeps memory bounded.
-const basicAuthCache = new Map<string, { accountId: number; gen: number; expires: number }>();
+const basicAuthCache = new Map<string, { accountId: number; gen: number; tag: string; expires: number }>();
 const BASIC_TTL_MS = 5 * 60_000;
 // Basic logins in progress, by header and client address: requests that
 // arrive together from one address with one header share one login at the
@@ -626,7 +707,11 @@ async function authn(req: {
   if (typeof h !== "string") return UNAUTHORIZED;
 
   if (h.startsWith("Bearer ")) {
-    const session = bearerSession(h.slice("Bearer ".length).trim());
+    const token = h.slice("Bearer ".length).trim();
+    const first = bearerSession(token);
+    if (!first) return UNAUTHORIZED;
+    await awaitStoredCheck(first.account.id, first.token.cf);
+    const session = bearerSession(token);
     return session ? { ok: true, account: session.account } : UNAUTHORIZED;
   }
 
@@ -646,9 +731,12 @@ async function authn(req: {
     const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
     const cached = basicAuthCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
+      await awaitStoredCheck(cached.accountId, cached.tag);
       const account = store.getAccountById(cached.accountId);
       // A header validated under an older credential generation is asked again.
-      if (account && account.cred_gen === cached.gen) return { ok: true, account };
+      if (account && generationValid(cached.gen, cached.tag, account.cred_gen, account.cred_rotated_by)) {
+        return { ok: true, account };
+      }
       basicAuthCache.delete(cacheKey);
     }
     const runningKey = `${cacheKey}\n${req.ip}`;
@@ -687,20 +775,13 @@ async function basicLogin(username: string, password: string, cacheKey: string, 
     return UNAUTHORIZED;
   }
   gate.finish("accepted");
-  const vault = await sealCredentials(cfg.vaultKey, creds);
   const slug = `${providerName}:${username}`;
-  const account = store.upsertAccount({
-    slug,
-    kind: providerName,
-    host: provider.imap.host,
-    username,
-    vault,
-    rotate: await credentialsChanged(slug, creds),
-  });
+  const tag = credentialTag(cfg.vaultKey, creds);
+  const account = await recordSignIn({ slug, providerName, provider, creds, ip, tag });
   // Keep the validated connection: the JMAP request this auth is for will
   // need one immediately.
   pool.adopt(account, probe);
-  basicAuthCache.set(cacheKey, { accountId: account.id, gen: account.cred_gen, expires: Date.now() + BASIC_TTL_MS });
+  basicAuthCache.set(cacheKey, { accountId: account.id, gen: account.cred_gen, tag, expires: Date.now() + BASIC_TTL_MS });
   return { ok: true, account };
 }
 

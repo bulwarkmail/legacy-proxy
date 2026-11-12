@@ -219,14 +219,25 @@ opens a probe IMAP session with the supplied credentials, seals them into the
 vault, and only mints a token if IMAP accepts.
 
 A token is valid for 7 days. It ends earlier when the password behind it is
-replaced: the first sign-in that stores a different password for the account
-(through `/api/login` or HTTP Basic) moves the account's credential generation,
-and from then on every token issued before it is answered `401`. The IMAP
-connections that logged in with the old password, the push IDLE connection
-included, are closed, and cached Basic logins are checked against the server
-again. Signing in again with the same password ends nothing. Tokens issued by
-versions before this check carry no generation and keep working until the
-account's password first changes.
+replaced. When a sign-in (through `/api/login` or HTTP Basic) succeeds with a
+password other than the stored one, the proxy answers it and then tries the
+stored password once at the mail server:
+
+- If the server refuses the stored password, the new one replaced it: the proxy
+  stores the new password and moves the account's credential generation. From
+  then on every session made with the old password is answered `401`, and the
+  IMAP connections that logged in with it, the push IDLE connection included,
+  are closed. Sessions made with the new password keep working.
+- If the server still accepts the stored password, both are valid (one app
+  password per device, for example): nothing changes, and each device's Basic
+  header is cached as usual.
+
+While that check runs, the account's sessions made with other passwords wait
+for its result (at most 10 seconds). The check is a login like any other: it
+never runs for a held address, and a refusal counts toward the login limits.
+Signing in again with the same password ends nothing. Tokens issued by versions
+before this check carry no generation and keep working until the account's
+password first changes.
 
 The proxy also notices a password that was changed at the mail server. When the
 server refuses the stored password three times in a row (when the push IDLE

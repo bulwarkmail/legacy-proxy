@@ -10,8 +10,11 @@ import crypto from "node:crypto";
 
 export interface FakeImap {
   port: number;
-  /** user -> password; change it to simulate a password change on the mail server. */
-  users: Record<string, string>;
+  /**
+   * user -> password, or the passwords the server accepts for the user (app
+   * passwords); change it to simulate a password change on the mail server.
+   */
+  users: Record<string, string | string[]>;
   /** Every line a client sent, in order. */
   lines: string[];
   logins: number;
@@ -19,7 +22,7 @@ export interface FakeImap {
   close(): Promise<void>;
 }
 
-export async function startFakeImap(users: Record<string, string>): Promise<FakeImap> {
+export async function startFakeImap(users: Record<string, string | string[]>): Promise<FakeImap> {
   const state: FakeImap = { port: 0, users, lines: [], logins: 0, failedLogins: 0, close: async () => {} };
   const sockets = new Set<net.Socket>();
   const server = net.createServer((sock) => {
@@ -32,7 +35,8 @@ export async function startFakeImap(users: Record<string, string>): Promise<Fake
     const send = (s: string) => sock.write(s + "\r\n");
     const login = (tag: string, user: string, pass: string) => {
       state.logins++;
-      if (state.users[user] !== undefined && state.users[user] === pass) send(`${tag} OK logged in`);
+      const known = state.users[user];
+      if (known !== undefined && (Array.isArray(known) ? known.includes(pass) : known === pass)) send(`${tag} OK logged in`);
       else {
         state.failedLogins++;
         send(`${tag} NO [AUTHENTICATIONFAILED] no`);
