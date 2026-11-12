@@ -62,11 +62,11 @@ dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
 const confirmedAlongside = new Map<number, Map<string, number>>();
 const CONFIRMED_ALONGSIDE_MS = 60 * 60_000;
 
-// Attempts of the open checks of stored passwords (see recordSignIn), and the
-// client address of the sign-in that opened each, which the attempts are
-// counted for. After a restart the address is gone, like the login counters.
-const checks = new StoredPasswordChecks((accountId) => runCheckAttempt(accountId));
-const checkAddress = new Map<number, string>();
+// Attempts of the open checks of stored passwords (see recordSignIn), and what
+// happens to a check that has no answer after a day.
+const checks = new StoredPasswordChecks((accountId) => runCheckAttempt(accountId), {
+  expire: (accountId) => expireCheck(accountId),
+});
 
 // When an account's credential generation moves, nothing logged in with the
 // old credentials keeps serving it: pooled connections close, the IDLE worker
@@ -75,10 +75,7 @@ const checkAddress = new Map<number, string>();
 store.setCredentialListener((accountId) => {
   confirmedAlongside.delete(accountId);
   const row = store.getAccountById(accountId);
-  if (!row?.cred_check_tag) {
-    checks.close(accountId);
-    checkAddress.delete(accountId);
-  }
+  if (!row?.cred_check_tag) checks.close(accountId);
   hub.closeWhere(accountId, (s) => !row || !generationValid(s.gen, s.tag, row.cred_gen, row.cred_rotated_by));
   pool.retire(accountId);
   idleManager.onCredentialsChanged(accountId);
@@ -211,7 +208,7 @@ app.post("/api/login", async (req, reply) => {
 
   const slug = `${providerName}:${body.username}`;
   const tag = credentialTag(cfg.vaultKey, creds);
-  const signedIn = await recordSignIn({ slug, providerName, provider, creds, ip: req.ip, tag });
+  const signedIn = await recordSignIn({ slug, providerName, provider, creds, tag });
   if (!signedIn.ok) {
     probe.logout().catch(() => {});
     return sendLimited(reply, signedIn);
@@ -273,9 +270,14 @@ async function unsealed(vault: Buffer | null | undefined): Promise<Credentials |
 // store.openCredentialCheck) and only sessions made with it are served. Every
 // other session of the account waits for the answer while an attempt is due
 // within CHECK_WAIT_MS and is then judged, or is answered 503 with
-// Retry-After. A sign-in with yet another password is treated the same way; a
-// sign-in with the stored password is itself the answer "accepted". The check
-// is kept in the database, so a restart resumes it and holds the same sessions.
+// Retry-After; push subscriptions made before the check get nothing (see
+// store.activePushSubscriptions). A sign-in with yet another password is
+// treated the same way; a sign-in with the stored password is itself the
+// answer "accepted"; a sign-in with the new password changes nothing. The
+// attempts are the proxy's own logins (LoginLimiter.beginOwn), so no client's
+// hold delays them. A check with no answer after CHECK_MAX_OPEN_MS counts as
+// refused. The check is kept in the database, so a restart resumes it and
+// holds the same sessions.
 
 const TRY_AGAIN = "try again later";
 
@@ -296,7 +298,11 @@ async function holdForCheck(account: AccountRow, tag: string | undefined): Promi
 /** Run the attempts of the row's open check, if they don't run yet (after a restart). */
 function resumeCheck(row: AccountRow): void {
   if (!row.cred_check_tag) return;
-  checks.open(row.id, { attempts: row.cred_check_attempts ?? 0, lastAt: row.cred_check_last ?? 0 });
+  checks.open(row.id, {
+    attempts: row.cred_check_attempts ?? 0,
+    lastAt: row.cred_check_last ?? 0,
+    openedAt: row.cred_check_since ?? 0,
+  });
 }
 
 /** Record the answer to the row's open check; the row after it, or undefined when that check was closed already. */
@@ -305,8 +311,19 @@ function answerCheck(row: AccountRow, answer: "accepted" | "refused"): AccountRo
   if (!answered) return undefined;
   if (answer === "accepted" && row.cred_check_tag) confirmAlongside(row.id, row.cred_check_tag);
   checks.close(row.id);
-  checkAddress.delete(row.id);
   return answered;
+}
+
+/**
+ * A check that had no answer for CHECK_MAX_OPEN_MS counts as refused: the new
+ * password stays, sessions and subscriptions of the old one end, and a device
+ * that still has a valid old password signs in again (which checks the new one).
+ */
+function expireCheck(accountId: number): void {
+  const row = store.getAccountById(accountId);
+  if (!row?.cred_check_tag) return;
+  log.warn({ account: row.slug }, "stored password check had no answer for a day; the new password replaces it");
+  answerCheck(row, "refused");
 }
 
 /** One attempt of the open check of an account's stored password. */
@@ -326,9 +343,9 @@ async function runCheckAttempt(accountId: number): Promise<CheckAttemptResult> {
   } catch {
     return "unanswered";
   }
-  // Each attempt is a login like any other: never for a held address, and a
-  // refusal counts toward the limits.
-  const gate = await logins.begin(checkAddress.get(accountId) ?? "", row.username);
+  // The proxy's own login with the password it holds: no client's address is
+  // counted for it or can hold it; it has login slots of its own.
+  const gate = await logins.beginOwn();
   if (!gate.ok) return "unanswered";
   let probe;
   try {
@@ -358,7 +375,6 @@ interface SignIn {
   providerName: string;
   provider: ProviderConfig;
   creds: Credentials;
-  ip: string;
   /** `credentialTag` of `creds`. */
   tag: string;
 }
@@ -408,10 +424,10 @@ async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   }
   // Confirmed valid next to the stored one not long ago: no check again.
   if (bothValid(existing.id, s.tag)) return { ok: true, account: existing };
-  const opened = store.openCredentialCheck(existing.id, { vault, tag: s.tag, since: Date.now() });
+  const since = Date.now();
+  const opened = store.openCredentialCheck(existing.id, { vault, tag: s.tag, since });
   if (!opened) return again ? { ok: false, status: 503, retryAfterSec: 1, error: TRY_AGAIN } : recordSignIn(s, true);
-  checkAddress.set(opened.id, s.ip);
-  checks.open(opened.id);
+  checks.open(opened.id, { openedAt: since });
   // Streams of the sessions the check holds end; they can open again once it has its answer.
   hub.closeWhere(opened.id, (session) => session.tag !== s.tag);
   return { ok: true, account: opened };
@@ -945,7 +961,7 @@ async function basicLogin(
   }
   gate.finish("accepted");
   const slug = `${providerName}:${username}`;
-  const signedIn = await recordSignIn({ slug, providerName, provider, creds, ip, tag });
+  const signedIn = await recordSignIn({ slug, providerName, provider, creds, tag });
   if (!signedIn.ok) {
     probe.logout().catch(() => {});
     return signedIn;

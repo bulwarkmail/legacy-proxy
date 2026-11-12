@@ -1,7 +1,8 @@
 // A check of a stored password that gets no answer tries again on a timer
-// with growing delays, a bounded number of times per hour, and stops at the
-// first answer. Requests it holds wait for an attempt that is due and are
-// then told when to come back.
+// with growing delays, at most 11 times in the first hour and once an hour
+// after, stops at the first answer, and expires a day after it opened (34
+// attempts at most). Requests it holds wait for an attempt that is due and
+// are then told when to come back.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CHECK_RETRY_DELAYS_MS, StoredPasswordChecks, type CheckAttemptResult } from "../../src/auth/storedCheck.js";
@@ -16,20 +17,59 @@ afterEach(() => {
 });
 
 describe("attempts of a check without an answer", () => {
-  it("are at most 11 in the first hour and 6 in each hour after", async () => {
+  it("are at most 11 in the first hour, one an hour after, 34 in all before the check expires at 24 hours", async () => {
     let attempts = 0;
-    const checks = new StoredPasswordChecks(async () => {
-      attempts++;
-      return "unanswered";
-    });
-    checks.open(1);
-    await vi.advanceTimersByTimeAsync(HOUR - 1);
-    expect(attempts).toBe(11);
-    await vi.advanceTimersByTimeAsync(HOUR);
-    expect(attempts).toBe(17);
-    await vi.advanceTimersByTimeAsync(HOUR);
-    expect(attempts).toBe(23);
-    checks.closeAll();
+    const expired: number[] = [];
+    const opened = Date.now();
+    const checks = new StoredPasswordChecks(
+      async () => {
+        attempts++;
+        return "unanswered";
+      },
+      { expire: (id) => void expired.push(id) },
+    );
+    checks.open(1, { openedAt: opened });
+    const perHour: number[] = [];
+    for (let hour = 0; hour < 24; hour++) {
+      const before = attempts;
+      await vi.advanceTimersByTimeAsync(HOUR - (hour === 23 ? 1 : 0));
+      perHour.push(attempts - before);
+    }
+    expect(perHour[0]).toBe(11);
+    expect(perHour.slice(1).every((n) => n === 1)).toBe(true);
+    expect(attempts).toBe(34);
+    expect(expired).toEqual([]);
+    // At 24 hours the check expires instead of making another attempt, and stops.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(expired).toEqual([1]);
+    expect(checks.isOpen(1)).toBe(false);
+    await vi.advanceTimersByTimeAsync(7 * 24 * HOUR);
+    expect(attempts).toBe(34);
+    expect(expired).toEqual([1]);
+  });
+
+  it("expire at once, without an attempt, when resumed more than a day after they opened", async () => {
+    let attempts = 0;
+    const expired: number[] = [];
+    const checks = new StoredPasswordChecks(
+      async () => {
+        attempts++;
+        return "unanswered";
+      },
+      { expire: (id) => void expired.push(id) },
+    );
+    checks.open(7, { attempts: 20, lastAt: Date.now() - 2 * HOUR, openedAt: Date.now() - 25 * HOUR });
+    await vi.advanceTimersByTimeAsync(0);
+    expect({ attempts, expired, open: checks.isOpen(7) }).toEqual({ attempts: 0, expired: [7], open: false });
+  });
+
+  it("wake a request waiting for the next attempt when the check expires instead", async () => {
+    const checks = new StoredPasswordChecks(async () => "unanswered", { expire: () => {} });
+    checks.open(1, { attempts: 11, lastAt: Date.now() - 50 * 60_000, openedAt: Date.now() - (24 * HOUR - 5_000) });
+    // The next attempt is ten minutes away, the expiry five seconds: the request waits for the expiry.
+    const waiting = checks.waitForAnswer(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await waiting).toBeNull();
   });
 
   it("stop at the first answer", async () => {

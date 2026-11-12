@@ -269,17 +269,30 @@ Every other session of the account, and a sign-in with yet another password,
 waits for the answer while an attempt is due within 15 seconds and is then
 answered `401` or served as the answer says; otherwise it gets `503` with
 `Retry-After`. Event streams those sessions opened before end when the check
-starts; they can be opened again once it has its answer. A sign-in with the
-stored password answers the check itself: both are valid.
+starts; they can be opened again once it has its answer. Push subscriptions
+made before the check get nothing while it is open; they deliver again if it
+ends "accepted" and end if it ends "refused". A sign-in with the stored
+password answers the check itself: both are valid. A sign-in with the new
+password changes nothing about it.
 
 Only a refusal of the credentials answers "refused". An attempt that gets no
 answer (the server can't be reached, answers "try again later" with one of the
-codes listed below, no login slot is free, or the address is held) is repeated
-after 5 seconds, 30 seconds, 1, 2 and 5 minutes, then every 10 minutes: at most
-11 attempts in the first hour and 6 in each hour after that. Each attempt is a
-login like any other: it never runs for a held address, and a refusal counts
-toward the login limits. The check is kept in the database, so a restart holds
-the same sessions and goes on with the attempts where it left off.
+codes listed below, or no login slot is free) is repeated after 5 seconds, 30
+seconds, 1, 2 and 5 minutes, five times every 10 minutes, then once an hour:
+at most 11 attempts in the first hour and one an hour after that, so a server
+that answers a locked account with "try again later" gets too few logins to
+keep the lock going. The attempts are the proxy's own logins with the password
+it holds: no client's address is counted for them and no client's hold delays
+them. They have 5 login slots of their own across all accounts, apart from the
+20 for callers.
+
+A check that still has no answer 24 hours after it opened (after at most 34
+attempts) counts as refused: the new password stays, and every device that
+signed in with the old password is signed out (`401`) and loses its push
+subscriptions. Its owner signs in again; if the old password still works at
+the mail server, that sign-in checks the new one in the same way. The check is
+kept in the database, so a restart holds the same sessions and goes on with the
+attempts, and with the 24 hours, where it left off.
 
 Signing in again with the same password ends nothing. Tokens issued by versions
 before this check carry no generation and keep working until the account's

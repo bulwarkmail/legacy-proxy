@@ -21,6 +21,8 @@ export interface LoginLimitOptions {
   maxPerUser?: number;
   maxPerAddress?: number;
   maxInFlight?: number;
+  /** Logins of the proxy's own (beginOwn) running at once. */
+  maxOwnInFlight?: number;
   maxWaitMs?: number;
   maxWaiting?: number;
   maxKeys?: number;
@@ -39,6 +41,7 @@ const DEFAULTS = {
   maxPerUser: 10,
   maxPerAddress: 50,
   maxInFlight: 20,
+  maxOwnInFlight: 5,
   maxWaitMs: 5_000,
   maxWaiting: 200,
   maxKeys: 50_000,
@@ -121,6 +124,8 @@ export class LoginLimiter {
   // slots busy cannot make signed-in clients wait or get 503.
   private readonly slots: Slots = { inFlight: 0, waiting: [] };
   private readonly knownSlots: Slots = { inFlight: 0, waiting: [] };
+  // The proxy's own logins with a password it holds (see beginOwn).
+  private readonly ownSlots: Slots = { inFlight: 0, waiting: [] };
 
   constructor(options: LoginLimitOptions = {}) {
     const { now, ...rest } = options;
@@ -173,6 +178,29 @@ export class LoginLimiter {
         } else if (outcome === "accepted") {
           this.byUser.clear(user);
         }
+      },
+    };
+  }
+
+  /**
+   * Ask to make a login of the proxy's own with credentials it already holds
+   * (a check of a stored password). Nobody chose those credentials, so no
+   * client address or user name is counted for it and no client's hold stops
+   * it. It waits for one of `maxOwnInFlight` slots of its own: callers keeping
+   * the other slots busy can't stall it, and it never adds more than that many
+   * logins at once to theirs. When `ok`, the caller must call `finish` once.
+   */
+  async beginOwn(): Promise<LoginGate> {
+    if (!(await this.acquire(this.ownSlots, this.opts.maxOwnInFlight))) {
+      return { ok: false, status: 503, retryAfterSec: Math.max(1, Math.ceil(this.opts.maxWaitMs / 1000)) };
+    }
+    let finished = false;
+    return {
+      ok: true,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        this.release(this.ownSlots);
       },
     };
   }
@@ -234,8 +262,8 @@ export class LoginLimiter {
     else this.pending.delete(key);
   }
 
-  private acquire(slots: Slots): Promise<boolean> {
-    if (slots.inFlight < this.opts.maxInFlight) {
+  private acquire(slots: Slots, max = this.opts.maxInFlight): Promise<boolean> {
+    if (slots.inFlight < max) {
       slots.inFlight++;
       return Promise.resolve(true);
     }

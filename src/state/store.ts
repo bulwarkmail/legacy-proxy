@@ -743,13 +743,18 @@ export class Store {
   // Returns subs that should currently be receiving StateChange POSTs:
   // verified, not expired, with a non-empty types filter. The dispatcher uses
   // this on every fan-out so a freshly destroyed/expired sub stops receiving
-  // mid-flight without needing an explicit cache invalidation.
+  // mid-flight without needing an explicit cache invalidation. While a check
+  // of the stored credentials is open, subscriptions made before it get
+  // nothing: they belong to sessions the check holds. They deliver again when
+  // it ends "accepted" and are deleted when it ends "refused".
   activePushSubscriptions(accountId: number): PushSubscriptionRow[] {
     const now = Date.now();
     const rows = this.prep(
-        `SELECT * FROM push_subscription
-         WHERE account_id = ? AND verified = 1
-         AND (expires IS NULL OR expires > ?)`,
+        `SELECT p.* FROM push_subscription p
+         JOIN account a ON a.id = p.account_id
+         WHERE p.account_id = ? AND p.verified = 1
+         AND (p.expires IS NULL OR p.expires > ?)
+         AND (a.cred_check_tag IS NULL OR p.created_at >= a.cred_check_since)`,
       )
       .all(accountId, now) as PushRowRaw[];
     return rows.map(rowToPushSub);

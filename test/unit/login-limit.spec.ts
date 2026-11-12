@@ -94,6 +94,27 @@ describe("LoginLimiter", () => {
     expect(held(await limiter.begin("198.51.100.1", "carol", { known: true }))).toBe(429);
   });
 
+  it("gives the proxy's own logins slots of their own, held by no address and counted for none", async () => {
+    const limiter = new LoginLimiter({ maxInFlight: 1, maxOwnInFlight: 2, maxWaitMs: 20 });
+    // Every address is held, and a stranger keeps the only first-login slot busy.
+    await fail(limiter, "198.51.100.1", "carol", 10);
+    for (let i = 0; i < 50; i++) await fail(limiter, "10.0.0.1", `nobody${i}`, 1);
+    const stranger = await limiter.begin("198.51.100.9", "someone");
+    expect(held(stranger)).toBe("open");
+    const keys = limiter.trackedKeys;
+    // The proxy's own logins still get their slots, at most two at once.
+    const a = await limiter.beginOwn();
+    const b = await limiter.beginOwn();
+    expect([held(a), held(b)]).toEqual(["open", "open"]);
+    expect(await limiter.beginOwn()).toMatchObject({ ok: false, status: 503 });
+    if (a.ok) a.finish("refused");
+    if (b.ok) b.finish("refused");
+    // Their refusals count for nobody.
+    expect(limiter.trackedKeys).toBe(keys);
+    expect(held(await limiter.beginOwn())).toBe("open");
+    if (stranger.ok) stranger.finish("accepted");
+  });
+
   it("stays bounded in size", async () => {
     const limiter = new LoginLimiter({ maxKeys: 100, maxPerAddress: 1_000_000 });
     for (let i = 0; i < 1000; i++) await fail(limiter, `198.51.${i >> 8}.${i & 255}`, `user${i}`, 1);
