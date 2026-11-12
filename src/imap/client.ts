@@ -1,5 +1,6 @@
 import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
+import { assertTransport, transportOf } from "../auth/providers.js";
 import type { ProviderConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
@@ -18,10 +19,16 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
   } else {
     throw new Error("openImap: no credentials supplied");
   }
+  // Refuse a plain connection the provider entry does not allow, and make
+  // STARTTLS a requirement when the entry asks for it: imapflow then fails the
+  // connect, before any credential is sent, if the server does not offer it.
+  assertTransport("imap", provider.imap);
+  const { secure, starttls } = transportOf("imap", provider.imap);
   const client = new ImapFlow({
     host: provider.imap.host,
     port: provider.imap.port,
-    secure: provider.imap.secure ?? true,
+    secure,
+    ...(starttls ? { doSTARTTLS: true } : {}),
     auth,
     logger: imapflowLogger,
   });
@@ -60,6 +67,23 @@ export async function withMailbox<T>(
   } finally {
     lock.release();
   }
+}
+
+// Response codes (RFC 5530) a server gives to a login it cannot serve right
+// now. imapflow flags every NO to LOGIN/AUTHENTICATE as an authentication
+// failure; these mean "try again later", not "wrong credentials". Stalwart
+// answers a store error during the login with CONTACTADMIN.
+const TEMPORARY_LOGIN_CODES = new Set(["UNAVAILABLE", "SERVERBUG", "INUSE", "LIMIT", "CONTACTADMIN"]);
+
+/**
+ * True when the mail server refused the credentials themselves, as opposed to
+ * a connection that failed or a server that asks to try again later.
+ */
+export function isCredentialRefusal(e: unknown): boolean {
+  const err = e as { authenticationFailed?: unknown; serverResponseCode?: unknown } | null;
+  if (!err || err.authenticationFailed !== true) return false;
+  const code = typeof err.serverResponseCode === "string" ? err.serverResponseCode.toUpperCase() : "";
+  return !TEMPORARY_LOGIN_CODES.has(code);
 }
 
 // The server's side of a failed IMAP command. imapflow puts the tagged NO/BAD

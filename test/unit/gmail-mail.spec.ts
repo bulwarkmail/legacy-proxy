@@ -300,6 +300,7 @@ it("rotates bridge passwords and leaves non-bridge passwords to the legacy backe
     });
     expect(bearer.statusCode).toBe(200);
     expect(bearer.json().accounts[mail.accountId]).toBeDefined();
+    // ...and as a Basic password it is refused here, never handed to the legacy backend's IMAP login.
     expect(
       (
         await app.inject({
@@ -309,8 +310,8 @@ it("rotates bridge passwords and leaves non-bridge passwords to the legacy backe
               "Basic " + Buffer.from(`${email}:${signedIn.accessToken}`).toString("base64"),
           },
         })
-      ).json(),
-    ).toEqual({ legacy: true });
+      ).statusCode,
+    ).toBe(401);
     store.revokeToken(signedIn.refreshToken, "webmail");
     expect(
       (

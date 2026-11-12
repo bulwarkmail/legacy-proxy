@@ -203,7 +203,9 @@ docker compose -f compose.prod.yml up -d
 ```
 
 `curl http://localhost:8080/healthz` returns `{"ok":true}` once the server is
-up. Clients connect via `http://localhost:8080/.well-known/jmap`.
+up. Clients connect via `http://localhost:8080/.well-known/jmap`. The compose
+files publish port 8080 on `127.0.0.1` only; other machines reach the proxy
+through a reverse proxy (see [TLS](#tls)).
 
 ### Build from source
 
@@ -243,10 +245,99 @@ The response carries `{ token, accountId, apiUrl }`. Use the token as
 opens a probe IMAP session with the supplied credentials, seals them into the
 vault, and only mints a token if IMAP accepts.
 
+A token is valid for 7 days. It ends earlier when the password behind it is
+replaced. When a sign-in (through `/api/login` or HTTP Basic) succeeds with a
+password other than the stored one, the proxy answers it at once and then
+checks the stored password at the mail server until the server accepts or
+refuses it:
+
+- If the server refuses the stored password, the new one replaced it: the proxy
+  stores the new password and moves the account's credential generation. From
+  then on every session made with the old password is answered `401`, the
+  IMAP connections that logged in with it, the push IDLE connection included,
+  are closed, its event streams end, and the push subscriptions made before
+  the change end. Sessions made with the new password, and the subscriptions
+  and streams they opened, keep working.
+- If the server still accepts the stored password, both are valid (one app
+  password per device, for example): nothing changes, and each device's Basic
+  header is cached as usual. The stored password is not checked again for that
+  second password for an hour.
+
+Until the check has an answer, only sessions made with the new password are
+served, and the proxy logs in with the new password for its own connections.
+Every other session of the account, and a sign-in with yet another password,
+waits for the answer while an attempt is due within 15 seconds and is then
+answered `401` or served as the answer says; otherwise it gets `503` with
+`Retry-After`. Event streams those sessions opened before end when the check
+starts; they can be opened again once it has its answer. Push subscriptions
+made before the check get nothing while it is open; they deliver again if it
+ends "accepted" and end if it ends "refused". A sign-in with the stored
+password answers the check itself: both are valid. A sign-in with the new
+password changes nothing about it. While a check opened by another password is
+open, this holds every other session of the account, including one the owner
+makes with a password they have just set: normally for milliseconds, up to an
+hour if the check is in its hourly phase, and up to 24 hours if the mail server
+gives no verdict.
+
+Only a refusal of the credentials answers "refused". An attempt that gets no
+answer (the server can't be reached, answers "try again later" with one of the
+codes listed below, or no login slot is free) is repeated after 5 seconds, 30
+seconds, 1, 2 and 5 minutes, five times every 10 minutes, then once an hour:
+at most 11 attempts in the first hour and one an hour after that, so a server
+that answers a locked account with "try again later" gets too few logins to
+keep the lock going. The attempts are the proxy's own logins with the password
+it holds: no client's address is counted for them and no client's hold delays
+them. They have 5 login slots of their own across all accounts, apart from the
+20 for callers.
+
+A check that still has no answer 24 hours after it opened (after at most 34
+attempts) counts as refused: the new password stays, and every device that
+signed in with the old password is signed out (`401`) and loses its push
+subscriptions. Its owner signs in again; if the old password still works at
+the mail server, that sign-in checks the new one in the same way. The check is
+kept in the database, so a restart holds the same sessions and goes on with the
+attempts, and with the 24 hours, where it left off.
+
+Signing in again with the same password ends nothing. Tokens issued by versions
+before this check carry no generation and keep working until the account's
+password first changes.
+
+The proxy also notices a password that was changed at the mail server. When the
+server refuses the stored password three times in a row (when the push IDLE
+worker reconnects, or the pool opens a new connection), the stored credentials
+are marked refused: the proxy stops logging in with them, every token issued
+before is answered `401` and its event streams end, and the account's push
+subscriptions end, so its push IDLE worker stops. After a refusal the
+stored password is tried again only two and a half minutes later, so the three
+refusals span at least five minutes and a server that refuses logins for a
+moment marks nobody. After the first refusal, one request made after it may
+try once right away, so a moment's hiccup does not fail new connections for
+minutes; if that try is refused too, requests that need a new connection fail
+without a login until the five minutes are up. The IDLE worker keeps the
+spacing. The mark is kept in the database across restarts and cleared
+by the next successful sign-in; the push worker starts again once the client
+subscribes again. A
+server that cannot be reached, or answers "try again later" (`UNAVAILABLE`,
+`SERVERBUG`, `INUSE`, `LIMIT`, or `CONTACTADMIN`, which Stalwart sends for a
+store error), is not a refusal and is retried with backoff, at most once a
+minute.
+
+`POST /api/logout` with `Authorization: Bearer <token>` ends that one token,
+closes the event streams opened with it, and answers `204`; the account's other
+sessions and their streams stay. Ended tokens are
+kept in the database until they would have expired, so a restart does not
+bring them back.
+
 `provider` is the key into `providers.json`. When omitted, the proxy picks it
 from the email domain of `username` (see [Provider selection](#provider-selection)),
 falling back to `DEFAULT_PROVIDER`. For OAuth providers, pass `accessToken`
 instead of `password` and the proxy will use `XOAUTH2`.
+
+Every field is a string: `username` (up to 512 characters), `password` or
+`accessToken`, an optional `provider` that must be a key of `providers.json`,
+and an optional `mech` (`PLAIN`, `LOGIN` or `XOAUTH2`). Any other body is
+answered `400`. A failed login is answered `401` without the mail server's
+reply, which goes to the log instead.
 
 ### HTTP Basic
 
@@ -255,11 +346,65 @@ The first request in a 5 minute window costs one IMAP probe; subsequent
 requests reuse the cached account. Useful for compliance suite runs and
 servers that already terminate auth at a reverse proxy.
 
+The cache is kept in memory and keyed by the decoded user name and password,
+so every spelling of one header shares an entry. A lapsed entry is kept for a
+day as a sign that a client re-validating it signed in before (see
+[Login limits](#login-limits)), then forgotten; the cache holds at most 10,000
+entries and drops the ones validated longest ago first.
+
+A `401` offers Basic (`WWW-Authenticate: Basic realm="legacy-proxy", Bearer`)
+only to callers that are not browsers. A request that carries an `Origin`
+header or any `Sec-Fetch-*` header (a page's fetch, or a browser opening the
+URL directly) is offered `Bearer` alone, so a browser never puts up its own
+password prompt for the proxy; a web client that sends Basic credentials in the
+`Authorization` header itself is still accepted.
+
 Basic auth carries no explicit provider, so the proxy selects one from the
 email domain of the username (see [Provider selection](#provider-selection)).
 This is what lets a JMAP client like the Bulwark webmail front several IMAP
 backends through one proxy without any client-side change: the user just types
 their email, and the domain routes them to the right provider.
+
+### Login limits
+
+Every login the proxy makes at the mail server for a caller without a session
+(`/api/login` and HTTP Basic) is checked first:
+
+- 10 failed logins for one user name from one client address within 15 minutes
+  hold further logins for that pair, and 50 failed logins from one address,
+  across user names, hold the address. A held login is answered `429` with
+  `Retry-After`, and nothing is sent to the mail server, the right password
+  included, until the oldest of those failures is 15 minutes old. A successful
+  login clears its pair's count.
+- Only a refusal of the credentials counts. A mail server that cannot be
+  reached, or answers "try again later", does not.
+- At most 20 such logins run at once; more wait up to 5 seconds and are then
+  answered `503`. A Basic client re-validating a login the proxy validated
+  before (every 5 minutes, when its cache entry lapses) uses 20 slots of its
+  own, so first logins from unknown callers cannot keep signed-in clients
+  waiting. One re-validation runs per user name and password at a time, and
+  requests with the same credentials from any address wait for it; one account
+  re-validates at most 3 logins at once, and a fourth is answered `503` with
+  `Retry-After`.
+- A held pair gets `429` for HTTP Basic even when the header is in the 5-minute
+  cache or a login for it is still running; the same header from another
+  address is a different pair and keeps working. A Basic client that shares an
+  address with someone who keeps failing (one NAT, one IPv6 /64, or everyone
+  behind a reverse proxy without `TRUST_PROXY`) is held with them.
+- Requests with a Bearer token are not limited, so a user with a session keeps
+  working while their login is held.
+- A request with a valid Gmail bridge password or sign-in token is never
+  limited and takes no login slot. Failed bridge lookups on the JMAP routes
+  have a budget of their own: the first 50 from one address within 15 minutes
+  are answered `401`, further ones `429` with `Retry-After` until the oldest is
+  15 minutes old. They never hold mail logins from that address, and a valid
+  bridge login is never held.
+
+The counters live in memory, are bounded in size and start from zero when the
+proxy restarts. IPv6 clients are counted per /64. The limits count by client
+address, so behind a reverse proxy set `TRUST_PROXY` (see
+[Configuration](#configuration)): without it every caller has the reverse
+proxy's address and all of them share one budget.
 
 ### Provider selection
 
@@ -428,7 +573,10 @@ Reissuing it immediately revokes the previous bridge password. Basic auth with
 that username/password or Bearer auth with the bridge password is supported;
 Google tokens stay on the server. Only passwords starting with `gmap_` select the
 Gmail API backend; any other password for the same address, such as an IMAP App
-Password, is handled by the regular IMAP backend. Removing the email from the
+Password, is handled by the regular IMAP backend. A credential that starts with
+`gmap_`, `gmat_` or `gmrt_` and is not a valid bridge login (a sign-in token sent
+as a Basic password, a refresh token sent as a Bearer token, a revoked one) is
+answered `401` and is never offered to an IMAP server, on `/api/login` neither. Removing the email from the
 allowlist and restarting also blocks access, including to cached data.
 
 Expose `/jmap`, `/jmap/*` and `/.well-known/jmap` alongside the OAuth routes at
@@ -673,7 +821,17 @@ Google setup references: [OAuth web flow](https://developers.google.com/identity
 The proxy only speaks plain HTTP. Put Caddy, Traefik, or nginx in front of it
 and set `PUBLIC_URL` to whatever URL clients see. The Session resource bakes
 URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
-`eventSourceUrl`, so a wrong value silently breaks every client.
+`eventSourceUrl`, so a wrong value silently breaks every client. Set
+`TRUST_PROXY` to the reverse proxy's address or network too (see
+[Configuration](#configuration)), so the [login limits](#login-limits) count by
+the client's address and not the reverse proxy's.
+
+With a reverse proxy in front, port 8080 should not be reachable from anywhere
+else: a caller that bypasses the reverse proxy skips its TLS. The compose files
+publish it on `127.0.0.1` only, which is enough for a reverse proxy on the same
+host; one in another container reaches the proxy over their shared Docker
+network and needs no published port at all. Publish it on all interfaces
+(`"8080:8080"`) only when nothing is in front.
 
 ## Configuration
 
@@ -687,15 +845,90 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `DEFAULT_PROVIDER`         | `generic`                          | provider key when `/api/login` omits one             |
 | `PROVIDERS_FILE`           | `/etc/legacy-proxy/providers.json` | provider catalogue                                   |
 | `LOG_LEVEL`                | `info`                             | pino level                                           |
-| `MAX_CONCURRENT_REQUESTS`  | `10`                               | advertised on `coreCapabilityProps`                  |
-| `MAX_OBJECTS_IN_GET`       | `500`                              | advertised on `coreCapabilityProps`                  |
-| `MAX_OBJECTS_IN_SET`       | `500`                              | advertised on `coreCapabilityProps`                  |
+| `MAX_CONCURRENT_REQUESTS`  | `10`                               | per account, advertised and enforced (see below)     |
+| `MAX_OBJECTS_IN_GET`       | `500`                              | advertised and enforced (see below)                  |
+| `MAX_OBJECTS_IN_SET`       | `500`                              | advertised and enforced (see below)                  |
 | `MAX_SIZE_UPLOAD`          | `50_000_000` (50 MB)               | upload endpoint body limit, advertised in caps       |
+| `MAX_UPLOAD_STORAGE_PER_ACCOUNT` | `100_000_000` (100 MB)       | pending uploads one account may have stored          |
 | `MAX_SIZE_REQUEST`         | `10_000_000` (10 MB)               | JMAP POST body limit, advertised in caps             |
 | `MAX_CALLS_IN_REQUEST`     | `64`                               | per-envelope method-call cap                         |
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks and plain `http` (IMAP backend) |
+| `TRUST_PROXY`              | unset                              | reverse proxy addresses or ranges; see below         |
+
+The limits the Session resource advertises are the ones the proxy enforces:
+
+- A `/get` with more `ids` than `MAX_OBJECTS_IN_GET` (counted after result
+  references are resolved; `SearchSnippet/get` counts `emailIds`, `Email/parse`
+  counts `blobIds`) and a `/set` whose `create`, `update` and `destroy` together
+  exceed `MAX_OBJECTS_IN_SET` (`Email/copy` counts `create`, `Email/import`
+  counts `emails`) are answered `requestTooLarge` before the method runs.
+  `ids: null` is left to the method.
+- A `POST /jmap` while the account already has `MAX_CONCURRENT_REQUESTS`
+  requests running is answered `400` with the `urn:ietf:params:jmap:error:limit`
+  problem and `"limit": "maxConcurrentRequests"`, before any method runs, so the
+  client can retry it.
+- Uploads: one account may have at most `MAX_UPLOAD_STORAGE_PER_ACCOUNT` bytes
+  of pending uploads stored (they expire after 24 hours). An upload past that is
+  answered `413` with the `urn:ietf:params:jmap:error:limit` problem and
+  `"limit": "maxUploadStoragePerAccount"`.
+- Event streams: at most 10 open per account. The eleventh closes the oldest.
+
+The Gmail backend advertises and enforces its own object limits (100 per get,
+20 per set).
+
+`TRUST_PROXY` names the reverse proxies whose `X-Forwarded-For` entries the
+proxy believes, as a comma-separated list of IP addresses and CIDR ranges. The
+[login limits](#login-limits) count by the client address this gives:
+
+- Unset, empty, `false`, `0`, `no` or `off`: the socket's address is the
+  client's. Behind a reverse proxy that is the proxy's address, so everyone
+  behind it shares one budget: ten wrong passwords from anyone hold that user
+  name for everyone, and 50 hold every login. Docker's userland proxy (Docker
+  Desktop, published IPv6 ports) hides client addresses the same way.
+- The reverse proxy's own address or network: a request that arrives from one
+  of them is counted by the address that proxy appended to `X-Forwarded-For`
+  (Caddy and Traefik do this by default, nginx with
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`). A request
+  from any other address is counted by its own address, whatever header it
+  sends.
+
+A reverse proxy on the same host, with the proxy listening on loopback
+(`LISTEN_HOST=127.0.0.1`, or the compose files' `127.0.0.1` port):
+
+```bash
+TRUST_PROXY=127.0.0.1,::1
+```
+
+A reverse proxy in front of the container: requests reach the container from
+its Docker network, whether the reverse proxy is another container on that
+network or runs on the host and uses the published port (Docker forwards those
+from the network's gateway). Trust that network's range, which
+`docker network inspect <network> --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'`
+prints (compose names the network after the folder: `legacy-proxy_default` in
+the quickstart):
+
+```bash
+TRUST_PROXY=172.18.0.0/16
+```
+
+A reverse proxy on another host: put that host's address in `TRUST_PROXY`, and
+publish port 8080 on the address that host reaches, not on all interfaces (for
+example `"10.0.0.5:8080:8080"` in the compose file, with `TRUST_PROXY=10.0.0.4`).
+
+Private, loopback and link-local ranges may be given whole (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `127.0.0.0/8`,
+`169.254.0.0/16`, `fc00::/7`, `fe80::/10`, `::1`). Ranges in public space may be
+at most a `/8` for IPv4 and a `/32` for IPv6; no reverse proxy's network is
+larger. Anything else stops the proxy at start with one line that says what to
+write instead: a hop count such as `1` (the proxy couldn't tell the reverse
+proxy from a caller that reaches port 8080 directly and writes its own header),
+`true` or `yes`, a wider public range, an IPv6 range that covers
+IPv4-mapped addresses (`::ffff:0:0/96`; write the IPv4 address or range
+itself), entries that together cover every address, a host name, or an empty
+entry. If you set `TRUST_PROXY=1` or `TRUST_PROXY=true` before, replace it with
+the reverse proxy's address or network when you upgrade.
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
@@ -704,6 +937,36 @@ methods will then either return empty results or, for vacation, reject with
 the underlying ManageSieve error. An optional `domains` array on a provider
 opts it into domain-based [provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
+
+### Encryption to the mail server
+
+Each `imap`, `smtp` and `sieve` entry in `providers.json` says how the proxy
+reaches that server:
+
+- `"secure": true`: implicit TLS from the first byte (IMAP 993, SMTP 465).
+- `"starttls": true`: a plain connection that must be upgraded with STARTTLS
+  before the proxy logs in. If the server does not offer STARTTLS, or the
+  upgrade fails, the connection is dropped and no credentials are sent.
+- neither: a plain connection, and the password crosses the network in clear.
+
+When `secure` is left out it means implicit TLS for IMAP, implicit TLS on port
+465 for SMTP, and plain for ManageSieve; with `"starttls": true` it means plain
+plus the required upgrade. `"secure": true` together with `"starttls": true` is
+a configuration error. For `carddav`, `"secure": true` means https; anything
+else means Basic auth over plain http.
+
+A plain connection is accepted only when the host is loopback (`localhost`,
+`127.0.0.0/8`, `::1`) or the entry says `"allowPlaintext": true`. The providers
+file is checked at start, and an entry that would send a password in clear stops
+the proxy with a message that names the provider and the service. An existing
+deployment with such an entry (IMAP on 143 with `"secure": false`, or SMTP on
+587 without `"starttls": true`, which used to upgrade only when the server
+offered it) has three ways out:
+
+1. implicit TLS: `"secure": true` on the server's TLS port;
+2. required STARTTLS: `"starttls": true`, with `"secure": false` or no `secure`;
+3. a plain connection on purpose: `"allowPlaintext": true`, for a server on a
+   network you trust.
 
 ## Tests
 

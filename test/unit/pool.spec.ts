@@ -36,6 +36,7 @@ vi.mock("../../src/imap/client.js", () => ({
     return c;
   }),
   withMailbox: vi.fn(),
+  isCredentialRefusal: (e: unknown) => (e as { authenticationFailed?: boolean } | null)?.authenticationFailed === true,
 }));
 
 vi.mock("../../src/auth/credentials.js", () => ({
@@ -48,12 +49,20 @@ vi.mock("../../src/auth/providers.js", () => ({
 }));
 
 const { ImapPool } = await import("../../src/imap/pool.js");
+const { openImap } = await import("../../src/imap/client.js");
+const { openCredentials } = await import("../../src/auth/credentials.js");
 import type { AccountRow, Store } from "../../src/state/store.js";
 import type { AppConfig } from "../../src/util/config.js";
 
-const account = { id: 1, slug: "test:u", kind: "test", vault: Buffer.alloc(0) } as AccountRow;
+const account = { id: 1, slug: "test:u", kind: "test", vault: Buffer.alloc(0), cred_gen: 0 } as AccountRow;
 const cfg = { vaultKey: Buffer.alloc(32) } as AppConfig;
-const store = {} as Store;
+// The pool reads the account's row as it is now before it dials.
+let rows: Record<number, AccountRow> = {};
+const store = {
+  getAccountById: (id: number) => rows[id] ?? { ...account, id },
+  noteCredentialRefusal: vi.fn(() => false),
+  noteCredentialSuccess: vi.fn(),
+} as unknown as Store;
 
 function makePool() {
   return new ImapPool(cfg, store);
@@ -64,6 +73,8 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(() => {
   opened.length = 0;
+  rows = {};
+  vi.mocked(store.noteCredentialRefusal).mockClear();
 });
 
 describe("ImapPool", () => {
@@ -190,6 +201,79 @@ describe("ImapPool", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("closes an account's idle connections when it retires them", async () => {
+    const pool = makePool();
+    const a = await pool.acquire(account, "interactive");
+    const b = await pool.acquire(account, "bulk");
+    a.release();
+    b.release();
+    pool.retire(account.id);
+    await settle();
+    expect(opened.map((c) => c.loggedOut)).toEqual([true, true]);
+
+    // The next borrower gets a fresh connection, not a retired one.
+    const c = await pool.acquire(account, "interactive");
+    expect(c.client).not.toBe(a.client);
+    expect(opened).toHaveLength(3);
+  });
+
+  it("closes a retired connection that was borrowed when its borrower gives it back", async () => {
+    const pool = makePool();
+    const held = await pool.acquire(account, "interactive");
+    pool.retire(account.id);
+    await settle();
+    expect((held.client as unknown as FakeClient).loggedOut).toBe(false);
+
+    held.release();
+    await settle();
+    expect((held.client as unknown as FakeClient).loggedOut).toBe(true);
+    const next = await pool.acquire(account, "interactive");
+    expect(next.client).not.toBe(held.client);
+  });
+
+  it("leaves other accounts' connections alone when one retires", async () => {
+    const pool = makePool();
+    const other = { ...account, id: 2, slug: "test:v" } as AccountRow;
+    const mine = await pool.acquire(account, "interactive");
+    const theirs = await pool.acquire(other, "interactive");
+    mine.release();
+    theirs.release();
+    pool.retire(account.id);
+    await settle();
+    expect((theirs.client as unknown as FakeClient).loggedOut).toBe(false);
+    expect((await pool.acquire(other, "interactive")).client).toBe(theirs.client);
+  });
+
+  it("does not dial once the account's stored credentials are marked refused", async () => {
+    rows[1] = { ...account, cred_refused: 1 } as AccountRow;
+    const pool = makePool();
+    await expect(pool.acquire(account, "interactive")).rejects.toThrow(/refused/);
+    expect(opened).toHaveLength(0);
+  });
+
+  it("counts a refusal of the stored credentials against the generation it used", async () => {
+    rows[1] = { ...account, cred_gen: 4 } as AccountRow;
+    const refusal = Object.assign(new Error("Command failed"), { authenticationFailed: true });
+    vi.mocked(openImap).mockRejectedValueOnce(refusal);
+    const pool = makePool();
+    await expect(pool.acquire(account, "interactive")).rejects.toBe(refusal);
+    expect(store.noteCredentialRefusal).toHaveBeenCalledWith(1, 4);
+  });
+
+  it("does not count a connection that failed for another reason", async () => {
+    vi.mocked(openImap).mockRejectedValueOnce(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+    const pool = makePool();
+    await expect(pool.acquire(account, "interactive")).rejects.toThrow(/ECONNREFUSED/);
+    expect(store.noteCredentialRefusal).not.toHaveBeenCalled();
+  });
+
+  it("dials with the credentials the row holds now, not the ones the request started with", async () => {
+    rows[1] = { ...account, vault: Buffer.from("current") } as AccountRow;
+    const pool = makePool();
+    await pool.acquire({ ...account, vault: Buffer.from("stale") } as AccountRow, "interactive");
+    expect(vi.mocked(openCredentials).mock.lastCall?.[1]).toEqual(Buffer.from("current"));
   });
 
   it("frees a parked caller when a held connection closes", async () => {

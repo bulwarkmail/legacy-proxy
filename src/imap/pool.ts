@@ -3,8 +3,8 @@ import type { Credentials } from "../auth/credentials.js";
 import type { AppConfig } from "../util/config.js";
 import { resolveProvider } from "../auth/providers.js";
 import { openCredentials } from "../auth/credentials.js";
-import { openImap } from "./client.js";
-import type { Store, AccountRow } from "../state/store.js";
+import { isCredentialRefusal, openImap } from "./client.js";
+import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
 
 interface PoolEntry {
@@ -14,6 +14,9 @@ interface PoolEntry {
   // per socket, so handing one connection to two concurrent callers would
   // queue them behind each other — exactly what the pool exists to avoid.
   busy: boolean;
+  // Logged in with credentials that are no longer the account's: closed as
+  // soon as its borrower gives it back.
+  retired?: boolean;
 }
 
 // Skip the sanity-NOOP if the connection was used within this window.
@@ -52,6 +55,12 @@ export class ImapPool {
   private entries = new Map<string, PoolEntry[]>();
   // Callers parked waiting for a connection to come free, per pool key.
   private waiters = new Map<string, Array<() => void>>();
+  // Connections being opened, per pool key.
+  private opening = new Map<string, number>();
+  // Accounts whose stored credentials opened a connection in this process,
+  // and the chain of dials for those that have not (see takeFree).
+  private verified = new Set<number>();
+  private dialLocks = new Map<number, Promise<void>>();
 
   constructor(
     private cfg: AppConfig,
@@ -82,8 +91,9 @@ export class ImapPool {
    */
   async acquire(account: AccountRow, role: PoolRole = "interactive"): Promise<Lease> {
     const key = `${account.id}:${role}`;
+    const requestedAt = Date.now();
     for (;;) {
-      const entry = await this.takeFree(account, key, role);
+      const entry = await this.takeFree(account, key, role, requestedAt);
       if (entry) return this.leaseFor(key, entry);
       // At the cap with everything busy: park until someone releases, then
       // re-run the whole selection (the freed entry may have died meanwhile).
@@ -93,12 +103,14 @@ export class ImapPool {
 
   /**
    * Claim a usable idle connection, or open one if the role is under its cap.
-   * Returns null when every slot is taken.
+   * Returns null when every slot is taken. `requestedAt` is when the request
+   * asked for the connection (see nextStoredAttemptAt).
    */
   private async takeFree(
     account: AccountRow,
     key: string,
     role: PoolRole,
+    requestedAt: number,
   ): Promise<PoolEntry | null> {
     const list = [...(this.entries.get(key) ?? [])];
     for (const entry of list) {
@@ -121,14 +133,69 @@ export class ImapPool {
       }
     }
 
-    if ((this.entries.get(key)?.length ?? 0) >= MAX_PER_ROLE[role]) return null;
+    // Connections still being opened count against the cap too.
+    const opening = this.opening.get(key) ?? 0;
+    if ((this.entries.get(key)?.length ?? 0) + opening >= MAX_PER_ROLE[role]) return null;
+    this.opening.set(key, opening + 1);
+    let unlock: (() => void) | null = null;
+    let opened = false;
+    try {
+      // Until the stored credentials have worked in this process, and again
+      // after the server refused them, the account's dials go one at a time:
+      // each one sees the refusals of the one before, so requests that arrive
+      // together cannot send more logins than the refused mark allows.
+      if (!this.verified.has(account.id)) unlock = await this.lockDials(account.id);
 
-    const provider = resolveProvider(this.cfg, account.kind);
-    const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
-    const client = await openImap({ provider, creds });
-    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
-    this.attach(account, key, entry);
-    return entry;
+      // Dial with the credentials the row holds now, not the ones the request
+      // started with, and not at all once the mail server refused them: the
+      // next successful login clears that mark.
+      const current = this.store.getAccountById(account.id);
+      if (!current || current.cred_refused) throw new Error("stored credentials refused by the mail server");
+      // After a refusal the next try waits its turn, except once for a request
+      // made after it (see nextStoredAttemptAt).
+      if (Date.now() < nextStoredAttemptAt(current, requestedAt)) {
+        throw new Error("stored credentials refused by the mail server; trying again later");
+      }
+      const provider = resolveProvider(this.cfg, current.kind);
+      const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
+      let client: ImapFlow;
+      try {
+        client = await openImap({ provider, creds });
+      } catch (e) {
+        if (isCredentialRefusal(e)) {
+          this.verified.delete(account.id);
+          this.store.noteCredentialRefusal(current.id, current.cred_gen);
+        }
+        throw e;
+      }
+      if (current.cred_refusals > 0) this.store.noteCredentialSuccess(current.id);
+      this.verified.add(account.id);
+      const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
+      this.attach(account, key, entry);
+      opened = true;
+      return entry;
+    } finally {
+      unlock?.();
+      const left = (this.opening.get(key) ?? 1) - 1;
+      if (left > 0) this.opening.set(key, left);
+      else this.opening.delete(key);
+      // A slot reserved for a dial that failed is free again.
+      if (!opened) this.wake(key);
+    }
+  }
+
+  /** Wait for the account's previous dial to finish; returns the release for this one. */
+  private async lockDials(accountId: number): Promise<() => void> {
+    const previous = this.dialLocks.get(accountId) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => (release = resolve));
+    const tail = previous.then(() => mine);
+    this.dialLocks.set(accountId, tail);
+    await previous;
+    return () => {
+      release();
+      if (this.dialLocks.get(accountId) === tail) this.dialLocks.delete(accountId);
+    };
   }
 
   private leaseFor(key: string, entry: PoolEntry): Lease {
@@ -143,6 +210,10 @@ export class ImapPool {
         // A caller that killed the socket (or found it dead) must not leave a
         // corpse in the pool for the next borrower to trip over.
         if (!entry.client.usable) this.drop(key, entry);
+        else if (entry.retired) {
+          this.drop(key, entry);
+          entry.client.logout().catch(() => {});
+        }
         this.wake(key);
       },
     };
@@ -177,6 +248,28 @@ export class ImapPool {
     }
     this.attach(account, key, { client, lastUsed: Date.now(), busy: false });
     this.wake(key);
+  }
+
+  /**
+   * Close every connection of the account: idle ones now, borrowed ones when
+   * they are given back. Called when the account's credentials change, so no
+   * connection logged in with the old ones keeps serving requests.
+   */
+  retire(accountId: number): void {
+    // The new credentials have not opened a connection yet.
+    this.verified.delete(accountId);
+    for (const role of Object.keys(MAX_PER_ROLE) as PoolRole[]) {
+      const key = `${accountId}:${role}`;
+      for (const entry of [...(this.entries.get(key) ?? [])]) {
+        if (entry.busy) {
+          entry.retired = true;
+          continue;
+        }
+        this.drop(key, entry);
+        entry.client.logout().catch(() => {});
+      }
+      this.wake(key);
+    }
   }
 
   private attach(account: AccountRow, key: string, entry: PoolEntry): void {

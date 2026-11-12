@@ -6,6 +6,8 @@ import type {
   RawReplyDefaultExpression,
 } from "fastify";
 import type { AppConfig } from "../util/config.js";
+import type { LoginLimiter } from "../auth/loginLimit.js";
+import { fromBrowser } from "../util/cors.js";
 import {
   CORE_CAPABILITY,
   EMAIL_PUSH_CAPABILITY,
@@ -15,7 +17,7 @@ import {
   submissionCapabilityProps,
   coreCapabilityProps,
 } from "../jmap/capabilities.js";
-import { dispatch, type RequestEnvelope } from "../jmap/router.js";
+import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "../jmap/router.js";
 import { JmapError } from "../jmap/errors.js";
 import type { GmailConfig } from "./config.js";
 import { GmailStore } from "./store.js";
@@ -23,6 +25,27 @@ import { GmailConnection } from "./connection.js";
 import { GmailApi } from "./api.js";
 import { GmailMail } from "./mail.js";
 import { GmailPush } from "./push.js";
+
+// The object limits the Gmail session advertises, and the dispatcher enforces.
+const GMAIL_MAX_OBJECTS_IN_GET = 100;
+const GMAIL_MAX_OBJECTS_IN_SET = 20;
+
+/**
+ * Bridge passwords (`gmap_`), sign-in tokens (`gmat_`) and refresh tokens
+ * (`gmrt_`), also with white space in front, as a pasted one may have.
+ */
+export function isBridgeSecret(secret: string | undefined): boolean {
+  return typeof secret === "string" && /^gm(?:ap|at|rt)_/.test(secret.trimStart());
+}
+
+/**
+ * The path pattern of the route the router matched. When no route matched,
+ * the raw path: such a request can only be answered here or with a 404, so no
+ * other backend serves it.
+ */
+function routedPath(req: { routeOptions?: { url?: string }; url: string }): string {
+  return req.routeOptions?.url ?? req.url.split("?")[0]!;
+}
 
 /** Select Gmail before the legacy handlers, without creating an IMAP account. */
 export function registerGmailBackend<L extends FastifyBaseLogger>(
@@ -49,6 +72,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       !!google.push,
       google.labelTags ?? true,
     ),
+  logins?: LoginLimiter,
 ): void {
   const accounts = new Map<string, GmailMail>();
   const account = (email: string) => {
@@ -118,7 +142,9 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     { email: string; mail: GmailMail; uploadType?: string }
   >();
   app.addHook("onRequest", async (req, reply) => {
-    const path = req.url.split("?")[0]!;
+    // The route the router matched, not the raw request line: the router
+    // decodes the path, so `/%6Amap` is served as `/jmap` and must be seen so.
+    const path = routedPath(req);
     if (path !== "/jmap" && !path.startsWith("/jmap/")) return;
     const auth = req.headers.authorization ?? "";
     let username: string | undefined,
@@ -131,18 +157,33 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         password = decoded.slice(colon + 1);
       }
     } else if (/^Bearer /i.test(auth)) password = auth.slice(7).trim();
-    // Only bridge passwords and bridge sign-in tokens select Gmail. Anything else, such as an IMAP app
-    // password for the same address, stays with the legacy backend.
+    // Only bridge secrets select Gmail. Anything else, such as an IMAP app password for the same
+    // address, stays with the legacy backend. A bridge secret that is not a valid bridge login (a
+    // sign-in token sent as a Basic password, a refresh token sent as a Bearer token, a wrong or
+    // revoked one) is answered here and never reaches the legacy backend's IMAP login.
+    if (!isBridgeSecret(password)) return;
     const signedIn = password.startsWith("gmat_") && !username;
-    if (!password.startsWith("gmap_") && !signedIn) return;
-    const email = signedIn ? store.authenticateToken(password) : store.authenticate(password, username);
+    let email: string | null = null;
+    if (signedIn) email = store.authenticateToken(password);
+    else if (password.startsWith("gmap_")) email = store.authenticate(password, username);
+    // A valid bridge login is served without the login limits. A failed lookup
+    // counts toward its address's budget for failed lookups, which is apart
+    // from the one for mail logins; past it, failures are answered 429.
+    if (!email) {
+      const held = logins?.noteFailedLookup(req.ip);
+      if (held && !held.ok) {
+        return reply.header("Retry-After", String(held.retryAfterSec)).code(429).send({ error: "too many failed logins" });
+      }
+    }
     if (
       !email ||
       !google.allowedEmails.has(email) ||
       !store.hasConnection(email)
     ) {
+      // Basic only for callers that are not browsers, so a browser never puts
+      // up its own password prompt for the bridge.
       return reply
-        .header("WWW-Authenticate", 'Basic realm="gmail-bridge"')
+        .header("WWW-Authenticate", fromBrowser(req.headers) ? 'Bearer realm="gmail-bridge"' : 'Basic realm="gmail-bridge"')
         .code(401)
         .send({ error: "unauthorized" });
     }
@@ -164,7 +205,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     const selected = authenticated.get(req);
     if (!selected) return;
     const { email, mail } = selected;
-    const path = req.url.split("?")[0]!;
+    const path = routedPath(req);
     const writable = await mail.writable();
     const canCompose = await mail.canCompose();
     const submissionProps = google.schedule
@@ -196,8 +237,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         capabilities: {
           [CORE_CAPABILITY]: {
             ...coreCapabilityProps(cfg),
-            maxObjectsInGet: 100,
-            maxObjectsInSet: 20,
+            maxObjectsInGet: GMAIL_MAX_OBJECTS_IN_GET,
+            maxObjectsInSet: GMAIL_MAX_OBJECTS_IN_SET,
             maxSizeUpload: 25_000_000,
           },
           [MAIL_CAPABILITY]: {},
@@ -273,24 +314,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       return;
     }
     if (req.method === "POST" && path === "/jmap") {
-      const env = req.body as RequestEnvelope;
-      if (
-        !env ||
-        !Array.isArray(env.using) ||
-        !Array.isArray(env.methodCalls) ||
-        env.methodCalls.some(
-          (c) =>
-            !Array.isArray(c) ||
-            c.length !== 3 ||
-            typeof c[0] !== "string" ||
-            !c[1] ||
-            typeof c[1] !== "object" ||
-            Array.isArray(c[1]) ||
-            typeof c[2] !== "string",
-        )
-      ) {
-        return reply.code(400).send({ error: "malformed JMAP request" });
-      }
+      const env = req.body;
+      if (!isRequestEnvelope(env)) return reply.code(400).send(NOT_REQUEST_PROBLEM);
       if (
         env.using.some(
           (c) =>
@@ -319,6 +344,8 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
         await dispatch(env, {
           methods: mail.methods(),
           maxCallsInRequest: cfg.limits.maxCallsInRequest,
+          maxObjectsInGet: GMAIL_MAX_OBJECTS_IN_GET,
+          maxObjectsInSet: GMAIL_MAX_OBJECTS_IN_SET,
           sessionState,
         }),
       );

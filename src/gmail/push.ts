@@ -266,6 +266,11 @@ export class GmailPush {
       username: email,
       vault: Buffer.alloc(0),
       created_at: 0,
+      cred_gen: 0,
+      cred_refused: 0,
+      cred_refusals: 0,
+      cred_first_refusal: 0,
+      cred_rotated_by: null,
     };
   }
 }

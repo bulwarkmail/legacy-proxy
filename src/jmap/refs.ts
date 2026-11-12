@@ -66,6 +66,10 @@ function resolveArgsInner(
       const real = createdIds.get(k.slice(1));
       if (real !== undefined) outKey = real;
     }
+    // Assigning `__proto__` on a plain object replaces its prototype instead
+    // of adding a property, and no JMAP object has such a property: skip it,
+    // whether it arrives as a key, a result reference or a creation id.
+    if (outKey === "__proto__" || (topLevel && k === "#__proto__")) continue;
     if (topLevel && k.startsWith("#")) {
       const ref = v as ResultRef;
       const r = prior[ref.resultOf];
@@ -141,11 +145,13 @@ function walk(here: Json, parts: string[], i: number): Json {
     }
     return out;
   }
+  // Only an array's elements and an object's own properties: never what they
+  // inherit (`__proto__`, `constructor`).
   if (Array.isArray(here)) {
-    return walk(here[Number(seg)], parts, i + 1);
+    return /^\d+$/.test(seg) ? walk(here[Number(seg)], parts, i + 1) : undefined;
   }
   if (here && typeof here === "object") {
-    return walk((here as Record<string, Json>)[seg], parts, i + 1);
+    return Object.hasOwn(here, seg) ? walk((here as Record<string, Json>)[seg], parts, i + 1) : undefined;
   }
   return undefined;
 }

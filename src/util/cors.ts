@@ -15,3 +15,14 @@ export const corsOptions: FastifyCorsOptions = {
   origin: true,
   maxAge: CORS_MAX_AGE,
 };
+
+/**
+ * True for a request a browser made: one with an Origin header (a page's
+ * fetch or XHR) or a Sec-Fetch-* header (every request of a current browser,
+ * a top-level navigation included). Such a request is offered Bearer only in
+ * a 401, so the browser never shows its own password prompt.
+ */
+export function fromBrowser(headers: Record<string, string | string[] | undefined>): boolean {
+  if (headers["origin"] !== undefined) return true;
+  return Object.keys(headers).some((name) => name.toLowerCase().startsWith("sec-fetch-"));
+}

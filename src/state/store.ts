@@ -10,6 +10,78 @@ export interface AccountRow {
   username: string;
   vault: Buffer;
   created_at: number;
+  /**
+   * Credential generation. It moves when a login stores a different password
+   * for the account, and when the mail server refuses the stored one; session
+   * tokens carry the generation they were issued under and stop working once
+   * it has moved on.
+   */
+  cred_gen: number;
+  /**
+   * 1 once the mail server refused the stored credentials: nothing logs in
+   * with them again until a login succeeds. Survives restarts.
+   */
+  cred_refused: number;
+  /** Refusals of the stored credentials in a row, while not yet marked refused. */
+  cred_refusals: number;
+  /** When the first of those refusals came (epoch ms), 0 when there are none. */
+  cred_first_refusal: number;
+  /**
+   * The credential tag of the sign-in that moved the generation last, when a
+   * sign-in did: sessions made with those credentials stay valid under the new
+   * generation. Null otherwise.
+   */
+  cred_rotated_by: string | null;
+  /**
+   * A check of the stored credentials that has no answer yet (see
+   * `openCredentialCheck`): the credentials it checks, the ones held before a
+   * sign-in with other credentials. Null when no check is open. The fields of
+   * the check are optional so rows made up outside the database need none.
+   */
+  cred_check_vault?: Buffer | null;
+  /** The credential tag of the sign-in that opened the check; its credentials are in `vault` meanwhile. */
+  cred_check_tag?: string | null;
+  /** When the check opened (epoch ms); identifies it. */
+  cred_check_since?: number;
+  /** Attempts the check made at the mail server so far. */
+  cred_check_attempts?: number;
+  /** When its last attempt started (epoch ms), 0 before the first. */
+  cred_check_last?: number;
+}
+
+/** Refusals of the stored credentials in a row before they are marked refused. */
+export const STORED_CREDENTIAL_ATTEMPTS = 3;
+/**
+ * The least time those refusals must span. A server that refuses logins for a
+ * moment (a restart, a store hiccup it reports as a refusal) does not mark
+ * anyone; a password that was really changed ends the sessions within this
+ * time, or at once when the owner signs in with the new one.
+ */
+export const STORED_CREDENTIAL_SPREAD_MS = 5 * 60_000;
+
+/**
+ * When the stored credentials may be tried again after a refusal (epoch ms;
+ * 0 when they have none pending). The attempts are spaced evenly over
+ * STORED_CREDENTIAL_SPREAD_MS, so the last one that may set the mark comes no
+ * earlier than that after the first.
+ *
+ * `requestedAt`: when a user's request that needs a connection started. After
+ * a single refusal, such a request made after it may try once right away (the
+ * refusal may have been a moment's hiccup); the attempt after that still waits
+ * for the end of the spread, so there are never more than three in it.
+ * Requests that were already waiting when the refusal came, and the IDLE
+ * worker, keep the spacing.
+ */
+export function nextStoredAttemptAt(
+  row: Pick<AccountRow, "cred_refusals" | "cred_first_refusal">,
+  requestedAt?: number,
+): number {
+  if (!row.cred_refusals) return 0;
+  if (row.cred_refusals === 1 && requestedAt !== undefined && requestedAt > row.cred_first_refusal) {
+    return row.cred_first_refusal;
+  }
+  const spacing = STORED_CREDENTIAL_SPREAD_MS / (STORED_CREDENTIAL_ATTEMPTS - 1);
+  return row.cred_first_refusal + row.cred_refusals * spacing;
 }
 
 export interface MailboxRow {
@@ -175,7 +247,33 @@ CREATE TABLE IF NOT EXISTS push_subscription (
   last_push_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS push_sub_account_idx ON push_subscription(account_id);
+
+-- Session tokens their holder ended with /api/logout, by SHA-256 of the token,
+-- kept until the token would have expired anyway.
+CREATE TABLE IF NOT EXISTS ended_session (
+  token_hash TEXT    PRIMARY KEY,
+  expires    INTEGER NOT NULL
+);
 `;
+
+// Columns added to tables that existing databases already have.
+const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
+  { table: "account", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_refused", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_refusals", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_rotated_by", definition: "TEXT" },
+  { table: "account", column: "cred_first_refusal", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "push_subscription", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_check_vault", definition: "BLOB" },
+  { table: "account", column: "cred_check_tag", definition: "TEXT" },
+  { table: "account", column: "cred_check_since", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_check_attempts", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_check_last", definition: "INTEGER NOT NULL DEFAULT 0" },
+];
+
+// Clears an open check of the stored credentials, inside an UPDATE's SET list.
+const NO_CHECK =
+  "cred_check_vault = NULL, cred_check_tag = NULL, cred_check_since = 0, cred_check_attempts = 0, cred_check_last = 0";
 
 export class Store {
   readonly db: DB;
@@ -193,6 +291,12 @@ export class Store {
   constructor(dataDir: string) {
     this.db = new Database(path.join(dataDir, "proxy.db"));
     this.db.exec(SCHEMA);
+    for (const { table, column, definition } of ADDED_COLUMNS) {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      if (!columns.some((c) => c.name === column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      }
+    }
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */
@@ -209,16 +313,153 @@ export class Store {
     this.db.close();
   }
 
-  upsertAccount(p: { slug: string; kind: string; host: string; username: string; vault: Buffer }): AccountRow {
+  /**
+   * Store the credentials a successful login proved, which clears a refused
+   * mark. `rotate` says they replaced what the row held: the credential
+   * generation then moves, which ends every session issued under the previous
+   * one except those made with the new credentials (tag `rotatedBy`), and the
+   * push subscriptions made under it except those made since `keepSince`.
+   */
+  upsertAccount(p: {
+    slug: string;
+    kind: string;
+    host: string;
+    username: string;
+    vault: Buffer;
+    rotate?: boolean;
+    rotatedBy?: string | null;
+    keepSince?: number;
+  }): AccountRow {
     const now = Date.now();
+    const before = this.getAccount(p.slug);
     const stmt = this.prep(
       `INSERT INTO account(slug, kind, host, username, vault, created_at)
        VALUES(?,?,?,?,?,?)
        ON CONFLICT(slug) DO UPDATE SET kind=excluded.kind, host=excluded.host,
-         username=excluded.username, vault=excluded.vault`,
+         username=excluded.username, vault=excluded.vault,
+         cred_gen = cred_gen + ?, cred_refused = 0, cred_refusals = 0, cred_first_refusal = 0,
+         cred_rotated_by = CASE WHEN ? THEN ? ELSE cred_rotated_by END`,
     );
-    stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now);
-    return this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
+    const rotate = p.rotate ? 1 : 0;
+    stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, rotate, rotate, p.rotatedBy ?? null);
+    // Replaced credentials have nothing left to check.
+    if (rotate) this.prep(`UPDATE account SET ${NO_CHECK} WHERE slug = ?`).run(p.slug);
+    const row = this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
+    if (before && before.cred_gen !== row.cred_gen) this.endOldSubscriptions(row.id, row.cred_gen, p.keepSince);
+    if (before && (before.cred_gen !== row.cred_gen || before.cred_refused)) this.credentialListener?.(row.id);
+    return row;
+  }
+
+  /**
+   * The mail server refused the stored credentials of generation `gen`. After
+   * {@link STORED_CREDENTIAL_ATTEMPTS} refusals in a row that span at least
+   * {@link STORED_CREDENTIAL_SPREAD_MS} they are marked refused and the
+   * generation moves. Returns true when the account is marked. A refusal of
+   * credentials the row no longer holds is not counted.
+   */
+  noteCredentialRefusal(accountId: number, gen: number, now = Date.now()): boolean {
+    this.prep(
+      `UPDATE account SET cred_refusals = cred_refusals + 1,
+         cred_first_refusal = CASE WHEN cred_refusals = 0 THEN ? ELSE cred_first_refusal END
+       WHERE id = ? AND cred_gen = ? AND cred_refused = 0`,
+    ).run(now, accountId, gen);
+    const row = this.getAccountById(accountId);
+    if (!row) return true;
+    if (row.cred_refused) return true;
+    if (row.cred_refusals < STORED_CREDENTIAL_ATTEMPTS) return false;
+    if (now - row.cred_first_refusal < STORED_CREDENTIAL_SPREAD_MS) return false;
+    this.prep(
+      `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_first_refusal = 0,
+         cred_gen = cred_gen + 1, cred_rotated_by = NULL, ${NO_CHECK}
+       WHERE id = ?`,
+    ).run(accountId);
+    this.endOldSubscriptions(accountId, row.cred_gen + 1);
+    this.credentialListener?.(accountId);
+    return true;
+  }
+
+  /** The stored credentials just worked: refusals so far were not in a row. */
+  noteCredentialSuccess(accountId: number): void {
+    this.prep(`UPDATE account SET cred_refusals = 0, cred_first_refusal = 0 WHERE id = ? AND cred_refusals > 0`).run(
+      accountId,
+    );
+  }
+
+  /**
+   * A sign-in succeeded with credentials (`vault`, tag `tag`) other than the
+   * stored ones: open a check of the stored ones. Until it has an answer the
+   * row holds the new credentials, so everything the proxy opens for the
+   * account meanwhile logs in with credentials the server just accepted, and
+   * keeps the stored ones in `cred_check_vault`. The generation does not move.
+   * Returns the row, or undefined when a check is open already.
+   */
+  openCredentialCheck(accountId: number, p: { vault: Buffer; tag: string; since: number }): AccountRow | undefined {
+    // SQLite evaluates every SET expression on the row as it was, so the
+    // stored vault moves to cred_check_vault as the new one takes its place.
+    const changed = this.prep(
+      `UPDATE account SET cred_check_vault = vault, vault = ?, cred_check_tag = ?, cred_check_since = ?,
+         cred_check_attempts = 0, cred_check_last = 0
+       WHERE id = ? AND cred_check_tag IS NULL AND cred_refused = 0`,
+    ).run(p.vault, p.tag, p.since, accountId).changes;
+    return changed ? this.getAccountById(accountId) : undefined;
+  }
+
+  /** Count an attempt of the check opened at `since` (epoch ms) that starts `at`. */
+  noteCheckAttempt(accountId: number, since: number, at = Date.now()): void {
+    this.prep(
+      `UPDATE account SET cred_check_attempts = cred_check_attempts + 1, cred_check_last = ?
+       WHERE id = ? AND cred_check_tag IS NOT NULL AND cred_check_since = ?`,
+    ).run(at, accountId, since);
+  }
+
+  /**
+   * The answer to the check opened at `since`. "accepted": the server still
+   * takes the stored credentials, so both are valid; they go back in place
+   * and nothing moves. "refused": the new credentials replaced them; the
+   * generation moves, sessions made with the new credentials (the check's tag)
+   * stay valid, and so do the push subscriptions made since the check opened,
+   * because only those sessions were served meanwhile. Returns the row, or
+   * undefined when that check is no longer open.
+   */
+  answerCredentialCheck(accountId: number, since: number, answer: "accepted" | "refused"): AccountRow | undefined {
+    const sql =
+      answer === "accepted"
+        ? `UPDATE account SET vault = cred_check_vault, cred_refusals = 0, cred_first_refusal = 0, ${NO_CHECK}
+           WHERE id = ? AND cred_check_tag IS NOT NULL AND cred_check_vault IS NOT NULL AND cred_check_since = ?`
+        : `UPDATE account SET cred_gen = cred_gen + 1, cred_rotated_by = cred_check_tag,
+             cred_refused = 0, cred_refusals = 0, cred_first_refusal = 0, ${NO_CHECK}
+           WHERE id = ? AND cred_check_tag IS NOT NULL AND cred_check_since = ?`;
+    if (!this.prep(sql).run(accountId, since).changes) return undefined;
+    const row = this.getAccountById(accountId);
+    if (row && answer === "refused") {
+      this.endOldSubscriptions(row.id, row.cred_gen, since);
+      this.credentialListener?.(row.id);
+    }
+    return row;
+  }
+
+  /** Accounts with a check of their stored credentials still open, to resume after a restart. */
+  accountsWithOpenCheck(): AccountRow[] {
+    return this.prep(`SELECT * FROM account WHERE cred_check_tag IS NOT NULL`).all() as AccountRow[];
+  }
+
+  // Told when an account's credential generation moved or its refused mark
+  // was cleared, so the server can close what was opened under the old
+  // credentials (pooled connections, cached Basic logins) and start the IDLE
+  // worker over.
+  setCredentialListener(fn: ((accountId: number) => void) | undefined): void {
+    this.credentialListener = fn;
+  }
+  private credentialListener?: (accountId: number) => void;
+
+  /** Remember that a session token was ended, until it would have expired. */
+  endSession(tokenHash: string, expiresMs: number): void {
+    this.prep(`DELETE FROM ended_session WHERE expires <= ?`).run(Date.now());
+    this.prep(`INSERT OR REPLACE INTO ended_session(token_hash, expires) VALUES(?,?)`).run(tokenHash, expiresMs);
+  }
+
+  isSessionEnded(tokenHash: string): boolean {
+    return this.prep(`SELECT 1 FROM ended_session WHERE token_hash = ?`).get(tokenHash) !== undefined;
   }
 
   getAccount(slug: string): AccountRow | undefined {
@@ -404,6 +645,13 @@ export class Store {
       .run(p.id, p.accountId, p.ctype, p.body.length, p.body, Date.now());
   }
 
+  /** Bytes of uploads the account has stored now. */
+  uploadBytes(accountId: number): number {
+    return (
+      this.prep(`SELECT COALESCE(SUM(size), 0) AS n FROM upload WHERE account_id = ?`).get(accountId) as { n: number }
+    ).n;
+  }
+
   getUpload(id: string, accountId: number): { ctype: string; body: Buffer } | null {
     const row = this.prep(`SELECT ctype, body FROM upload WHERE id = ? AND account_id = ?`)
       .get(id, accountId) as { ctype: string; body: Buffer } | undefined;
@@ -442,12 +690,14 @@ export class Store {
     return new Map(rows.map((r) => [r.mailbox_id, r.sort_order]));
   }
 
+  // A subscription belongs to the account's credential generation when it is
+  // made, and ends when that generation moves (see endOldSubscriptions).
   insertPushSubscription(row: PushSubscriptionRow): void {
     this.prep(
         `INSERT INTO push_subscription(
            id, account_id, device_client_id, url, types,
-           expires, verification_code, verified, created_at, last_push_at
-         ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+           expires, verification_code, verified, created_at, last_push_at, cred_gen
+         ) VALUES(?,?,?,?,?,?,?,?,?,?, COALESCE((SELECT cred_gen FROM account WHERE id = ?), 0))`,
       )
       .run(
         row.id,
@@ -460,7 +710,22 @@ export class Store {
         row.verified ? 1 : 0,
         row.createdAt,
         row.lastPushAt ?? null,
+        row.accountId,
       );
+  }
+
+  /**
+   * The account's credential generation moved to `gen`: its push
+   * subscriptions made under an older one end. Those made since `keepSince`
+   * (epoch ms) belong to the sign-in that moved it and move along.
+   */
+  private endOldSubscriptions(accountId: number, gen: number, keepSince?: number): void {
+    if (keepSince !== undefined) {
+      this.prep(
+        `UPDATE push_subscription SET cred_gen = ? WHERE account_id = ? AND cred_gen = ? AND created_at >= ?`,
+      ).run(gen, accountId, gen - 1, keepSince);
+    }
+    this.prep(`DELETE FROM push_subscription WHERE account_id = ? AND cred_gen < ?`).run(accountId, gen);
   }
 
   getPushSubscription(id: string, accountId: number): PushSubscriptionRow | null {
@@ -478,13 +743,18 @@ export class Store {
   // Returns subs that should currently be receiving StateChange POSTs:
   // verified, not expired, with a non-empty types filter. The dispatcher uses
   // this on every fan-out so a freshly destroyed/expired sub stops receiving
-  // mid-flight without needing an explicit cache invalidation.
+  // mid-flight without needing an explicit cache invalidation. While a check
+  // of the stored credentials is open, subscriptions made before it get
+  // nothing: they belong to sessions the check holds. They deliver again when
+  // it ends "accepted" and are deleted when it ends "refused".
   activePushSubscriptions(accountId: number): PushSubscriptionRow[] {
     const now = Date.now();
     const rows = this.prep(
-        `SELECT * FROM push_subscription
-         WHERE account_id = ? AND verified = 1
-         AND (expires IS NULL OR expires > ?)`,
+        `SELECT p.* FROM push_subscription p
+         JOIN account a ON a.id = p.account_id
+         WHERE p.account_id = ? AND p.verified = 1
+         AND (p.expires IS NULL OR p.expires > ?)
+         AND (a.cred_check_tag IS NULL OR p.created_at >= a.cred_check_since)`,
       )
       .all(accountId, now) as PushRowRaw[];
     return rows.map(rowToPushSub);
@@ -492,12 +762,14 @@ export class Store {
 
   // Distinct list of accounts that need an IDLE worker right now. Used by the
   // PushIdleManager on startup and after every PushSubscription/set mutation
-  // to recompute who needs a connection held open.
+  // to recompute who needs a connection held open. An account whose stored
+  // credentials the mail server refused gets none until a login succeeds.
   accountsWithActivePushSubs(): number[] {
     const now = Date.now();
     const rows = this.prep(
-        `SELECT DISTINCT account_id FROM push_subscription
-         WHERE verified = 1 AND (expires IS NULL OR expires > ?)`,
+        `SELECT DISTINCT p.account_id FROM push_subscription p
+         JOIN account a ON a.id = p.account_id
+         WHERE p.verified = 1 AND (p.expires IS NULL OR p.expires > ?) AND a.cred_refused = 0`,
       )
       .all(now) as { account_id: number }[];
     return rows.map((r) => r.account_id);

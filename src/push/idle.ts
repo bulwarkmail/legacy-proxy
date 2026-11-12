@@ -15,8 +15,8 @@ import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
 import { openCredentials } from "../auth/credentials.js";
 import { resolveProvider } from "../auth/providers.js";
-import { openImap } from "../imap/client.js";
-import type { Store, AccountRow } from "../state/store.js";
+import { isCredentialRefusal, openImap } from "../imap/client.js";
+import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
@@ -75,6 +75,14 @@ export class PushIdleManager {
     void this.sync();
   };
 
+  // The account's stored credentials changed, or a login cleared their refused
+  // mark: a worker logged in with the old ones starts over with the new ones,
+  // and an account whose worker had stopped gets one again.
+  onCredentialsChanged = (accountId: number): void => {
+    const worker = this.workers.get(accountId);
+    void (worker ? this.stop(accountId, worker) : Promise.resolve()).then(() => this.sync());
+  };
+
   async closeAll(): Promise<void> {
     for (const [accountId, worker] of this.workers) {
       await this.stop(accountId, worker);
@@ -94,8 +102,21 @@ export class PushIdleManager {
     this.workers.set(accountId, worker);
     this.connect(account, worker).catch((err) => {
       log.warn({ accountId, err: (err as Error).message }, "idle: initial connect failed");
-      this.scheduleReconnect(account, worker);
+      this.afterFailure(account, worker, err);
     });
+  }
+
+  // A refusal of the stored credentials counts towards the account's refused
+  // mark; once it is set the worker stops for good, and only a successful
+  // login (which clears the mark) brings it back. Anything else is retried
+  // with backoff.
+  private afterFailure(account: AccountRow, worker: Worker, err: unknown): void {
+    if (err instanceof StoredCredentialsRefused) {
+      log.warn({ accountId: account.id }, "idle: stored credentials refused; stopped until the next successful login");
+      void this.stop(account.id, worker);
+      return;
+    }
+    this.scheduleReconnect(account, worker);
   }
 
   private async stop(accountId: number, worker: Worker): Promise<void> {
@@ -110,14 +131,30 @@ export class PushIdleManager {
       }
       worker.client = null;
     }
-    this.workers.delete(accountId);
+    // A replacement may have started meanwhile; leave it in place.
+    if (this.workers.get(accountId) === worker) this.workers.delete(accountId);
   }
 
   private async connect(account: AccountRow, worker: Worker): Promise<void> {
     if (worker.closing) return;
-    const provider = resolveProvider(this.cfg, account.kind);
-    const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
-    const client = await openImap({ provider, creds });
+    // The row as it is now: the credentials may have changed, or been refused,
+    // since the worker started.
+    const current = this.store.getAccountById(account.id);
+    if (!current || current.cred_refused) throw new StoredCredentialsRefused();
+    // After a refusal the next try waits its turn; scheduleReconnect waits for it.
+    if (Date.now() < nextStoredAttemptAt(current)) throw new Error("stored credentials refused; trying again later");
+    const provider = resolveProvider(this.cfg, current.kind);
+    const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
+    let client: ImapFlow;
+    try {
+      client = await openImap({ provider, creds });
+    } catch (err) {
+      if (isCredentialRefusal(err) && this.store.noteCredentialRefusal(current.id, current.cred_gen)) {
+        throw new StoredCredentialsRefused();
+      }
+      throw err;
+    }
+    if (current.cred_refusals > 0) this.store.noteCredentialSuccess(current.id);
 
     // imapflow's `'exists'` event tells us the post-mutation count + the
     // previous count. A higher count is a true new arrival; equal/lower
@@ -195,15 +232,25 @@ export class PushIdleManager {
   private scheduleReconnect(account: AccountRow, worker: Worker): void {
     if (worker.closing) return;
     if (worker.reconnectTimer) clearTimeout(worker.reconnectTimer);
-    const delay = worker.backoffMs;
+    // Not before the stored credentials may be tried again after a refusal.
+    const row = this.store.getAccountById(account.id);
+    const resting = row ? nextStoredAttemptAt(row) - Date.now() : 0;
+    const delay = Math.max(worker.backoffMs, resting);
     worker.backoffMs = Math.min(worker.backoffMs * 2, RECONNECT_MAX_MS);
     log.info({ accountId: account.id, delayMs: delay }, "idle: scheduling reconnect");
     worker.reconnectTimer = setTimeout(() => {
       worker.reconnectTimer = null;
       this.connect(account, worker).catch((err) => {
         log.warn({ accountId: account.id, err: (err as Error).message }, "idle: reconnect failed");
-        this.scheduleReconnect(account, worker);
+        this.afterFailure(account, worker, err);
       });
     }, delay);
+  }
+}
+
+/** The account's stored credentials are marked refused: no further login with them. */
+class StoredCredentialsRefused extends Error {
+  constructor() {
+    super("stored credentials refused by the mail server");
   }
 }

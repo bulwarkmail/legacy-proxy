@@ -21,3 +21,22 @@ it("lets the browser reuse a preflight instead of sending one before every JMAP 
   expect(reply.headers["access-control-max-age"]).toBe(String(CORS_MAX_AGE));
   await app.close();
 });
+
+it("does not allow credentialed cross-origin requests, the event stream's preflight included", async () => {
+  const app = Fastify();
+  await app.register(cors, corsOptions);
+  app.get("/jmap/eventsource", async () => ({}));
+  const reply = await app.inject({
+    method: "OPTIONS",
+    url: "/jmap/eventsource?types=*&closeafter=no&ping=30",
+    headers: {
+      origin: "https://other.example",
+      "access-control-request-method": "GET",
+      "access-control-request-headers": "authorization",
+    },
+  });
+  expect(reply.statusCode).toBe(204);
+  expect(reply.headers["access-control-allow-origin"]).toBe("https://other.example");
+  expect(reply.headers["access-control-allow-credentials"]).toBeUndefined();
+  await app.close();
+});
