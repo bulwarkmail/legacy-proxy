@@ -129,7 +129,7 @@ describe("a sealed value copied into another row", () => {
     const annas = (db.prepare("SELECT body FROM gmail_upload WHERE email=? AND id=?").get(ANNA, annasId) as { body: Buffer }).body;
     db.prepare("UPDATE gmail_upload SET body=? WHERE email=? AND id=?").run(annas, BEN, bensId);
 
-    expect(store.uploaded(BEN, bensId)?.body.toString()).not.toBe("Anna's attachment");
+    expect(store.uploaded(BEN, bensId)?.body.toString("latin1") ?? "").not.toContain("Anna's attachment");
     expect(store.uploaded(ANNA, annasId)?.body.toString()).toBe("Anna's attachment");
   });
 
@@ -238,6 +238,19 @@ describe("values sealed before places were bound", () => {
       vault: sealTheOldWay(key, Buffer.from(JSON.stringify({ mech: "PLAIN", username: "anna@corp.test", password: "fake-password" }))),
     });
     expect((await openAccountCredentials(key, proxy.getAccount(slug)!)).password).toBe("fake-password");
+  });
+
+  it("leave the upload table in the shape an earlier version writes to, so a rollback can still store uploads", async () => {
+    const dir = tempDir();
+    const key = crypto.randomBytes(32);
+    const store = gmailStore(dir, key);
+    await connect(store, ANNA);
+    const id = store.upload(ANNA, Buffer.from("written by this version"), "text/plain");
+    const db = rawDb(dir);
+    // The earlier version's insert names no columns.
+    db.prepare("INSERT INTO gmail_upload VALUES(?,?,?,?,?)").run(ANNA, "gu_rolled_back", Buffer.from("written after a rollback"), "text/plain", Date.now() + 3600_000);
+    expect(store.uploaded(ANNA, "gu_rolled_back")?.body.toString()).toBe("written after a rollback");
+    expect(store.uploaded(ANNA, id)?.body.toString()).toBe("written by this version");
   });
 });
 

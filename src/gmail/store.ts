@@ -53,7 +53,7 @@ export class GmailStore {
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS gmail_cursor (email TEXT PRIMARY KEY, history TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_mailbox_snapshot (email TEXT NOT NULL,state TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(email,state));
-      CREATE TABLE IF NOT EXISTS gmail_upload (email TEXT NOT NULL,id TEXT NOT NULL,body BLOB NOT NULL,type TEXT NOT NULL,expires INTEGER NOT NULL,sealed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(email,id));
+      CREATE TABLE IF NOT EXISTS gmail_upload (email TEXT NOT NULL,id TEXT NOT NULL,body BLOB NOT NULL,type TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(email,id));
       CREATE TABLE IF NOT EXISTS gmail_draft (email TEXT NOT NULL,original TEXT NOT NULL,current TEXT NOT NULL,draft TEXT NOT NULL,PRIMARY KEY(email,original));
       CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
       CREATE TABLE IF NOT EXISTS gmail_submission (email TEXT NOT NULL,original TEXT NOT NULL,id TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT,PRIMARY KEY(email,original));
@@ -109,12 +109,6 @@ export class GmailStore {
       .all() as { name: string }[];
     if (!passwordColumns.some((c) => c.name === "issued_at"))
       this.db.exec("ALTER TABLE gmail_password ADD COLUMN issued_at INTEGER NOT NULL DEFAULT 0");
-    // Uploads stored before uploads were sealed are marked as not sealed.
-    const uploadColumns = this.db
-      .prepare("PRAGMA table_info(gmail_upload)")
-      .all() as { name: string }[];
-    if (!uploadColumns.some((c) => c.name === "sealed"))
-      this.db.exec("ALTER TABLE gmail_upload ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0");
     // Every token belongs to a sign-in (its family: the hash of the sign-in's
     // first refresh token) made at family_since. A refresh token issued before
     // sign-ins were recorded is a sign-in of its own, dated now, with the
@@ -570,7 +564,7 @@ export class GmailStore {
         throw new Error("Upload quota exceeded");
       // Uploads are mail being written: sealed like the cache.
       this.db
-        .prepare("INSERT INTO gmail_upload(email,id,body,type,expires,sealed) VALUES(?,?,?,?,?,1)")
+        .prepare("INSERT INTO gmail_upload(email,id,body,type,expires) VALUES(?,?,?,?,?)")
         .run(email, id, seal(this.vaultKey, sealPlace.gmailUpload(email, id), body), type, Date.now() + 24 * 60 * 60_000);
     })();
     return id;
@@ -578,18 +572,21 @@ export class GmailStore {
   uploaded(email: string, id: string): { body: Buffer; type: string } | null {
     const row = this.db
       .prepare(
-        "SELECT body,type,sealed FROM gmail_upload WHERE email=? AND id=? AND expires>?",
+        "SELECT body,type FROM gmail_upload WHERE email=? AND id=? AND expires>?",
       )
       .get(email, id, Date.now()) as
-      { body: Buffer; type: string; sealed: number } | undefined;
+      { body: Buffer; type: string } | undefined;
     if (!row) return null;
-    // Uploads stored before they were sealed keep their bytes as they came, for the day they live.
-    if (!row.sealed) return { body: row.body, type: row.type };
     try {
-      return { body: unsealValue(this.vaultKey, sealPlace.gmailUpload(email, id), row.body).plain, type: row.type };
+      const opened = unsealValue(this.vaultKey, sealPlace.gmailUpload(email, id), row.body);
+      if (!opened.legacy) return { body: opened.plain, type: row.type };
     } catch {
-      return null;
+      // Not sealed for this row.
     }
+    // An upload stored before uploads were sealed keeps its bytes as they came
+    // for the day it lives; a body sealed for another row comes back as the
+    // sealed bytes, which reveal nothing.
+    return { body: row.body, type: row.type };
   }
   rememberDraft(
     email: string,
