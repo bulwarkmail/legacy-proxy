@@ -74,13 +74,36 @@ describe("buildRfc822 addresses", () => {
     ["replyTo", "a(b)@corp.example"],
     ["sender", '"x"@corp.example'],
     ["from", "alice@corp.example\r\nBcc: b@evil.example"],
-    ["to", "bob"],
+    // Text without an "@" that holds address syntax or a line break.
+    ["to", "<bob>"],
+    ["to", '"bob"'],
+    ["to", "team:"],
+    ["to", "team: bob;"],
+    ["to", "bob, carol"],
+    ["cc", "bob\r\nBcc"],
+    ["to", "bob carol"],
+    ["to", "bob (work)"],
+    ["to", "[bob]"],
   ])("refuses %s %j, naming the property and the address", async (property, email) => {
     const err = await build({ [property]: [{ name: "N", email }] }).catch((e: unknown) => e);
     // What the client gets as the SetError.
     const setError = (err as JmapError).toMethodError();
     expect(setError).toMatchObject({ type: "invalidProperties", properties: [property] });
     expect(setError.description).toContain(JSON.stringify(email));
+  });
+
+  it.each<[string, { name?: string; email: string }[], (string | null)[]]>([
+    ["bob", [{ email: "bob" }], [null]],
+    ["Bob Smith", [{ email: "Bob Smith" }], [null]],
+    ["a display name and bob", [{ name: "Bob", email: "bob" }], [null]],
+    ["a non-ASCII word", [{ email: "müller" }], [null]],
+    ["a complete address and a half-typed one", [{ name: "Alice", email: "alice@corp.example" }, { email: "bo" }], ["alice@corp.example", null]],
+    ["an empty string", [{ email: "" }], []],
+  ])("saves a draft whose To holds %s, the half-typed text as no mailbox", async (_label, to, mailboxes) => {
+    const raw = await build({ to });
+    const read = headerValues(raw, "to").flatMap(parseAddressList);
+    // A mailbox is an address with an "@"; half-typed text reads back as none.
+    expect(read.map((e) => (e.address?.includes("@") ? e.address : null))).toEqual(mailboxes);
   });
 
   it("refuses an address property that isn't a list, and an email that isn't text", async () => {

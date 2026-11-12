@@ -308,7 +308,15 @@ const ADDRESS_FIELDS = [
 interface CheckedAddress {
   name: string;
   address: string;
+  /** False for a recipient still being typed: text without an "@", which names no mailbox. */
+  mailbox: boolean;
 }
+
+// What text without an "@" may not contain to stay text: everything address
+// syntax gives meaning to (angle brackets, quotes, escapes, the colon and
+// semicolon of a group, the comma of a list, comments, domain literals) and
+// line breaks.
+const NOT_DRAFT_TEXT = /[<>"\\:;,()[\]\u0000-\u001f\u007f-\u009f\u2028\u2029\ufffd]/u;
 
 function refusedAddress(property: string, address: string): JmapError {
   return new JmapError("invalidProperties", `${property}: ${JSON.stringify(address)} is not one plain email address`, {
@@ -317,11 +325,13 @@ function refusedAddress(property: string, address: string): JmapError {
 }
 
 /**
- * One address property, checked before anything reaches MimeNode: every
- * entry with an email must be one plain address (isPlainAddress); an entry
- * without an email names no mailbox and is left out. Anything else refuses
- * the create with invalidProperties naming the property and the address as
- * given.
+ * One address property, checked before anything reaches MimeNode. An entry
+ * with an "@" must be one plain address (isPlainAddress). An entry without
+ * one is a recipient still being typed into a draft (`bob`, `Bob Smith`): it
+ * is written as text, provided it holds nothing in NOT_DRAFT_TEXT, and a
+ * submission refuses it later. An entry without an email is left out.
+ * Anything else refuses the create with invalidProperties naming the
+ * property and the address as given.
  */
 function checkedAddresses(property: string, list: unknown): CheckedAddress[] {
   if (list == null) return [];
@@ -333,8 +343,14 @@ function checkedAddresses(property: string, list: unknown): CheckedAddress[] {
     if (typeof email !== "string") throw refusedAddress(property, String(email));
     const address = email.trim();
     if (!address) continue;
+    const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+    if (!address.includes("@")) {
+      if (NOT_DRAFT_TEXT.test(address)) throw refusedAddress(property, email);
+      out.push({ name, address, mailbox: false });
+      continue;
+    }
     if (!isPlainAddress(address)) throw refusedAddress(property, email);
-    out.push({ name: typeof entry?.name === "string" ? entry.name.trim() : "", address });
+    out.push({ name, address, mailbox: true });
   }
   return out;
 }
@@ -353,9 +369,12 @@ function sameMailbox(a: string, b: string): boolean {
 
 /**
  * Reads each address header of the built message back with the strict parser
- * and refuses the create unless it names exactly the mailboxes it was given,
- * in order, and no others. MimeNode lower-cases and punycodes the domain; any
- * other difference, whatever the nodemailer version does, is refused.
+ * and refuses the create unless it has one entry per entry given, in order:
+ * each address read back as exactly that mailbox, each recipient still being
+ * typed read back as no mailbox at all (no address, or one without an "@").
+ * MimeNode lower-cases and punycodes the domain, and wraps text with a space
+ * in angle brackets; any other difference, whatever the nodemailer version
+ * does, is refused.
  */
 function verifyAddressHeaders(message: Buffer, given: Map<string, CheckedAddress[]>): void {
   const block = readHeaderBlock(message);
@@ -366,9 +385,13 @@ function verifyAddressHeaders(message: Buffer, given: Map<string, CheckedAddress
     for (let i = 0; i < Math.max(expected.length, read.length); i++) {
       const want = expected[i];
       const got = read[i];
-      if (!want || !got || got.address === null || !sameMailbox(got.address, want.address)) {
-        throw refusedAddress(property, want?.address ?? got?.written ?? "");
-      }
+      const ok =
+        want && got
+          ? want.mailbox
+            ? got.address !== null && sameMailbox(got.address, want.address)
+            : got.address === null || !got.address.includes("@")
+          : false;
+      if (!ok) throw refusedAddress(property, want?.address ?? got?.written ?? "");
     }
   }
 }
@@ -507,9 +530,11 @@ export async function buildRfc822(
   root.keepBcc = keepBcc;
 
   // Address objects, not "name <address>" strings: MimeNode then writes the
-  // checked address (domain lower-cased and punycoded) and encodes the name,
-  // without parsing anything again. (The type package declares strings only;
-  // MimeNode takes {name, address} objects for address headers.)
+  // checked address (domain lower-cased and punycoded), or the text of a
+  // recipient still being typed as it is (in angle brackets when it holds a
+  // space), and encodes the name, without parsing anything again. (The type
+  // package declares strings only; MimeNode takes {name, address} objects for
+  // address headers.)
   for (const [property, header] of ADDRESS_FIELDS) {
     const list = addresses.get(property)!;
     if (list.length) root.setHeader(header, list.map((a) => ({ name: a.name, address: a.address })) as unknown as string[]);

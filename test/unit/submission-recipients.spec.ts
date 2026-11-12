@@ -406,6 +406,36 @@ describe("a header the envelope reads is one a reader and the Bcc stripping read
   });
 });
 
+describe("a draft saved while a recipient was still being typed", () => {
+  const save = (to: { name?: string; email: string }[]) =>
+    buildRfc822(
+      { from: [{ name: "Alice", email: "alice@corp.example" }], to, subject: "s", bodyValues: { "1": { value: "hi" } }, textBody: [{ partId: "1" }] },
+      "corp.example",
+    );
+
+  it("is refused when sent without an envelope, naming the text", async () => {
+    draft = await save([{ email: "carol@corp.example" }, { email: "bob" }]);
+    expect((await send()).notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: ["bob"] });
+    draft = await save([{ email: "Bob Smith" }]);
+    expect((await send()).notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: ["<Bob Smith>"] });
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("is refused when the client's envelope lists every recipient, as the webmail's does", async () => {
+    draft = await save([{ email: "carol@corp.example" }, { email: "bob" }]);
+    const res = await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: "carol@corp.example" }, { email: "bob" }] });
+    expect(res.notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: ["bob"] });
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("goes only to the client's envelope when that leaves the text out", async () => {
+    draft = await save([{ email: "carol@corp.example" }, { email: "bob" }]);
+    const res = await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: "carol@corp.example" }] });
+    expect(res.notCreated).toBeNull();
+    expect(rcpts()).toEqual(["RCPT TO:<carol@corp.example>"]);
+  });
+});
+
 describe("a refusal names what was refused", () => {
   it("lists the refused header entries in invalidRecipients and in the description", async () => {
     draft = mail(`From: alice@corp.example\r\nTo: ok@corp.example, ${CONFUSING}, John`);
