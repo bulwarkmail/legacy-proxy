@@ -9,6 +9,7 @@ import {
   sealCredentials,
   sealPlace,
   unseal,
+  verifyVaultKey,
   type Credentials,
 } from "../auth/credentials.js";
 import { ownerOnly } from "../state/store.js";
@@ -168,14 +169,13 @@ export class GmailStore {
    */
   private prepareSealedValues(file: string): void {
     this.db.transaction(() => {
-      const check =
-        (this.db.prepare("SELECT value FROM vault_check WHERE id=1").get() as { value: Buffer } | undefined)?.value ?? null;
-      const rows = this.db.prepare("SELECT email, vault FROM gmail_connection").all() as { email: string; vault: Buffer }[];
+      const { check, rows, holdsOther } = gmailSealedValues(this.db);
       const plan = planSealedValues(
         this.vaultKey,
         file,
         check,
         rows.map((r) => ({ place: sealPlace.gmailConnection(r.email), value: r.vault })),
+        holdsOther,
       );
       for (const { index, value } of plan.reseal) {
         const row = rows[index]!;
@@ -194,36 +194,64 @@ export class GmailStore {
               .run(seal(this.vaultKey, place, u.body), u.email, u.id);
           }
         }
-        // Every token belongs to a sign-in (its family: the hash of the
-        // sign-in's first refresh token) made at family_since. A refresh token
-        // issued before sign-ins were recorded is a sign-in of its own, dated
-        // now, with the access tokens under it.
-        this.db
-          .prepare(
-            "UPDATE gmail_token SET family=CASE WHEN kind='refresh' THEN hash ELSE COALESCE(parent,hash) END, family_since=? WHERE family IS NULL",
-          )
-          .run(Date.now());
-        // The stored hashes are SHA-256 of each secret: key them in place.
-        const passwords = this.db.prepare("SELECT email, hash FROM gmail_password").all() as { email: string; hash: string }[];
-        for (const p of passwords) {
-          const hash = this.keyed(p.hash);
-          this.db.prepare("UPDATE gmail_password SET hash=?, mac=? WHERE email=?").run(hash, this.passwordMac(p.email, hash), p.email);
-        }
-        const tokens = this.db.prepare("SELECT * FROM gmail_token").all() as TokenRow[];
-        for (const t of tokens) {
-          const row: TokenRow = {
-            ...t,
-            hash: this.keyed(t.hash),
-            parent: t.parent === null ? null : this.keyed(t.parent),
-            family: t.family === null ? null : this.keyed(t.family),
-          };
+        // The hashes are keyed once: never again once any row carries a MAC.
+        const keyedBefore = this.db
+          .prepare("SELECT 1 FROM gmail_password WHERE mac IS NOT NULL UNION ALL SELECT 1 FROM gmail_token WHERE mac IS NOT NULL LIMIT 1")
+          .get();
+        if (!keyedBefore) {
+          // Every token belongs to a sign-in (its family: the hash of the
+          // sign-in's first refresh token) made at family_since. A refresh
+          // token issued before sign-ins were recorded is a sign-in of its
+          // own, dated now, with the access tokens under it.
           this.db
-            .prepare("UPDATE gmail_token SET hash=?, parent=?, family=?, mac=? WHERE hash=?")
-            .run(row.hash, row.parent, row.family, this.tokenMac(row), t.hash);
+            .prepare(
+              "UPDATE gmail_token SET family=CASE WHEN kind='refresh' THEN hash ELSE COALESCE(parent,hash) END, family_since=? WHERE family IS NULL",
+            )
+            .run(Date.now());
+          // The stored hashes are SHA-256 of each secret: key them in place.
+          const passwords = this.db.prepare("SELECT email, hash FROM gmail_password").all() as { email: string; hash: string }[];
+          for (const p of passwords) {
+            const hash = this.keyed(p.hash);
+            this.db.prepare("UPDATE gmail_password SET hash=?, mac=? WHERE email=?").run(hash, this.passwordMac(p.email, hash), p.email);
+          }
+          const tokens = this.db.prepare("SELECT * FROM gmail_token").all() as TokenRow[];
+          for (const t of tokens) {
+            const row: TokenRow = {
+              ...t,
+              hash: this.keyed(t.hash),
+              parent: t.parent === null ? null : this.keyed(t.parent),
+              family: t.family === null ? null : this.keyed(t.family),
+            };
+            this.db
+              .prepare("UPDATE gmail_token SET hash=?, parent=?, family=?, mac=? WHERE hash=?")
+              .run(row.hash, row.parent, row.family, this.tokenMac(row), t.hash);
+          }
         }
       }
-      if (plan.check) this.db.prepare("INSERT INTO vault_check(id, value) VALUES(1, ?)").run(plan.check);
+      if (plan.check) this.db.prepare("INSERT OR REPLACE INTO vault_check(id, value) VALUES(1, ?)").run(plan.check);
     })();
+  }
+  /**
+   * Throws VaultKeyMismatch when `vaultKey` doesn't open what `gmail.sqlite3`
+   * in `dataDir` holds, without writing anything (read-only, not created). The
+   * server checks every database this way before it opens any.
+   */
+  static verifyVaultKey(dataDir: string, vaultKey: Buffer): void {
+    const file = path.join(dataDir, "gmail.sqlite3");
+    if (!fs.existsSync(file)) return;
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      const { check, rows, holdsOther } = gmailSealedValues(db);
+      verifyVaultKey(
+        vaultKey,
+        file,
+        check,
+        rows.map((r) => ({ place: sealPlace.gmailConnection(r.email), value: r.vault })),
+        holdsOther,
+      );
+    } finally {
+      db.close();
+    }
   }
   /** Key for the stored hashes of bridge passwords and sign-in tokens, derived from the vault key. */
   private readonly hashKey: Buffer;
@@ -1177,6 +1205,31 @@ export const MAX_SUCCESSORS = 3;
 export const SIGN_IN_TTL = 365 * 86400_000;
 const TOKEN_PREFIX = { access: "gmat_", refresh: "gmrt_" } as const;
 const TOKEN_RE = { access: /^gmat_[A-Za-z0-9_-]{43}$/, refresh: /^gmrt_[A-Za-z0-9_-]{43}$/ };
+/**
+ * The key check and the sealed grants of a gmail.sqlite3, and whether it holds
+ * anything else that depends on the key (sealed cache entries and uploads,
+ * keyed password and token hashes). Tables a database lacks count as empty.
+ */
+function gmailSealedValues(db: Database.Database): {
+  check: Buffer | null;
+  rows: { email: string; vault: Buffer }[];
+  holdsOther: boolean;
+} {
+  const tables = new Set(
+    (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name),
+  );
+  const check = tables.has("vault_check")
+    ? ((db.prepare("SELECT value FROM vault_check WHERE id=1").get() as { value: Buffer } | undefined)?.value ?? null)
+    : null;
+  const rows = tables.has("gmail_connection")
+    ? (db.prepare("SELECT email, vault FROM gmail_connection").all() as { email: string; vault: Buffer }[])
+    : [];
+  const holdsOther = ["gmail_cache", "gmail_upload", "gmail_password", "gmail_token"].some(
+    (t) => tables.has(t) && !!db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get(),
+  );
+  return { check, rows, holdsOther };
+}
+
 /** A row of gmail_token. */
 interface TokenRow {
   hash: string;

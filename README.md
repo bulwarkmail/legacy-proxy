@@ -1022,10 +1022,14 @@ that a password or token of their choosing opens, or move their own row to
 another account. The first start of this version keys the plain SHA-256 hashes
 earlier versions stored, so existing bridge passwords and sign-ins keep working.
 
-Each database keeps a value sealed under the key. A start with a `VAULT_KEY` that
-opens neither it nor any stored credential stops with one line,
-`legacy-proxy: VAULT_KEY does not open the sealed values in <file>: ...`, before
-any row is changed; `npm run gmail:password` stops the same way.
+Each database keeps a value sealed under the key. The proxy checks both databases
+against `VAULT_KEY` before it opens either. A key that opens neither that value
+nor any stored credential of a database that holds sealed data stops the start
+with one line, `legacy-proxy: VAULT_KEY does not open the sealed values in
+<file>: ...`, and no file is changed; `npm run gmail:password` stops the same
+way. A database that holds nothing sealed takes whatever key it is started with,
+so a mistyped key on a fresh or empty database is simply replaced by the right
+one at the next start.
 
 Keep `VAULT_KEY` safe and apart from the backups of `DATA_DIR`: a backup stored
 together with its key gives whoever takes it everything the proxy sealed. Without

@@ -213,13 +213,14 @@ describe("a VAULT_KEY that is not the one the values were sealed with", () => {
     });
   }
 
-  it("stops the proxy at start with one line and no stack, and stops gmail:password before it changes anything", () => {
+  it("stops the proxy at start with one line and no stack, and stops gmail:password before it changes anything", async () => {
     const key = crypto.randomBytes(32);
     const dir = tempDir();
     const proxy = new Store(dir, key);
     proxy.upsertAccount({ slug: SLUG, kind: "generic", host: "imap.test", username: "pat@corp.test", vault: Buffer.alloc(40) });
     proxy.close();
     const gmail = new GmailStore(dir, key);
+    await gmail.save(ANNA, grant(ANNA), { profile: { emailAddress: ANNA, historyId: "5", messagesTotal: 1, threadsTotal: 1 }, labels: [] });
     gmail.close();
     fs.writeFileSync(path.join(dir, "google.json"), JSON.stringify({ web: { client_id: "fake-id", client_secret: "fake-secret" } }));
     const before = fs.readFileSync(path.join(dir, "gmail.sqlite3"));

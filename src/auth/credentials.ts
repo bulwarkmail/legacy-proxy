@@ -148,27 +148,61 @@ const KEY_CHECK_TEXT = Buffer.from("legacy-proxy vault key", "utf8");
  * What one database's sealed values need when it is opened at start.
  *
  * `check` is the database's key check, null before it has one; `values` are its
- * sealed credentials with their places.
+ * sealed credentials with their places; `holdsOther` says whether it holds
+ * anything else that depends on the key (sealed cache entries or uploads,
+ * keyed hashes).
  * - The key must open the key check, or, before there is one, at least one of
  *   the values in either format. Otherwise {@link VaultKeyMismatch} is thrown
  *   and the caller changes nothing.
+ * - A key check that doesn't open, in a database that holds nothing that
+ *   depends on the key, only recorded the key of an earlier start (a mistyped
+ *   one, say): it is replaced, since there is nothing to protect.
  * - `firstStart` is true when the database has no key check and no value in the
  *   current format: it was written only by versions that sealed with the vault
  *   key itself. Then `reseal` holds every value that opens in that earlier
  *   format, sealed again for its place. This happens once: later starts find
  *   the key check, and a value in the earlier format opens nowhere.
- * - `check` is the key check to store when the database has none.
+ * - `check` is the key check to store (insert or replace), null when the stored
+ *   one opened.
  */
 export function planSealedValues(
   key: Buffer,
   file: string,
   check: Buffer | null,
   values: { place: SealPlace; value: Buffer }[],
+  holdsOther = false,
+): { firstStart: boolean; reseal: { index: number; value: Buffer }[]; check: Buffer | null } {
+  return plan(key, file, check, values, holdsOther, true);
+}
+
+/**
+ * Throws {@link VaultKeyMismatch} when {@link planSealedValues} would, and
+ * otherwise does nothing: for checking every database before any is written.
+ */
+export function verifyVaultKey(
+  key: Buffer,
+  file: string,
+  check: Buffer | null,
+  values: { place: SealPlace; value: Buffer }[],
+  holdsOther = false,
+): void {
+  plan(key, file, check, values, holdsOther, false);
+}
+
+function plan(
+  key: Buffer,
+  file: string,
+  check: Buffer | null,
+  values: { place: SealPlace; value: Buffer }[],
+  holdsOther: boolean,
+  write: boolean,
 ): { firstStart: boolean; reseal: { index: number; value: Buffer }[]; check: Buffer | null } {
   checkKey(key);
+  const newCheck = () => (write ? seal(key, KEY_CHECK_PLACE, KEY_CHECK_TEXT) : null);
   if (check) {
-    if (!opens(key, KEY_CHECK_PLACE, check)) throw new VaultKeyMismatch(file);
-    return { firstStart: false, reseal: [], check: null };
+    if (opens(key, KEY_CHECK_PLACE, check)) return { firstStart: false, reseal: [], check: null };
+    if (values.length > 0 || holdsOther) throw new VaultKeyMismatch(file);
+    return { firstStart: false, reseal: [], check: newCheck() };
   }
   const current = values.map((v) => opens(key, v.place, v.value));
   const earlier = values.map((v, i) => (current[i] ? null : unsealEarlierForm(key, v.value)));
@@ -176,10 +210,11 @@ export function planSealedValues(
     throw new VaultKeyMismatch(file);
   }
   const firstStart = !current.some(Boolean);
-  const reseal = firstStart
-    ? earlier.flatMap((plain, index) => (plain ? [{ index, value: seal(key, values[index]!.place, plain) }] : []))
-    : [];
-  return { firstStart, reseal, check: seal(key, KEY_CHECK_PLACE, KEY_CHECK_TEXT) };
+  const reseal =
+    firstStart && write
+      ? earlier.flatMap((plain, index) => (plain ? [{ index, value: seal(key, values[index]!.place, plain) }] : []))
+      : [];
+  return { firstStart, reseal, check: newCheck() };
 }
 
 export async function sealCredentials(key: Buffer, place: SealPlace, c: Credentials): Promise<Buffer> {

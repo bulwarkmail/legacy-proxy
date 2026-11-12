@@ -39,6 +39,13 @@ import { isBridgeSecret, registerGmailBackend } from "./gmail/backend.js";
 import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfigOrExit();
+const gmailConfig = loadGmailConfig(cfg.publicUrl);
+// Every database the proxy uses is checked against VAULT_KEY before any is
+// opened, so a mistyped key changes no file.
+openOrExit(() => {
+  Store.verifyVaultKey(cfg.dataDir, cfg.vaultKey);
+  if (gmailConfig) GmailStore.verifyVaultKey(cfg.dataDir, cfg.vaultKey);
+});
 const store = openOrExit(() => new Store(cfg.dataDir, cfg.vaultKey));
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
@@ -115,7 +122,6 @@ await app.register(compress, { global: true, threshold: 1024 });
 // reaches the mail server (see auth/loginLimit.ts).
 const logins = new LoginLimiter();
 
-const gmailConfig = loadGmailConfig(cfg.publicUrl);
 const gmailStore = gmailConfig ? openOrExit(() => new GmailStore(cfg.dataDir, cfg.vaultKey)) : null;
 // Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
 const gmailHooks: { push?: import("./gmail/push.js").GmailPush } = {};

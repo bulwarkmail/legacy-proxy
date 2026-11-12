@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { planSealedValues, sealPlace } from "../auth/credentials.js";
+import { planSealedValues, sealPlace, verifyVaultKey, type SealPlace } from "../auth/credentials.js";
 import { log } from "../util/log.js";
 import type { Database as DB, Statement } from "better-sqlite3";
 
@@ -306,6 +306,39 @@ export function ownerOnly(files: string[]): void {
   }
 }
 
+/**
+ * The key check and the sealed credentials of a proxy.db, also of one an
+ * earlier version wrote (tables or columns it lacks count as empty). A row's
+ * stored credentials and the ones a check holds share the row's place.
+ */
+function sealedValues(db: DB): {
+  check: Buffer | null;
+  values: { id: number; column: string; value: Buffer; place: SealPlace }[];
+} {
+  const tables = new Set(
+    (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as { name: string }[]).map((t) => t.name),
+  );
+  const check = tables.has("vault_check")
+    ? ((db.prepare(`SELECT value FROM vault_check WHERE id = 1`).get() as { value: Buffer } | undefined)?.value ?? null)
+    : null;
+  if (!tables.has("account")) return { check, values: [] };
+  const withCheckVault = (db.prepare(`PRAGMA table_info(account)`).all() as { name: string }[]).some(
+    (c) => c.name === "cred_check_vault",
+  );
+  const rows = db
+    .prepare(`SELECT id, slug, vault, ${withCheckVault ? "cred_check_vault" : "NULL AS cred_check_vault"} FROM account`)
+    .all() as { id: number; slug: string; vault: Buffer; cred_check_vault: Buffer | null }[];
+  return {
+    check,
+    values: rows.flatMap((r) => [
+      { id: r.id, column: "vault", value: r.vault, place: sealPlace.account(r.slug) },
+      ...(r.cred_check_vault
+        ? [{ id: r.id, column: "cred_check_vault", value: r.cred_check_vault, place: sealPlace.account(r.slug) }]
+        : []),
+    ]),
+  };
+}
+
 // Clears an open check of the stored credentials, inside an UPDATE's SET list.
 const NO_CHECK =
   "cred_check_vault = NULL, cred_check_tag = NULL, cred_check_since = 0, cred_check_attempts = 0, cred_check_last = 0";
@@ -358,28 +391,32 @@ export class Store {
   /** The start step of the sealed credentials, in one transaction (see planSealedValues). */
   private prepareSealedValues(key: Buffer, file: string): void {
     this.db.transaction(() => {
-      const check = (this.db.prepare(`SELECT value FROM vault_check WHERE id = 1`).get() as { value: Buffer } | undefined)
-        ?.value ?? null;
-      const rows = this.db.prepare(`SELECT id, slug, vault, cred_check_vault FROM account`).all() as {
-        id: number;
-        slug: string;
-        vault: Buffer;
-        cred_check_vault: Buffer | null;
-      }[];
-      // A row's stored credentials and the ones a check holds share the row's place.
-      const values = rows.flatMap((r) => [
-        { id: r.id, column: "vault", value: r.vault, place: sealPlace.account(r.slug) },
-        ...(r.cred_check_vault
-          ? [{ id: r.id, column: "cred_check_vault", value: r.cred_check_vault, place: sealPlace.account(r.slug) }]
-          : []),
-      ]);
+      const { check, values } = sealedValues(this.db);
       const plan = planSealedValues(key, file, check, values);
       for (const { index, value } of plan.reseal) {
         const v = values[index]!;
         this.db.prepare(`UPDATE account SET ${v.column} = ? WHERE id = ? AND ${v.column} = ?`).run(value, v.id, v.value);
       }
-      if (plan.check) this.db.prepare(`INSERT INTO vault_check(id, value) VALUES(1, ?)`).run(plan.check);
+      if (plan.check) this.db.prepare(`INSERT OR REPLACE INTO vault_check(id, value) VALUES(1, ?)`).run(plan.check);
     })();
+  }
+
+  /**
+   * Throws VaultKeyMismatch when `vaultKey` doesn't open what `proxy.db` in
+   * `dataDir` holds, without writing anything (the file is opened read-only,
+   * and not created). The server checks every database this way before it
+   * opens any, so a mistyped key changes no file.
+   */
+  static verifyVaultKey(dataDir: string, vaultKey: Buffer): void {
+    const file = path.join(dataDir, "proxy.db");
+    if (!fs.existsSync(file)) return;
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      const { check, values } = sealedValues(db);
+      verifyVaultKey(vaultKey, file, check, values);
+    } finally {
+      db.close();
+    }
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */
