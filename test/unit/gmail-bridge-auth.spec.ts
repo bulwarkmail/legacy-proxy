@@ -209,11 +209,12 @@ describe("bridge secrets on the JMAP routes", () => {
 });
 
 describe("failed bridge logins", () => {
-  it("are held per address like mail logins, the right password included", async () => {
+  it("count against the address's budget for mail logins and never hold a valid bridge login", async () => {
     const store = await connectedStore();
     const password = store.issuePassword(EMAIL);
     const app = Fastify();
     const config = { allowedEmails: new AllowList([EMAIL]) } as unknown as GmailConfig;
+    const limiter = new LoginLimiter();
     registerGmailBackend(
       app,
       { publicUrl: "https://bridge.test", limits: { maxCallsInRequest: 16 } } as never,
@@ -222,19 +223,19 @@ describe("failed bridge logins", () => {
       {} as never,
       {},
       () => ({ writable: async () => false, canCompose: async () => false, accountId: "a1" }) as never,
-      new LoginLimiter(),
+      limiter,
     );
     // Stands for the legacy route the real server registers.
     app.get("/jmap/session", async () => ({ legacy: true }));
-    const lookups = vi.spyOn(store, "authenticate");
     const session = (pass: string) =>
       app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: basic(EMAIL, pass) } });
 
-    for (let i = 0; i < 10; i++) expect((await session(`gmap_wrong${i}`)).statusCode).toBe(401);
-    const held = await session(password);
+    for (let i = 0; i < 50; i++) expect((await session(`gmap_wrong${i}`)).statusCode).toBe(401);
+    const valid = await session(password);
     await app.close();
-    expect(held.statusCode).toBe(429);
-    expect(held.headers["retry-after"]).toBeDefined();
-    expect(lookups).toHaveBeenCalledTimes(10);
+    expect(valid.statusCode).toBe(200);
+    expect(valid.json()).not.toEqual({ legacy: true });
+    // The 50 failed lookups hold mail logins from that address.
+    expect(await limiter.begin("127.0.0.1", "someone@imap.test")).toMatchObject({ ok: false, status: 429 });
   });
 });

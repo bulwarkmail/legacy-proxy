@@ -159,21 +159,12 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     // revoked one) is answered here and never reaches the legacy backend's IMAP login.
     if (!isBridgeSecret(password)) return;
     const signedIn = password.startsWith("gmat_") && !username;
-    // Failed bridge logins count against the same per-address budget as mail logins.
-    const gate = logins ? await logins.begin(req.ip, username ?? "") : null;
-    if (gate && !gate.ok) {
-      return reply
-        .header("Retry-After", String(gate.retryAfterSec))
-        .code(gate.status)
-        .send({ error: gate.status === 429 ? "too many failed logins" : "too many logins in progress" });
-    }
     let email: string | null = null;
-    try {
-      if (signedIn) email = store.authenticateToken(password);
-      else if (password.startsWith("gmap_")) email = store.authenticate(password, username);
-    } finally {
-      gate?.finish(email ? "accepted" : "refused");
-    }
+    if (signedIn) email = store.authenticateToken(password);
+    else if (password.startsWith("gmap_")) email = store.authenticate(password, username);
+    // A valid bridge login is served without the login limits. Only a failed
+    // lookup counts, against its address's budget for mail logins.
+    if (!email) logins?.noteFailedLookup(req.ip);
     if (
       !email ||
       !google.allowedEmails.has(email) ||

@@ -177,6 +177,15 @@ export class LoginLimiter {
     return this.hold(addr, userKey(addr, username));
   }
 
+  /**
+   * Count a failed lookup of a secret the proxy checks itself (no login at the
+   * mail server) against the address's budget. It takes no slot and is never
+   * held: a valid secret is not looked up through here at all.
+   */
+  noteFailedLookup(address: string): void {
+    this.byAddress.add(addressKey(address), this.now());
+  }
+
   /** Number of tracked keys, for tests and diagnostics. */
   get trackedKeys(): number {
     return this.byUser.size + this.byAddress.size;
