@@ -1,9 +1,9 @@
 // What the proxy seals on disk opens only in the row it was sealed for: the
 // Gmail cache, Gmail uploads, the stored Google grant and the IMAP backend's
 // stored mail credentials. A value copied into another account's row (or
-// another row of the same account) does not open there. Values sealed before
-// this (vault key used as it is, no place) still open, and are in the current
-// form once the row is written again. proxy.db is readable by its owner only.
+// another row of the same account) does not open there. Values earlier
+// versions sealed are handled at start (sealed-values-at-start.spec.ts).
+// proxy.db is readable by its owner only.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -67,24 +67,6 @@ function rawDb(dir: string, file = "gmail.sqlite3") {
   cleanup.push(() => db.close());
   return db;
 }
-/** The format values were sealed in before: the vault key as it is, no place. */
-function sealTheOldWay(key: Buffer, plain: Buffer): Buffer {
-  const nonce = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
-  const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
-  return Buffer.concat([nonce, cipher.getAuthTag(), ct]);
-}
-function opensTheOldWay(key: Buffer, sealed: Buffer): boolean {
-  try {
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, sealed.subarray(0, 12));
-    decipher.setAuthTag(sealed.subarray(12, 28));
-    Buffer.concat([decipher.update(sealed.subarray(28)), decipher.final()]);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 describe("a sealed value copied into another row", () => {
   it("Gmail cache: does not open under another account, nor under another key of the same account", async () => {
     const dir = tempDir();
@@ -191,71 +173,19 @@ describe("uploads at rest", () => {
   });
 });
 
-describe("values sealed before places were bound", () => {
-  it("still open, and each row is in the current form once it is written again", async () => {
-    const dir = tempDir();
-    const key = crypto.randomBytes(32);
-    // Gmail tables in the shape the bridge created them before, with values sealed the old way.
-    const old = new Database(path.join(dir, "gmail.sqlite3"));
-    old.exec(`
-      CREATE TABLE gmail_connection (email TEXT PRIMARY KEY, vault BLOB NOT NULL, snapshot TEXT NOT NULL, updated_at INTEGER NOT NULL);
-      CREATE TABLE gmail_cache (
-        email TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,
-        expires INTEGER NOT NULL, touched INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(email, key)
-      );
-      CREATE TABLE gmail_upload (email TEXT NOT NULL,id TEXT NOT NULL,body BLOB NOT NULL,type TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(email,id));
-    `);
-    const snapshot = JSON.stringify({ profile: { emailAddress: ANNA, historyId: "5", messagesTotal: 1, threadsTotal: 1 }, labels: [] });
-    old.prepare("INSERT INTO gmail_connection VALUES (?,?,?,?)").run(ANNA, sealTheOldWay(key, Buffer.from(JSON.stringify(grant(ANNA)))), snapshot, Date.now());
-    const cached = sealTheOldWay(key, Buffer.from(JSON.stringify({ subject: "Kept from before" })));
-    old.prepare("INSERT INTO gmail_cache VALUES (?,?,?,?,?,?)").run(ANNA, "meta:v2:x", cached, Date.now() + 3600_000, Date.now(), cached.length);
-    old.prepare("INSERT INTO gmail_upload VALUES (?,?,?,?,?)").run(ANNA, "gu_before", Buffer.from("uploaded before"), "text/plain", Date.now() + 3600_000);
-    old.close();
-
-    const store = gmailStore(dir, key);
-    const db = rawDb(dir);
-    const vault = () => (db.prepare("SELECT vault FROM gmail_connection WHERE email=?").get(ANNA) as { vault: Buffer }).vault;
-    const cacheValue = () => (db.prepare("SELECT value FROM gmail_cache WHERE email=? AND key=?").get(ANNA, "meta:v2:x") as { value: Buffer }).value;
-
-    // They open.
-    expect((await store.load(ANNA))?.credentials.refreshToken).toBe("fake-refresh-" + ANNA);
-    expect(store.uploaded(ANNA, "gu_before")?.body.toString()).toBe("uploaded before");
-    expect(opensTheOldWay(key, cacheValue())).toBe(true);
-    expect(store.cached(ANNA, "meta:v2:x")).toEqual({ subject: "Kept from before" });
-
-    // The cache entry was written again when it was read; the grant when it is updated.
-    expect(opensTheOldWay(key, cacheValue())).toBe(false);
-    expect(unseal(key, sealPlace.gmailCache(ANNA, "meta:v2:x"), cacheValue()).toString()).toContain("Kept from before");
-    expect(opensTheOldWay(key, vault())).toBe(true);
-    await store.updateCredentials(ANNA, { ...grant(ANNA), accessToken: "renewed" }, "fake-refresh-" + ANNA);
-    expect(opensTheOldWay(key, vault())).toBe(false);
-    expect((await openCredentials(key, sealPlace.gmailConnection(ANNA), vault())).accessToken).toBe("renewed");
-    expect(store.cached(ANNA, "meta:v2:x")).toEqual({ subject: "Kept from before" });
-
-    // The IMAP backend's stored password, sealed the old way.
-    const proxy = proxyStore(dir);
-    const slug = "generic:anna@corp.test";
-    proxy.upsertAccount({
-      slug,
-      kind: "generic",
-      host: "imap.test",
-      username: "anna@corp.test",
-      vault: sealTheOldWay(key, Buffer.from(JSON.stringify({ mech: "PLAIN", username: "anna@corp.test", password: "fake-password" }))),
-    });
-    expect((await openAccountCredentials(key, proxy.getAccount(slug)!)).password).toBe("fake-password");
-  });
-
-  it("leave the upload table in the shape an earlier version writes to, so a rollback can still store uploads", async () => {
+describe("the upload table", () => {
+  it("keeps the shape an earlier version writes to, so a rollback can still store uploads", async () => {
     const dir = tempDir();
     const key = crypto.randomBytes(32);
     const store = gmailStore(dir, key);
     await connect(store, ANNA);
     const id = store.upload(ANNA, Buffer.from("written by this version"), "text/plain");
     const db = rawDb(dir);
-    // The earlier version's insert names no columns.
+    // The earlier version's insert names no columns, and works.
     db.prepare("INSERT INTO gmail_upload VALUES(?,?,?,?,?)").run(ANNA, "gu_rolled_back", Buffer.from("written after a rollback"), "text/plain", Date.now() + 3600_000);
-    expect(store.uploaded(ANNA, "gu_rolled_back")?.body.toString()).toBe("written after a rollback");
     expect(store.uploaded(ANNA, id)?.body.toString()).toBe("written by this version");
+    // Back on this version, an upload the earlier one stored in clear is answered like an unknown one.
+    expect(store.uploaded(ANNA, "gu_rolled_back")).toBeNull();
   });
 });
 

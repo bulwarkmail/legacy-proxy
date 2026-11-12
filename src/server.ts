@@ -39,7 +39,7 @@ import { isBridgeSecret, registerGmailBackend } from "./gmail/backend.js";
 import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfigOrExit();
-const store = new Store(cfg.dataDir);
+const store = openOrExit(() => new Store(cfg.dataDir, cfg.vaultKey));
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
 const dispatcher = new PushDispatcher(store, hub, (id) => store.getAccountById(id));
@@ -116,7 +116,7 @@ await app.register(compress, { global: true, threshold: 1024 });
 const logins = new LoginLimiter();
 
 const gmailConfig = loadGmailConfig(cfg.publicUrl);
-const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
+const gmailStore = gmailConfig ? openOrExit(() => new GmailStore(cfg.dataDir, cfg.vaultKey)) : null;
 // Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
 const gmailHooks: { push?: import("./gmail/push.js").GmailPush } = {};
 app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}), ...(gmailHooks.push ? { gmailPush: gmailHooks.push.stats() } : {}) }));
@@ -1024,6 +1024,17 @@ function loadConfigOrExit(): AppConfig {
   try {
     return loadConfig();
   } catch (e) {
+    fs.writeSync(2, `legacy-proxy: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
+
+/** Opens a database; a VAULT_KEY that doesn't open it stops the start with its message, nothing changed. */
+function openOrExit<T>(open: () => T): T {
+  try {
+    return open();
+  } catch (e) {
+    if ((e as Error).name !== "VaultKeyMismatch") throw e;
     fs.writeSync(2, `legacy-proxy: ${(e as Error).message}\n`);
     process.exit(1);
   }

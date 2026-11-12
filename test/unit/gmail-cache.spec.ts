@@ -56,13 +56,14 @@ it("keeps cached mail unreadable without the vault key", () => {
   store.close();
   const bytes = fs.readFileSync(path.join(dir, "gmail.sqlite3"));
   expect(bytes.includes(Buffer.from("Quarterly figures"))).toBe(false);
-  // The same key reads it back; a different one cannot, and drops the row.
+  // The same key reads it back; a different one is refused before it can
+  // change anything, and the entry is still there for the right key.
   const reopened = open(1_000_000, key, dir).store;
   expect(reopened.cached("a@example.test", "meta:v2:x")).toEqual({ subject: "Quarterly figures" });
   reopened.close();
-  const stranger = open(1_000_000, crypto.randomBytes(32), dir).store;
-  expect(stranger.cached("a@example.test", "meta:v2:x")).toBeNull();
-  expect(stranger.cached("a@example.test", "meta:v2:x")).toBeNull();
+  expect(() => new GmailStore(dir, crypto.randomBytes(32))).toThrow(/VAULT_KEY does not open/);
+  const again = open(1_000_000, key, dir).store;
+  expect(again.cached("a@example.test", "meta:v2:x")).toEqual({ subject: "Quarterly figures" });
 });
 
 it("drops mail a history record names, however long its entry had left", () => {

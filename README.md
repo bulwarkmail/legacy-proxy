@@ -1001,11 +1001,12 @@ the Gmail bridge the Google grant, the cache and uploaded files. Each table has 
 key of its own derived from `VAULT_KEY` (HKDF-SHA256), and every value is bound
 to its row: the table, the account and the row's key go in as associated data, so
 a value copied into another account's row does not open there. Values sealed by
-earlier versions (with `VAULT_KEY` itself and no binding) still open, and are
-written in the current form the next time their row is written: at the next
-sign-in for IMAP credentials, at the next Google token renewal for a Gmail grant,
-on the next read for a cache entry. Uploads made before the upgrade stay as they
-came until they expire (24 hours).
+earlier versions (with `VAULT_KEY` itself and no binding) are rewritten on the
+first start of this version, in one transaction per database: stored IMAP
+credentials and Google grants are sealed again for their row (users stay signed
+in), Gmail cache entries are dropped and fetched again, and uploads stored in
+clear are sealed for their row. That happens once; afterwards a value in the
+earlier format opens nowhere, also one copied in from an old backup.
 
 In clear: the IMAP backend's caches of message metadata (envelope, structure,
 headers), previews and attachment bytes, and its pending uploads; on the Gmail
@@ -1013,8 +1014,11 @@ bridge the profile and label snapshot, draft and send-ledger records, scheduled
 sends with their recipients, and push subscription URLs. Bridge passwords and
 sign-in tokens are stored only as SHA-256 hashes.
 
-A wrong `VAULT_KEY` opens nothing: the error says that `VAULT_KEY` is not the
-one the value was sealed with. Keep the key with the backups of `DATA_DIR`.
+Each database keeps a value sealed under the key. A start with a `VAULT_KEY` that
+opens neither it nor any stored credential stops with one line,
+`legacy-proxy: VAULT_KEY does not open the sealed values in <file>: ...`, before
+any row is changed; `npm run gmail:password` stops the same way. Keep the key with
+the backups of `DATA_DIR`.
 
 ## Tests
 

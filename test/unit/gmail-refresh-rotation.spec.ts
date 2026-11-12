@@ -27,8 +27,8 @@ function tempDir() {
   cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
-function openStore(dir: string) {
-  const store = new GmailStore(dir, crypto.randomBytes(32));
+function openStore(dir: string, key = crypto.randomBytes(32)) {
+  const store = new GmailStore(dir, key);
   cleanup.push(() => store.close());
   return store;
 }
@@ -197,13 +197,19 @@ describe("tokens stored before sign-ins were recorded", () => {
         parent TEXT, expires INTEGER NOT NULL
       );
     `);
-    old.prepare("INSERT INTO gmail_connection VALUES (?,?,?,?)").run(EMAIL, Buffer.alloc(40), "{}", writtenAt);
+    // The grant sealed the way it was then: the vault key itself, AES-256-GCM, nonce and tag in front.
+    const key = crypto.randomBytes(32);
+    const nonce = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
+    const ct = Buffer.concat([cipher.update(JSON.stringify({ mech: "XOAUTH2", username: EMAIL, refreshToken: "fake-refresh" })), cipher.final()]);
+    const vault = Buffer.concat([nonce, cipher.getAuthTag(), ct]);
+    old.prepare("INSERT INTO gmail_connection VALUES (?,?,?,?)").run(EMAIL, vault, "{}", writtenAt);
     old.prepare("INSERT INTO gmail_token VALUES (?,?,?,'refresh',NULL,?)").run(hash(refresh), EMAIL, "webmail", writtenAt + 180 * DAY);
     old.prepare("INSERT INTO gmail_token VALUES (?,?,?,'access',?,?)").run(hash(access), EMAIL, "webmail", hash(refresh), writtenAt + 3600_000);
     old.close();
 
     const upgradedAt = Date.now();
-    const store = openStore(dir);
+    const store = openStore(dir, key);
     expect(store.authenticateToken(access, upgradedAt + 60 * SECOND)).toBe(EMAIL);
     const next = store.refreshTokens(refresh, "webmail", upgradedAt + 10 * DAY);
     expect(next).not.toBeNull();

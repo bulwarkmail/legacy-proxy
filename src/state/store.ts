@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { planSealedValues, sealPlace } from "../auth/credentials.js";
 import type { Database as DB, Statement } from "better-sqlite3";
 
 export interface AccountRow {
@@ -255,6 +256,13 @@ CREATE TABLE IF NOT EXISTS ended_session (
   token_hash TEXT    PRIMARY KEY,
   expires    INTEGER NOT NULL
 );
+
+-- A value sealed under the vault key, so a start with another key is refused
+-- before anything is changed (auth/credentials.ts planSealedValues).
+CREATE TABLE IF NOT EXISTS vault_check (
+  id    INTEGER PRIMARY KEY CHECK (id = 1),
+  value BLOB    NOT NULL
+);
 `;
 
 // Columns added to tables that existing databases already have.
@@ -289,7 +297,14 @@ export class Store {
   // `.run()` can be reused freely.
   private stmts = new Map<string, Statement>();
 
-  constructor(dataDir: string) {
+  /**
+   * Opens `proxy.db` in `dataDir`. With `vaultKey` (the server passes it) the
+   * sealed credentials are checked against the key first: a key that doesn't
+   * open them throws {@link VaultKeyMismatch} before any row is changed, and
+   * the first start of this version seals the values of earlier versions for
+   * their row (see planSealedValues).
+   */
+  constructor(dataDir: string, vaultKey?: Buffer) {
     // The database holds the sealed mail credentials and, in clear, cached
     // message metadata, previews, attachments and uploads: only the proxy's
     // own user may read it. Permissions are set before SQLite opens the file,
@@ -299,13 +314,46 @@ export class Store {
     fs.closeSync(fs.openSync(file, "a", 0o600));
     for (const f of [file, `${file}-wal`, `${file}-shm`]) if (fs.existsSync(f)) fs.chmodSync(f, 0o600);
     this.db = new Database(file);
-    this.db.exec(SCHEMA);
-    for (const { table, column, definition } of ADDED_COLUMNS) {
-      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-      if (!columns.some((c) => c.name === column)) {
-        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    try {
+      this.db.exec(SCHEMA);
+      for (const { table, column, definition } of ADDED_COLUMNS) {
+        const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (!columns.some((c) => c.name === column)) {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        }
       }
+      if (vaultKey) this.prepareSealedValues(vaultKey, file);
+    } catch (e) {
+      this.db.close();
+      throw e;
     }
+  }
+
+  /** The start step of the sealed credentials, in one transaction (see planSealedValues). */
+  private prepareSealedValues(key: Buffer, file: string): void {
+    this.db.transaction(() => {
+      const check = (this.db.prepare(`SELECT value FROM vault_check WHERE id = 1`).get() as { value: Buffer } | undefined)
+        ?.value ?? null;
+      const rows = this.db.prepare(`SELECT id, slug, vault, cred_check_vault FROM account`).all() as {
+        id: number;
+        slug: string;
+        vault: Buffer;
+        cred_check_vault: Buffer | null;
+      }[];
+      // A row's stored credentials and the ones a check holds share the row's place.
+      const values = rows.flatMap((r) => [
+        { id: r.id, column: "vault", value: r.vault, place: sealPlace.account(r.slug) },
+        ...(r.cred_check_vault
+          ? [{ id: r.id, column: "cred_check_vault", value: r.cred_check_vault, place: sealPlace.account(r.slug) }]
+          : []),
+      ]);
+      const plan = planSealedValues(key, file, check, values);
+      for (const { index, value } of plan.reseal) {
+        const v = values[index]!;
+        this.db.prepare(`UPDATE account SET ${v.column} = ? WHERE id = ? AND ${v.column} = ?`).run(value, v.id, v.value);
+      }
+      if (plan.check) this.db.prepare(`INSERT INTO vault_check(id, value) VALUES(1, ?)`).run(plan.check);
+    })();
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */

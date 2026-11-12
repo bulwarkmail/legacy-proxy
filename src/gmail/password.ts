@@ -28,7 +28,11 @@ try {
   } finally {
     store.close();
   }
-} catch {
-  console.error("Cannot issue password: supply an allowed connected email and a new writable output path.");
+} catch (e) {
+  console.error(
+    (e as Error | undefined)?.name === "VaultKeyMismatch"
+      ? `Cannot issue password: ${(e as Error).message}`
+      : "Cannot issue password: supply an allowed connected email and a new writable output path.",
+  );
   process.exitCode = 1;
 }

@@ -40,8 +40,10 @@ export const sealPlace = {
 // Current format: [0x02 | 12-byte nonce | 16-byte tag | ciphertext], AES-256-GCM
 // under a key derived from the vault key for the place's table (HKDF-SHA256),
 // with the place as associated data.
-// Earlier format, read but no longer written: [12-byte nonce | 16-byte tag |
-// ciphertext] under the vault key itself, without associated data.
+// Earlier format: [12-byte nonce | 16-byte tag | ciphertext] under the vault
+// key itself, without associated data. It is opened only once, by the rewrite
+// at the first start of a database (planSealedValues); afterwards a value in
+// that format opens nowhere.
 const VERSION = 0x02;
 const NONCE_LEN = 12;
 const TAG_LEN = 16;
@@ -92,31 +94,92 @@ function decrypt(key: Buffer, body: Buffer, aad: Buffer | null): Buffer {
 }
 
 /**
- * Decrypts a value sealed for `place`. A value in the earlier format opens
- * with the vault key itself; `legacy` says so, and the caller writes it again
- * in the current format. Throws if the key is wrong, the bytes were altered,
- * or the value belongs to another place.
+ * Decrypts what {@link seal} produced for `place`. Throws if the key is wrong,
+ * the bytes were altered, the value belongs to another place, or it is in the
+ * earlier format.
  */
-export function unsealValue(key: Buffer, place: SealPlace, sealed: Buffer): { plain: Buffer; legacy: boolean } {
+export function unseal(key: Buffer, place: SealPlace, sealed: Buffer): Buffer {
   checkKey(key);
   if (sealed.length < NONCE_LEN + TAG_LEN) throw new Error("vault: truncated");
-  if (sealed[0] === VERSION && sealed.length >= 1 + NONCE_LEN + TAG_LEN) {
-    try {
-      return { plain: decrypt(tableKey(key, place.table), sealed.subarray(1), associatedData(place)), legacy: false };
-    } catch {
-      // An earlier-format value can start with the same byte: try that next.
-    }
-  }
+  if (!inCurrentForm(sealed)) throw new Error(OPEN_FAILED);
   try {
-    return { plain: decrypt(key, sealed, null), legacy: true };
+    return decrypt(tableKey(key, place.table), sealed.subarray(1), associatedData(place));
   } catch {
     throw new Error(OPEN_FAILED);
   }
 }
 
-/** Decrypts what {@link seal} produced for `place`, or a value in the earlier format. */
-export function unseal(key: Buffer, place: SealPlace, sealed: Buffer): Buffer {
-  return unsealValue(key, place, sealed).plain;
+function opens(key: Buffer, place: SealPlace, sealed: Buffer): boolean {
+  try {
+    unseal(key, place, sealed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A value in the earlier format, or null when it isn't one under this key. Only for the rewrite at start. */
+function unsealEarlierForm(key: Buffer, sealed: Buffer): Buffer | null {
+  if (sealed.length < NONCE_LEN + TAG_LEN) return null;
+  try {
+    return decrypt(key, sealed, null);
+  } catch {
+    return null;
+  }
+}
+
+/** Thrown when VAULT_KEY doesn't open what a database holds. No row has been changed when it is. */
+export class VaultKeyMismatch extends Error {
+  constructor(file: string) {
+    super(
+      `VAULT_KEY does not open the sealed values in ${file}: it is not the key they were sealed with. ` +
+        "Start with that key. No row was changed.",
+    );
+    this.name = "VaultKeyMismatch";
+  }
+}
+
+// A value each database keeps to tell its key from another one, also when it
+// holds no credentials.
+const KEY_CHECK_PLACE: SealPlace = { table: "vault_check", account: "", key: "vault key" };
+const KEY_CHECK_TEXT = Buffer.from("legacy-proxy vault key", "utf8");
+
+/**
+ * What one database's sealed values need when it is opened at start.
+ *
+ * `check` is the database's key check, null before it has one; `values` are its
+ * sealed credentials with their places.
+ * - The key must open the key check, or, before there is one, at least one of
+ *   the values in either format. Otherwise {@link VaultKeyMismatch} is thrown
+ *   and the caller changes nothing.
+ * - `firstStart` is true when the database has no key check and no value in the
+ *   current format: it was written only by versions that sealed with the vault
+ *   key itself. Then `reseal` holds every value that opens in that earlier
+ *   format, sealed again for its place. This happens once: later starts find
+ *   the key check, and a value in the earlier format opens nowhere.
+ * - `check` is the key check to store when the database has none.
+ */
+export function planSealedValues(
+  key: Buffer,
+  file: string,
+  check: Buffer | null,
+  values: { place: SealPlace; value: Buffer }[],
+): { firstStart: boolean; reseal: { index: number; value: Buffer }[]; check: Buffer | null } {
+  checkKey(key);
+  if (check) {
+    if (!opens(key, KEY_CHECK_PLACE, check)) throw new VaultKeyMismatch(file);
+    return { firstStart: false, reseal: [], check: null };
+  }
+  const current = values.map((v) => opens(key, v.place, v.value));
+  const earlier = values.map((v, i) => (current[i] ? null : unsealEarlierForm(key, v.value)));
+  if (values.length > 0 && !current.some(Boolean) && !earlier.some((e) => e !== null)) {
+    throw new VaultKeyMismatch(file);
+  }
+  const firstStart = !current.some(Boolean);
+  const reseal = firstStart
+    ? earlier.flatMap((plain, index) => (plain ? [{ index, value: seal(key, values[index]!.place, plain) }] : []))
+    : [];
+  return { firstStart, reseal, check: seal(key, KEY_CHECK_PLACE, KEY_CHECK_TEXT) };
 }
 
 export async function sealCredentials(key: Buffer, place: SealPlace, c: Credentials): Promise<Buffer> {
