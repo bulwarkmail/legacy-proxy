@@ -1,7 +1,8 @@
 // TRUST_PROXY names the reverse proxy by address or range. Unset, `false`,
 // `0`, `no` and `off` trust nobody. Values that would let a caller choose its
-// own address (a hop count, `true`, a range wider than a reverse proxy's
-// network, an IPv4-mapped range, entries that together cover everything) or
+// own address (a hop count, `true`, a public range wider than a reverse
+// proxy's network, an IPv4-mapped range, entries that together cover
+// everything) or
 // that the proxy can't check (a host name) stop the start with a message that
 // names the setting, the value and what to write instead, without a stack.
 
@@ -22,10 +23,11 @@ describe("parseTrustProxy", () => {
     }
   });
 
-  it("takes addresses and CIDR ranges, IPv4 and IPv6, up to /8 and /32", () => {
+  it("takes addresses and CIDR ranges, IPv4 and IPv6, up to /8 and /32 in public space and private ranges whole", () => {
     expect(parseTrustProxy("127.0.0.1")).toEqual(["127.0.0.1"]);
     expect(parseTrustProxy("127.0.0.1, ::1")).toEqual(["127.0.0.1", "::1"]);
-    expect(parseTrustProxy("10.0.0.0/8,172.18.0.0/16, fd00:1::/64")).toEqual(["10.0.0.0/8", "172.18.0.0/16", "fd00:1::/64"]);
+    expect(parseTrustProxy("10.0.0.0/8,172.18.0.0/16, fd00::/8")).toEqual(["10.0.0.0/8", "172.18.0.0/16", "fd00::/8"]);
+    expect(parseTrustProxy("fd00:1::/64")).toEqual(["fd00:1::/64"]);
     expect(parseTrustProxy("192.0.2.10/32")).toEqual(["192.0.2.10/32"]);
     expect(parseTrustProxy("2001:db8::/32")).toEqual(["2001:db8::/32"]);
   });

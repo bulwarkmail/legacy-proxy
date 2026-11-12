@@ -77,9 +77,10 @@ const TRUST_PROXY_HINT =
   "when nothing is in front.";
 
 /**
- * The widest range accepted per address family. A reverse proxy's network is
- * never larger; a wider one would let a large part of the internet name its
- * own address.
+ * The widest range accepted per address family in public space. A reverse
+ * proxy's network is never larger; a wider one would let a large part of the
+ * internet name its own address. Private and link-local ranges (see
+ * PRIVATE_RANGES) may be given whole.
  */
 export const TRUST_PROXY_MIN_PREFIX = { 4: 8, 6: 32 } as const;
 
@@ -89,6 +90,22 @@ interface AddressRange {
   start: bigint;
   end: bigint;
 }
+
+// Private, shared, loopback and link-local space: no client on the internet
+// arrives from there, so a range inside it is accepted at any width.
+const PRIVATE_RANGES: AddressRange[] = (
+  [
+    ["10.0.0.0", 8, 4],
+    ["172.16.0.0", 12, 4],
+    ["192.168.0.0", 16, 4],
+    ["100.64.0.0", 10, 4],
+    ["127.0.0.0", 8, 4],
+    ["169.254.0.0", 16, 4],
+    ["fc00::", 7, 6],
+    ["fe80::", 10, 6],
+    ["::1", 128, 6],
+  ] as const
+).map(([address, bits, family]) => rangeOf(address, bits, family));
 
 // IPv6 addresses that stand for IPv4 clients (::ffff:0:0/96): the web
 // framework matches every IPv4 client against them.
@@ -101,8 +118,8 @@ const MAPPED_END = MAPPED_START + (1n << 32n) - 1n;
  * (`127.0.0.1`, `::1`, `10.0.0.0/8`). Unset, empty, `false`, `0`, `no` or
  * `off` trusts no one: the socket's address is the client's. Any other value
  * stops the start with a message: a hop count can't tell the reverse proxy
- * from a client that reaches the port directly; `true`, a range wider than
- * TRUST_PROXY_MIN_PREFIX, an IPv4-mapped IPv6 range, or entries that together
+ * from a client that reaches the port directly; `true`, a public range wider
+ * than TRUST_PROXY_MIN_PREFIX, an IPv4-mapped IPv6 range, or entries that together
  * cover every address would trust everyone or a large part of the internet;
  * and host names are not looked up.
  */
@@ -141,19 +158,28 @@ function parseTrustProxyEntry(entry: string): AddressRange | string {
   let bits = width;
   if (slash >= 0) {
     const text = entry.slice(slash + 1);
-    if (!/^\d{1,3}$/.test(text) || Number(text) > width) return `"${entry}" needs a prefix length from ${widest} to ${width}`;
+    if (!/^\d{1,3}$/.test(text) || Number(text) > width) return `"${entry}" needs a prefix length up to ${width}`;
     bits = Number(text);
-    if (bits < widest) {
-      return `"${entry}" is wider than /${widest}, which is larger than any reverse proxy's network`;
-    }
   }
-  const size = 1n << BigInt(width - bits);
-  const start = (addressValue(address, family) / size) * size;
-  const end = start + size - 1n;
-  if (family === 6 && start <= MAPPED_END && end >= MAPPED_START) {
+  const range = rangeOf(address, bits, family);
+  const isPrivate = PRIVATE_RANGES.some((p) => p.family === family && p.start <= range.start && range.end <= p.end);
+  if (bits < widest && !isPrivate) {
+    return (
+      `"${entry}" is wider than /${widest}, which is larger than any reverse proxy's network ` +
+      `(only private and link-local ranges such as 10.0.0.0/8, fc00::/7 or fe80::/10 may be given whole)`
+    );
+  }
+  if (family === 6 && range.start <= MAPPED_END && range.end >= MAPPED_START) {
     return `"${entry}" covers IPv4-mapped addresses (::ffff:0:0/96), which stand for IPv4 clients; write the IPv4 address or range itself`;
   }
-  return { family, start, end };
+  return range;
+}
+
+/** The range an address net.isIP accepted and a prefix length cover. */
+function rangeOf(address: string, bits: number, family: 4 | 6): AddressRange {
+  const size = 1n << BigInt((family === 4 ? 32 : 128) - bits);
+  const start = (addressValue(address, family) / size) * size;
+  return { family, start, end: start + size - 1n };
 }
 
 /** An address net.isIP accepted, as a number. */

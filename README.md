@@ -273,7 +273,11 @@ starts; they can be opened again once it has its answer. Push subscriptions
 made before the check get nothing while it is open; they deliver again if it
 ends "accepted" and end if it ends "refused". A sign-in with the stored
 password answers the check itself: both are valid. A sign-in with the new
-password changes nothing about it.
+password changes nothing about it. While a check opened by another password is
+open, this holds every other session of the account, including one the owner
+makes with a password they have just set: normally for milliseconds, up to an
+hour if the check is in its hourly phase, and up to 24 hours if the mail server
+gives no verdict.
 
 Only a refusal of the credentials answers "refused". An attempt that gets no
 answer (the server can't be reached, answers "try again later" with one of the
@@ -913,11 +917,14 @@ A reverse proxy on another host: put that host's address in `TRUST_PROXY`, and
 publish port 8080 on the address that host reaches, not on all interfaces (for
 example `"10.0.0.5:8080:8080"` in the compose file, with `TRUST_PROXY=10.0.0.4`).
 
-Ranges may be at most a `/8` for IPv4 and a `/32` for IPv6; no reverse proxy's
-network is larger. Anything else stops the proxy at start with one line that
-says what to write instead: a hop count such as `1` (the proxy couldn't tell
-the reverse proxy from a caller that reaches port 8080 directly and writes its
-own header), `true` or `yes`, a wider range, an IPv6 range that covers
+Private, loopback and link-local ranges may be given whole (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `127.0.0.0/8`,
+`169.254.0.0/16`, `fc00::/7`, `fe80::/10`, `::1`). Ranges in public space may be
+at most a `/8` for IPv4 and a `/32` for IPv6; no reverse proxy's network is
+larger. Anything else stops the proxy at start with one line that says what to
+write instead: a hop count such as `1` (the proxy couldn't tell the reverse
+proxy from a caller that reaches port 8080 directly and writes its own header),
+`true` or `yes`, a wider public range, an IPv6 range that covers
 IPv4-mapped addresses (`::ffff:0:0/96`; write the IPv4 address or range
 itself), entries that together cover every address, a host name, or an empty
 entry. If you set `TRUST_PROXY=1` or `TRUST_PROXY=true` before, replace it with
