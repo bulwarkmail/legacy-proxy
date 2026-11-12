@@ -246,14 +246,16 @@ export class GmailStore {
    */
   issueTokens(email: string, client: string, now = Date.now()): IssuedTokens {
     if (!this.hasConnection(email)) throw new Error("Account is not connected");
-    return this.db.transaction(() => this.tokensFor({ email, client, family: null, since: now }, now))();
+    return this.db.transaction(() => this.tokensFor({ email, client, family: null, since: now, parent: null }, now))();
   }
   /**
    * Exchanges a refresh token of this client for a new refresh token and a new access token of the same
    * sign-in. The token that was used stays good for {@link REFRESH_REUSE_GRACE} after its first use, so two
-   * tabs that refresh at the same moment both get an answer. Presented again later, it was copied: it is
-   * refused and every token of its sign-in stops working. A sign-in ends {@link SIGN_IN_TTL} after it was
-   * made, however often it was refreshed.
+   * tabs that refresh at the same moment both get an answer, but it is exchanged at most
+   * {@link MAX_SUCCESSORS} times: a further exchange inside that time is refused and leaves the sign-in as
+   * it is, so a client that retries too often loses only that answer. Presented after that time, it was
+   * copied: it is refused and every token of its sign-in stops working. A sign-in ends
+   * {@link SIGN_IN_TTL} after it was made, however often it was refreshed.
    */
   refreshTokens(refreshToken: string, client: string, now = Date.now()): IssuedTokens | null {
     if (!TOKEN_RE.refresh.test(refreshToken)) return null;
@@ -272,13 +274,21 @@ export class GmailStore {
       }
       const since = row.family_since ?? now;
       if (now >= since + SIGN_IN_TTL || !this.hasConnection(row.email)) return null;
+      // A refresh token's successors record it as their parent.
+      const successors = (
+        this.db.prepare("SELECT COUNT(*) AS n FROM gmail_token WHERE kind='refresh' AND parent=?").get(hash) as { n: number }
+      ).n;
+      if (successors >= MAX_SUCCESSORS) return null;
       if (row.used_at === null) this.db.prepare("UPDATE gmail_token SET used_at=? WHERE hash=?").run(now, hash);
-      return this.tokensFor({ email: row.email, client, family, since }, now);
+      return this.tokensFor({ email: row.email, client, family, since, parent: hash }, now);
     })();
   }
-  /** A new refresh token and an access token under it, in sign-in `family` (a new one when null) made at `since`. Callers hold a transaction. */
+  /**
+   * A new refresh token and an access token under it, in sign-in `family` (a new one when null) made at
+   * `since`; `parent` is the refresh token it replaces, if any. Callers hold a transaction.
+   */
   private tokensFor(
-    s: { email: string; client: string; family: string | null; since: number },
+    s: { email: string; client: string; family: string | null; since: number; parent: string | null },
     now: number,
   ): IssuedTokens {
     const end = s.since + SIGN_IN_TTL;
@@ -290,7 +300,7 @@ export class GmailStore {
       "INSERT INTO gmail_token(hash,email,client,kind,parent,expires,family,family_since) VALUES (?,?,?,?,?,?,?,?)",
     );
     this.db.prepare("DELETE FROM gmail_token WHERE expires<=?").run(now);
-    insert.run(refreshHash, s.email, s.client, "refresh", null, Math.min(now + REFRESH_TOKEN_TTL, end), family, s.since);
+    insert.run(refreshHash, s.email, s.client, "refresh", s.parent, Math.min(now + REFRESH_TOKEN_TTL, end), family, s.since);
     insert.run(tokenHash(access), s.email, s.client, "access", refreshHash, Math.min(now + ACCESS_TOKEN_TTL, end), family, s.since);
     return { email: s.email, accessToken: access, expiresIn: ACCESS_TOKEN_TTL / 1000, refreshToken: refresh };
   }
@@ -1056,6 +1066,8 @@ const ACCESS_TOKEN_TTL = 3600_000;
 const REFRESH_TOKEN_TTL = 180 * 86400_000;
 /** How long a refresh token still answers after its first use, for a second tab that was a moment late. */
 export const REFRESH_REUSE_GRACE = 60_000;
+/** How many new refresh tokens one refresh token can be exchanged for in that time. */
+export const MAX_SUCCESSORS = 3;
 /** A sign-in ends this long after it was made, however often it was refreshed. */
 export const SIGN_IN_TTL = 365 * 86400_000;
 const TOKEN_PREFIX = { access: "gmat_", refresh: "gmrt_" } as const;

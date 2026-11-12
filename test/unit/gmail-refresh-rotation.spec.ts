@@ -81,6 +81,33 @@ describe("refreshing a bridge sign-in", () => {
     expect(store.refreshTokens(first.refreshToken, "webmail", t0 + 661 * SECOND)).toBeNull();
   });
 
+  it("exchanges one token at most three times inside its minute, and a further try ends nothing", async () => {
+    const store = await connected();
+    const t0 = Date.now();
+    const first = store.issueTokens(EMAIL, "webmail", t0);
+    const answers = Array.from({ length: 10 }, (_, i) => store.refreshTokens(first.refreshToken, "webmail", t0 + 600 * SECOND + i * SECOND));
+    const answered = answers.filter((a) => a !== null);
+    expect(answered).toHaveLength(3);
+    expect(answers.slice(3)).toEqual(new Array(7).fill(null));
+    // The three answers keep working: the refused tries did not end the sign-in.
+    for (const a of answered) {
+      expect(store.authenticateToken(a!.accessToken, t0 + 615 * SECOND)).toBe(EMAIL);
+      expect(store.refreshTokens(a!.refreshToken, "webmail", t0 + 1200 * SECOND)).not.toBeNull();
+    }
+  });
+
+  it("counts the three per token, so each new token gets its own", async () => {
+    const store = await connected();
+    const t0 = Date.now();
+    let current = store.issueTokens(EMAIL, "webmail", t0).refreshToken;
+    for (let step = 1; step <= 5; step++) {
+      const at = t0 + step * 600 * SECOND;
+      const tries = [0, 1, 2, 3].map((i) => store.refreshTokens(current, "webmail", at + i * SECOND));
+      expect(tries.map((t) => t !== null)).toEqual([true, true, true, false]);
+      current = tries[0]!.refreshToken;
+    }
+  });
+
   it("refuses a token brought back after that minute and ends every token of its sign-in", async () => {
     const store = await connected();
     const t0 = Date.now();
