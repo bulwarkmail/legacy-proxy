@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { bootProxy } from "./fake-imap.js";
 import { startScriptedImap, type LoginAnswer, type ScriptedImap } from "./scripted-imap.js";
-import { openCredentials } from "../../src/auth/credentials.js";
+import { openCredentials, sealPlace } from "../../src/auth/credentials.js";
 
 /** Per user: the passwords the server accepts, and answers that replace the default for one password. */
 const users: Record<string, { valid: string[]; answers?: Record<string, () => LoginAnswer | Promise<LoginAnswer>> }> = {};
@@ -81,7 +81,7 @@ async function row(username: string) {
     return {
       gen: r.cred_gen,
       checkOpen: !!r.cred_check_tag,
-      stored: (await openCredentials(key, r.cred_check_vault ?? r.vault)).password,
+      stored: (await openCredentials(key, sealPlace.account(r.slug), r.cred_check_vault ?? r.vault)).password,
     };
   } finally {
     store.close();

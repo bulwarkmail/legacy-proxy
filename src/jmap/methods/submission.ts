@@ -5,7 +5,7 @@ import type { AppConfig } from "../../util/config.js";
 import { decodeEmailId } from "../../mapping/ids.js";
 import { withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
-import { openCredentials } from "../../auth/credentials.js";
+import { openAccountCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
 import { headerValues, isPlainAddress, parseAddressList, readHeaderBlock } from "../../mapping/buildMime.js";
 import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, notFound } from "../errors.js";
@@ -256,7 +256,7 @@ export async function emailSubmissionSet(
   if (!provider.smtp) {
     throw new JmapError("forbidden", "no SMTP submission configured for this account");
   }
-  const creds = await openCredentials(ctx.cfg.vaultKey, ctx.account.vault);
+  const creds = await openAccountCredentials(ctx.cfg.vaultKey, ctx.account);
 
   const oldState = stateString(ctx.store.getState(ctx.account.id, "submission"));
   const gmail = ctx.account.kind === "gmail";

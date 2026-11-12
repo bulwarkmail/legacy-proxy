@@ -10,7 +10,7 @@ import { afterAll, beforeAll, beforeEach } from "vitest";
 import type { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { Store, type AccountRow } from "../../src/state/store.js";
-import { sealCredentials } from "../../src/auth/credentials.js";
+import { sealCredentials, sealPlace } from "../../src/auth/credentials.js";
 import { emailSubmissionSet } from "../../src/jmap/methods/submission.js";
 import { buildRfc822 } from "../../src/mapping/buildMime.js";
 import { encodeEmailId } from "../../src/mapping/ids.js";
@@ -86,7 +86,7 @@ export function useSubmitHarness(): void {
       kind: "generic",
       host: "imap.test",
       username: "alice@corp.example",
-      vault: await sealCredentials(vaultKey, { mech: "PLAIN", username: "alice@corp.example", password: "fake-password" }),
+      vault: await sealCredentials(vaultKey, sealPlace.account("generic:alice@corp.example"), { mech: "PLAIN", username: "alice@corp.example", password: "fake-password" }),
     });
     const row = store.db
       .prepare(`INSERT INTO mailbox(account_id, name) VALUES(?, 'Drafts') RETURNING id`)

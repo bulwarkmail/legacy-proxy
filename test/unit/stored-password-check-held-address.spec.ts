@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { bootProxy } from "./fake-imap.js";
 import { startScriptedImap, type ScriptedImap } from "./scripted-imap.js";
-import { openCredentials } from "../../src/auth/credentials.js";
+import { openCredentials, sealPlace } from "../../src/auth/credentials.js";
 
 let unavailableOnce = false;
 let imap: ScriptedImap;
@@ -62,7 +62,7 @@ describe("a check opened by someone with one valid password", () => {
     } finally {
       db.close();
     }
-    const inRow = (await openCredentials(Buffer.from(process.env.VAULT_KEY!, "base64"), row.vault)).password;
+    const inRow = (await openCredentials(Buffer.from(process.env.VAULT_KEY!, "base64"), sealPlace.account("generic:quin@test.local"), row.vault)).password;
     const ownerStatus = (await app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: `Bearer ${owner}` }, remoteAddress: "192.0.2.30" })).statusCode;
     expect({ open: row.cred_check_tag !== null, inRow, ownerStatus }).toEqual({ open: false, inRow: "owner-password", ownerStatus: 200 });
   }, 60_000);

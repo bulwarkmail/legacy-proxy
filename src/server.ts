@@ -10,7 +10,7 @@ import { corsOptions, fromBrowser } from "./util/cors.js";
 import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
-import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
+import { sealCredentials, openCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
 import {
   credentialTag,
   generationValid,
@@ -249,11 +249,15 @@ function sameCredentials(a: Credentials, b: Credentials): boolean {
   return oauth(a) === oauth(b) && a.username === b.username && (a.password ?? null) === (b.password ?? null);
 }
 
-/** The credentials sealed in `vault`, or null when there are none or they can't be read (another VAULT_KEY). */
-async function unsealed(vault: Buffer | null | undefined): Promise<Credentials | null> {
+/**
+ * The credentials sealed in `vault` of the account row `slug`, or null when
+ * there are none or they can't be read (another VAULT_KEY, or sealed for
+ * another row).
+ */
+async function unsealed(slug: string, vault: Buffer | null | undefined): Promise<Credentials | null> {
   if (!vault) return null;
   try {
-    return await openCredentials(cfg.vaultKey, vault);
+    return await openCredentials(cfg.vaultKey, sealPlace.account(slug), vault);
   } catch {
     return null;
   }
@@ -332,7 +336,7 @@ async function runCheckAttempt(accountId: number): Promise<CheckAttemptResult> {
   const row = store.getAccountById(accountId);
   if (!row?.cred_check_tag) return "answered";
   store.noteCheckAttempt(accountId, row.cred_check_since ?? 0);
-  const checked = await unsealed(row.cred_check_vault);
+  const checked = await unsealed(row.slug, row.cred_check_vault);
   // Stored credentials that can't be read can't be checked: the new ones replace them.
   if (!checked) {
     answerCheck(row, "refused");
@@ -388,7 +392,7 @@ type SignInOutcome = { ok: true; account: AccountRow } | { ok: false; status: 50
  */
 async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   const existing = store.getAccount(s.slug);
-  const vault = await sealCredentials(cfg.vaultKey, s.creds);
+  const vault = await sealCredentials(cfg.vaultKey, sealPlace.account(s.slug), s.creds);
   const save = (rotate: boolean): SignInOutcome => ({
     ok: true,
     account: store.upsertAccount({
@@ -404,7 +408,7 @@ async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   if (!existing) return save(false);
   // The credentials the row holds: the stored ones, or during a check the
   // ones that opened it.
-  const held = await unsealed(existing.vault);
+  const held = await unsealed(existing.slug, existing.vault);
   if (held && sameCredentials(held, s.creds)) return save(false);
   // Stored credentials that can't be read, or that the server refused
   // already, are replaced at once.
@@ -412,7 +416,7 @@ async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   if (existing.cred_check_tag) {
     // The stored password while it is being checked: the server just
     // accepted it, which answers the check.
-    const checked = await unsealed(existing.cred_check_vault);
+    const checked = await unsealed(existing.slug, existing.cred_check_vault);
     if (checked && sameCredentials(checked, s.creds)) answerCheck(existing, "accepted");
     else {
       // Another password: its session would depend on the answer, so it

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Database as DB, Statement } from "better-sqlite3";
@@ -289,7 +290,15 @@ export class Store {
   private stmts = new Map<string, Statement>();
 
   constructor(dataDir: string) {
-    this.db = new Database(path.join(dataDir, "proxy.db"));
+    // The database holds the sealed mail credentials and, in clear, cached
+    // message metadata, previews, attachments and uploads: only the proxy's
+    // own user may read it. Permissions are set before SQLite opens the file,
+    // so the WAL and SHM files it creates next to it get the same; files from
+    // before this get them on the next start.
+    const file = path.join(dataDir, "proxy.db");
+    fs.closeSync(fs.openSync(file, "a", 0o600));
+    for (const f of [file, `${file}-wal`, `${file}-shm`]) if (fs.existsSync(f)) fs.chmodSync(f, 0o600);
+    this.db = new Database(file);
     this.db.exec(SCHEMA);
     for (const { table, column, definition } of ADDED_COLUMNS) {
       const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];

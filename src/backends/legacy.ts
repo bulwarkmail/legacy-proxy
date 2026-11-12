@@ -43,7 +43,7 @@ import {
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "../jmap/methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
-import { openCredentials } from "../auth/credentials.js";
+import { openAccountCredentials } from "../auth/credentials.js";
 import type { MethodTable } from "../jmap/router.js";
 
 export interface LegacyContext {
@@ -95,17 +95,17 @@ function makeMethodTable(): Record<string, Handler> {
           notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
         };
       }
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return addressBookGet(a as never, { account: c.account, provider, creds });
     },
     "AddressBook/set": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return addressBookSet(a as never, { account: c.account, provider, creds });
     },
     "AddressBook/changes": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return addressBookChanges(a as never, { account: c.account, provider, creds });
     },
     "ContactCard/get": async (a, c) => {
@@ -118,7 +118,7 @@ function makeMethodTable(): Record<string, Handler> {
           notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
         };
       }
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return contactCardGet(a as never, { account: c.account, provider, creds });
     },
     "ContactCard/query": async (a, c) => {
@@ -133,22 +133,22 @@ function makeMethodTable(): Record<string, Handler> {
           ids: [],
         };
       }
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return contactCardQuery(a as never, { account: c.account, provider, creds });
     },
     "ContactCard/set": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return contactCardSet(a as never, { account: c.account, provider, creds });
     },
     "ContactCard/changes": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return contactCardChanges(a as never, { account: c.account, provider, creds });
     },
     "ContactCard/queryChanges": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return contactCardQueryChanges(a as never, { account: c.account, provider, creds });
     },
     "Mailbox/get": async (a, c) =>
@@ -234,12 +234,12 @@ function makeMethodTable(): Record<string, Handler> {
       identityChanges(a as never, { account: c.account, store: c.store }),
     "VacationResponse/get": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return vacationGet(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "VacationResponse/set": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
       return vacationSet(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "VacationResponse/changes": async (a, c) =>

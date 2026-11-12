@@ -541,10 +541,10 @@ leave the bridge.
 In Bulwark, give the bridge's server entry an OAuth client ID equal to the
 registered `id`, and optionally a button label such as "Sign in with Google".
 
-Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
-The same database caches metadata, message bodies and attachment bytes in plaintext;
-protect `DATA_DIR` and its backups. Cached values expire and are bounded to 256 MiB
-of logical data per account (SQLite may retain free pages).
+The Google grant, cached mail (metadata, message bodies, attachment bytes) and
+uploads are sealed with `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`; see
+[Data at rest](#data-at-rest) for what stays in clear. Cached values expire and are
+bounded to 256 MiB of logical data per account (SQLite may retain free pages).
 Google Testing refresh tokens with Gmail scopes expire after seven days; reconnect
 when consent expires or is revoked.
 
@@ -980,6 +980,34 @@ offered it) has three ways out:
 2. required STARTTLS: `"starttls": true`, with `"secure": false` or no `secure`;
 3. a plain connection on purpose: `"allowPlaintext": true`, for a server on a
    network you trust.
+
+### Data at rest
+
+Everything lives in `DATA_DIR`: `proxy.db` for the IMAP backend and
+`gmail.sqlite3` for the Gmail bridge. Both files are readable and writable by
+the proxy's user only (mode 0600): they are created that way and set to it at
+every start. Protect `DATA_DIR` and its backups anyway, because not everything
+in them is sealed.
+
+Sealed with AES-256-GCM: the stored mail credentials of each IMAP account, and on
+the Gmail bridge the Google grant, the cache and uploaded files. Each table has a
+key of its own derived from `VAULT_KEY` (HKDF-SHA256), and every value is bound
+to its row: the table, the account and the row's key go in as associated data, so
+a value copied into another account's row does not open there. Values sealed by
+earlier versions (with `VAULT_KEY` itself and no binding) still open, and are
+written in the current form the next time their row is written: at the next
+sign-in for IMAP credentials, at the next Google token renewal for a Gmail grant,
+on the next read for a cache entry. Uploads made before the upgrade stay as they
+came until they expire (24 hours).
+
+In clear: the IMAP backend's caches of message metadata (envelope, structure,
+headers), previews and attachment bytes, and its pending uploads; on the Gmail
+bridge the profile and label snapshot, draft and send-ledger records, scheduled
+sends with their recipients, and push subscription URLs. Bridge passwords and
+sign-in tokens are stored only as SHA-256 hashes.
+
+A wrong `VAULT_KEY` opens nothing: the error says that `VAULT_KEY` is not the
+one the value was sealed with. Keep the key with the backups of `DATA_DIR`.
 
 ## Tests
 
