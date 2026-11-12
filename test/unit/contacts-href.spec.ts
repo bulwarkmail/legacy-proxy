@@ -139,6 +139,13 @@ describe("ContactCard ids cannot point outside their address book", () => {
     ["a scheme-relative address", "//other.example/books/u/contacts/one.vcf"],
     ["the book itself", BOOK],
     ["an empty segment", `${BOOK}/one.vcf`],
+    ["a path parameter after a dot segment (servlet containers strip it)", `${BOOK}..;/..;/..;/calendars/u/work/x`],
+    ["an encoded path parameter", `${BOOK}..%3B/..%3B/..%3b/calendars/u/work/x`],
+    ["a dot segment with a trailing encoded NUL", `${BOOK}..%00/..%00/..%00/calendars/u/work/x`],
+    ["a twice-encoded NUL after a dot segment", `${BOOK}..%2500/..%2500/..%2500/calendars/u/work/x`],
+    ["a dot segment with an encoded trailing space", `${BOOK}..%20/..%20/..%20/calendars/u/work/x`],
+    ["a path parameter with a value", `${BOOK}..;jsessionid=1/..;x/..;y/calendars/u/work/x`],
+    ["an overlong UTF-8 dot", `${BOOK}%c0%ae%c0%ae/%c0%ae%c0%ae/%c0%ae%c0%ae/calendars/u/work/x`],
   ])("answers notFound and sends nothing for %s", async (_label, resource) => {
     const bad = id(BOOK, resource);
     const res = await contactCardSet(
@@ -206,6 +213,15 @@ describe("CardDavClient.isInBook", () => {
     ["/books/a/", "/books/a/./card.vcf", false],
     ["/books/a/", "/books/a/%25252e%25252e/card.vcf", false],
     ["/books/a/", "/books/a/%252525252525252e/card.vcf", false],
+    ["/books/a/", "/books/a/.;/card.vcf", false],
+    ["/books/a/", "/books/a/%2e%2e%3b/card.vcf", false],
+    ["/books/a/", "/books/a/...%00x/card.vcf", false],
+    ["/books/a/", "/books/a/.%09/card.vcf", false],
+    ["/books/a/", "/books/a/%e0%80%ae/card.vcf", false],
+    ["/books/a/", "/books/a/.hidden.vcf", true],
+    ["/books/a/", "/books/a/..vcf", true],
+    ["/books/a/", "/books/a/a;b.vcf", true],
+    ["/books/a/", "/books/a/a%3Bb.vcf", true],
   ])("book %s, resource %s: %s", (book, resource, expected) => {
     expect(client.isInBook(book, resource)).toBe(expected);
   });
