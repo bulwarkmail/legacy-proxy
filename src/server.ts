@@ -23,7 +23,7 @@ import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
-import { EventSourceHub } from "./jmap/eventsource.js";
+import { EventSourceHub, type StreamSession } from "./jmap/eventsource.js";
 import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
 import { LoginLimiter } from "./auth/loginLimit.js";
 import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
@@ -69,14 +69,17 @@ const checks = new StoredPasswordChecks((accountId) => runCheckAttempt(accountId
 const checkAddress = new Map<number, string>();
 
 // When an account's credential generation moves, nothing logged in with the
-// old credentials keeps serving it: pooled connections close and the IDLE
-// worker starts over. Cached Basic logins check the generation themselves.
+// old credentials keeps serving it: pooled connections close, the IDLE worker
+// starts over, and event streams of sessions that are no longer valid end.
+// Cached Basic logins check the generation themselves.
 store.setCredentialListener((accountId) => {
   confirmedAlongside.delete(accountId);
-  if (!store.getAccountById(accountId)?.cred_check_tag) {
+  const row = store.getAccountById(accountId);
+  if (!row?.cred_check_tag) {
     checks.close(accountId);
     checkAddress.delete(accountId);
   }
+  hub.closeWhere(accountId, (s) => !row || !generationValid(s.gen, s.tag, row.cred_gen, row.cred_rotated_by));
   pool.retire(accountId);
   idleManager.onCredentialsChanged(accountId);
 });
@@ -231,7 +234,9 @@ app.post("/api/logout", async (req, reply) => {
   const token = typeof h === "string" && h.startsWith("Bearer ") ? h.slice("Bearer ".length).trim() : "";
   const session = token ? bearerSession(token) : null;
   if (!session) return send401(req, reply);
-  store.endSession(tokenHash(token), session.token.exp * 1000);
+  const hash = tokenHash(token);
+  store.endSession(hash, session.token.exp * 1000);
+  hub.closeWhere(session.account.id, (s) => s.tokenHash === hash);
   return reply.code(204).send();
 });
 
@@ -407,6 +412,8 @@ async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   if (!opened) return again ? { ok: false, status: 503, retryAfterSec: 1, error: TRY_AGAIN } : recordSignIn(s, true);
   checkAddress.set(opened.id, s.ip);
   checks.open(opened.id);
+  // Streams of the sessions the check holds end; they can open again once it has its answer.
+  hub.closeWhere(opened.id, (session) => session.tag !== s.tag);
   return { ok: true, account: opened };
 }
 
@@ -762,8 +769,9 @@ app.post<{ Params: { accountId: string } }>(
 app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>(
   "/jmap/eventsource",
   async (req, reply) => {
-    const account = await requireAccount(req, reply);
-    if (!account) return reply;
+    const caller = await requireSession(req, reply);
+    if (!caller) return reply;
+    const { account, session } = caller;
     const origin = (req.headers["origin"] as string | undefined) ?? null;
     // Per RFC 8620 §7.3, `types=*` means all; an explicit comma-separated list
     // is a server-side filter. `closeafter=state` ends the stream after one
@@ -777,7 +785,9 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
     const closeAfter = req.query.closeafter === "state";
     const pingRaw = Number(req.query.ping ?? 30);
     const pingSec = Number.isFinite(pingRaw) ? Math.max(15, Math.min(pingRaw, 300)) : 30;
-    hub.add(account, reply, origin, { types, closeAfter, pingSec });
+    // The stream ends with its session: on sign-out, when the password behind
+    // it is replaced, and while a check holds the session.
+    hub.add(account, reply, origin, { types, closeAfter, pingSec, session });
   },
 );
 
@@ -798,21 +808,29 @@ const MAX_REVALIDATIONS_PER_ACCOUNT = 3;
 
 type AccountRow = import("./state/store.js").AccountRow;
 type AuthOutcome =
-  | { ok: true; account: AccountRow }
+  | { ok: true; account: AccountRow; session: StreamSession }
   | { ok: false; status: 401 }
   | { ok: false; status: 429 | 503; retryAfterSec: number; error?: string };
 const UNAUTHORIZED: AuthOutcome = { ok: false, status: 401 };
+
+/** The caller's account and session, or null after answering 401, 429 or 503. */
+async function requireSession(
+  req: { headers: Record<string, string | string[] | undefined>; ip: string },
+  reply: import("fastify").FastifyReply,
+): Promise<{ account: AccountRow; session: StreamSession } | null> {
+  const outcome = await authn(req);
+  if (outcome.ok) return outcome;
+  if (outcome.status === 401) send401(req, reply);
+  else sendLimited(reply, outcome);
+  return null;
+}
 
 /** The caller's account, or null after answering 401, 429 or 503. */
 async function requireAccount(
   req: { headers: Record<string, string | string[] | undefined>; ip: string },
   reply: import("fastify").FastifyReply,
 ): Promise<AccountRow | null> {
-  const outcome = await authn(req);
-  if (outcome.ok) return outcome.account;
-  if (outcome.status === 401) send401(req, reply);
-  else sendLimited(reply, outcome);
-  return null;
+  return (await requireSession(req, reply))?.account ?? null;
 }
 
 async function authn(req: {
@@ -829,7 +847,12 @@ async function authn(req: {
     const held = await holdForCheck(first.account, first.token.cf);
     if (held) return held;
     const session = bearerSession(token);
-    return session ? { ok: true, account: session.account } : UNAUTHORIZED;
+    if (!session) return UNAUTHORIZED;
+    return {
+      ok: true,
+      account: session.account,
+      session: { gen: sessionGeneration(session.token), tag: session.token.cf, tokenHash: tokenHash(token) },
+    };
   }
 
   if (h.startsWith("Basic ")) {
@@ -855,7 +878,7 @@ async function authn(req: {
       const account = store.getAccountById(cached.accountId);
       // A login validated under an older credential generation is asked again.
       if (account && generationValid(cached.gen, cached.tag, account.cred_gen, account.cred_rotated_by)) {
-        return { ok: true, account };
+        return { ok: true, account, session: { gen: cached.gen, tag: cached.tag } };
       }
       basicCache.delete(tag);
     }
@@ -932,7 +955,7 @@ async function basicLogin(
   // need one immediately.
   pool.adopt(account, probe);
   basicCache.set(tag, { accountId: account.id, gen: account.cred_gen, tag });
-  return { ok: true, account };
+  return { ok: true, account, session: { gen: account.cred_gen, tag } };
 }
 
 // Checks of stored passwords that were still open when the proxy stopped go on

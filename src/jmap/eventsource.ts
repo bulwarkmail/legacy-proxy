@@ -11,11 +11,22 @@ export interface StateChange {
   changed: Record<string, Record<string, string>>;
 }
 
+/** The session a stream was opened with, so the stream can end with it. */
+export interface StreamSession {
+  /** Credential generation the session was issued under. */
+  gen: number;
+  /** Credential tag of the credentials it was made with. */
+  tag?: string;
+  /** SHA-256 of the Bearer token, for a stream opened with one. */
+  tokenHash?: string;
+}
+
 interface Subscriber {
   reply: FastifyReply;
   types: Set<string> | null;
   closeAfter: boolean;
   ping: NodeJS.Timeout;
+  session?: StreamSession;
 }
 
 /** Open event streams per account; a new one past this closes the oldest. */
@@ -30,7 +41,7 @@ export class EventSourceHub {
     account: AccountRow,
     reply: FastifyReply,
     origin: string | null,
-    opts: { types?: string[] | null; closeAfter?: boolean; pingSec?: number } = {},
+    opts: { types?: string[] | null; closeAfter?: boolean; pingSec?: number; session?: StreamSession } = {},
   ): void {
     const pingSec = opts.pingSec ?? 30;
     let set = this.clients.get(account.id);
@@ -74,6 +85,7 @@ export class EventSourceHub {
       types: opts.types && opts.types.length > 0 ? new Set(opts.types) : null,
       closeAfter: opts.closeAfter ?? false,
       ping,
+      ...(opts.session ? { session: opts.session } : {}),
     };
     set.add(sub);
 
@@ -83,6 +95,26 @@ export class EventSourceHub {
       accountSet?.delete(sub);
       if (accountSet && accountSet.size === 0) this.clients.delete(account.id);
     });
+  }
+
+  /**
+   * End the account's streams whose session `ended` says may no longer be
+   * served. Streams opened without a session are left open.
+   */
+  closeWhere(accountId: number, ended: (session: StreamSession) => boolean): void {
+    const set = this.clients.get(accountId);
+    if (!set) return;
+    for (const sub of [...set]) {
+      if (!sub.session || !ended(sub.session)) continue;
+      set.delete(sub);
+      clearInterval(sub.ping);
+      try {
+        sub.reply.raw.end();
+      } catch {
+        // already gone
+      }
+    }
+    if (set.size === 0) this.clients.delete(accountId);
   }
 
   publish(account: AccountRow, change: StateChange): void {

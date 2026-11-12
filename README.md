@@ -255,8 +255,9 @@ refuses it:
   stores the new password and moves the account's credential generation. From
   then on every session made with the old password is answered `401`, the
   IMAP connections that logged in with it, the push IDLE connection included,
-  are closed, and the push subscriptions made before the change end. Sessions
-  made with the new password, and the subscriptions they made, keep working.
+  are closed, its event streams end, and the push subscriptions made before
+  the change end. Sessions made with the new password, and the subscriptions
+  and streams they opened, keep working.
 - If the server still accepts the stored password, both are valid (one app
   password per device, for example): nothing changes, and each device's Basic
   header is cached as usual. The stored password is not checked again for that
@@ -267,8 +268,9 @@ served, and the proxy logs in with the new password for its own connections.
 Every other session of the account, and a sign-in with yet another password,
 waits for the answer while an attempt is due within 15 seconds and is then
 answered `401` or served as the answer says; otherwise it gets `503` with
-`Retry-After`. A sign-in with the stored password answers the check itself:
-both are valid.
+`Retry-After`. Event streams those sessions opened before end when the check
+starts; they can be opened again once it has its answer. A sign-in with the
+stored password answers the check itself: both are valid.
 
 Only a refusal of the credentials answers "refused". An attempt that gets no
 answer (the server can't be reached, answers "try again later" with one of the
@@ -287,8 +289,8 @@ The proxy also notices a password that was changed at the mail server. When the
 server refuses the stored password three times in a row (when the push IDLE
 worker reconnects, or the pool opens a new connection), the stored credentials
 are marked refused: the proxy stops logging in with them, every token issued
-before is answered `401`, and the account's push subscriptions end, so its
-push IDLE worker stops. After a refusal the
+before is answered `401` and its event streams end, and the account's push
+subscriptions end, so its push IDLE worker stops. After a refusal the
 stored password is tried again only two and a half minutes later, so the three
 refusals span at least five minutes and a server that refuses logins for a
 moment marks nobody; requests that need a new connection in between fail
@@ -300,8 +302,9 @@ server that cannot be reached, or answers "try again later" (`UNAVAILABLE`,
 store error), is not a refusal and is retried with backoff, at most once a
 minute.
 
-`POST /api/logout` with `Authorization: Bearer <token>` ends that one token and
-answers `204`; the account's other sessions stay signed in. Ended tokens are
+`POST /api/logout` with `Authorization: Bearer <token>` ends that one token,
+closes the event streams opened with it, and answers `204`; the account's other
+sessions and their streams stay. Ended tokens are
 kept in the database until they would have expired, so a restart does not
 bring them back.
 
