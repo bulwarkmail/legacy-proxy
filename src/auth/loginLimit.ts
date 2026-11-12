@@ -98,8 +98,15 @@ class FailureLog {
 
   private prune(now: number, force: boolean): void {
     this.lastPrune = now;
+    // The map is in order of last failure, oldest first (add re-inserts), so
+    // the expired entries are at its front: stop at the first live one. Each
+    // entry is read here once before it goes, and a full log costs a few reads
+    // per new key, not one per entry. (After the clock steps back an expired
+    // entry can sit behind a live one; it goes when it reaches the front or is
+    // looked up, and the size stays bounded either way.)
     for (const [key, list] of this.entries) {
-      if (!list.length || list[list.length - 1]! <= now - this.windowMs) this.entries.delete(key);
+      if (list.length && list[list.length - 1]! > now - this.windowMs) break;
+      this.entries.delete(key);
     }
     if (!force) return;
     // Still full of live entries: drop the least recently failed.
