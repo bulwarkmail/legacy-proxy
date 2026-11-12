@@ -308,14 +308,25 @@ const ADDRESS_FIELDS = [
 interface CheckedAddress {
   name: string;
   address: string;
-  /** False for a recipient still being typed: text without an "@", which names no mailbox. */
+  /** False for a recipient still being typed (see isDraftText), which names no mailbox. */
   mailbox: boolean;
 }
 
-// What text without an "@" may not contain to stay text: everything address
-// syntax gives meaning to (angle brackets, quotes, escapes, the colon and
-// semicolon of a group, the comma of a list, comments, domain literals) and
-// line breaks.
+/**
+ * A recipient still being typed into a draft: text without an "@" (`bob`,
+ * `Bob Smith`), or text whose only "@" is its first or last character and
+ * that holds no white space (`jane@`, `@corp.example`). Neither has both a
+ * local part and a domain, so it names no mailbox.
+ */
+function isDraftText(address: string): boolean {
+  const at = address.indexOf("@");
+  if (at < 0) return true;
+  return at === address.lastIndexOf("@") && (at === 0 || at === address.length - 1) && !/\s/u.test(address);
+}
+
+// What draft text may not contain to stay text: everything address syntax
+// gives meaning to (angle brackets, quotes, escapes, the colon and semicolon
+// of a group, the comma of a list, comments, domain literals) and line breaks.
 const NOT_DRAFT_TEXT = /[<>"\\:;,()[\]\u0000-\u001f\u007f-\u009f\u2028\u2029\ufffd]/u;
 
 function refusedAddress(property: string, address: string): JmapError {
@@ -325,13 +336,12 @@ function refusedAddress(property: string, address: string): JmapError {
 }
 
 /**
- * One address property, checked before anything reaches MimeNode. An entry
- * with an "@" must be one plain address (isPlainAddress). An entry without
- * one is a recipient still being typed into a draft (`bob`, `Bob Smith`): it
- * is written as text, provided it holds nothing in NOT_DRAFT_TEXT, and a
- * submission refuses it later. An entry without an email is left out.
- * Anything else refuses the create with invalidProperties naming the
- * property and the address as given.
+ * One address property, checked before anything reaches MimeNode. A
+ * recipient still being typed (isDraftText) is written as text, provided it
+ * holds nothing in NOT_DRAFT_TEXT, and a submission refuses it later. Any
+ * other entry must be one plain address (isPlainAddress). An entry without an
+ * email is left out. Anything else refuses the create with invalidProperties
+ * naming the property and the address as given.
  */
 function checkedAddresses(property: string, list: unknown): CheckedAddress[] {
   if (list == null) return [];
@@ -344,7 +354,7 @@ function checkedAddresses(property: string, list: unknown): CheckedAddress[] {
     const address = email.trim();
     if (!address) continue;
     const name = typeof entry?.name === "string" ? entry.name.trim() : "";
-    if (!address.includes("@")) {
+    if (isDraftText(address)) {
       if (NOT_DRAFT_TEXT.test(address)) throw refusedAddress(property, email);
       out.push({ name, address, mailbox: false });
       continue;
@@ -371,10 +381,10 @@ function sameMailbox(a: string, b: string): boolean {
  * Reads each address header of the built message back with the strict parser
  * and refuses the create unless it has one entry per entry given, in order:
  * each address read back as exactly that mailbox, each recipient still being
- * typed read back as no mailbox at all (no address, or one without an "@").
- * MimeNode lower-cases and punycodes the domain, and wraps text with a space
- * in angle brackets; any other difference, whatever the nodemailer version
- * does, is refused.
+ * typed read back as no mailbox at all (text with an "@" exactly as given,
+ * text without one as no address or one without an "@"). MimeNode lower-cases
+ * and punycodes the domain, and wraps text with a space in angle brackets;
+ * any other difference, whatever the nodemailer version does, is refused.
  */
 function verifyAddressHeaders(message: Buffer, given: Map<string, CheckedAddress[]>): void {
   const block = readHeaderBlock(message);
@@ -389,7 +399,9 @@ function verifyAddressHeaders(message: Buffer, given: Map<string, CheckedAddress
         want && got
           ? want.mailbox
             ? got.address !== null && sameMailbox(got.address, want.address)
-            : got.address === null || !got.address.includes("@")
+            : want.address.includes("@")
+              ? got.address === want.address && !isPlainAddress(got.address)
+              : got.address === null || !got.address.includes("@")
           : false;
       if (!ok) throw refusedAddress(property, want?.address ?? got?.written ?? "");
     }
