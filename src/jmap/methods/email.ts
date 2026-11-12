@@ -3,7 +3,7 @@ import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
-import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
+import { dateMs, fetchEmailsBatch, isoDate, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
@@ -410,14 +410,12 @@ async function fetchSortMetadata(
   for await (const msg of fetchByUid(client, uids, query)) {
     const uid = Number(msg.uid);
     out.set(uid, {
-      receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
+      receivedAt: dateMs(msg.internalDate) ?? 0,
       size: typeof msg.size === "number" ? msg.size : undefined,
       from: pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from),
       to: pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to),
       subject: (msg.envelope as { subject?: string } | undefined)?.subject,
-      sentAt: (msg.envelope as { date?: Date | string } | undefined)?.date
-        ? new Date((msg.envelope as { date: Date | string }).date).getTime()
-        : 0,
+      sentAt: dateMs((msg.envelope as { date?: Date | string } | undefined)?.date) ?? 0,
       flags: msg.flags ? new Set(msg.flags) : undefined,
     });
   }
@@ -1606,7 +1604,10 @@ export async function emailParse(
       continue;
     }
     try {
-      const m = await simpleParser(upload.body);
+      // Without the text-to-HTML step (it linkifies the text, which costs far
+      // more than the size of the text). Email/parse returns `text` and
+      // `html`, not mailparser's `textAsHtml`.
+      const m = await simpleParser(upload.body, { skipTextToHtml: true });
       const collect = (
         f: { value?: { name?: string; address?: string }[] }
           | { value?: { name?: string; address?: string }[] }[]
@@ -1643,7 +1644,7 @@ export async function emailParse(
         keywords: null,
         blobId,
         size: upload.body.length,
-        receivedAt: m.date ? new Date(m.date).toISOString() : null,
+        receivedAt: isoDate(m.date),
         messageId: m.messageId ? [m.messageId.replace(/^<|>$/g, "")] : null,
         inReplyTo: m.inReplyTo ? [m.inReplyTo.replace(/^<|>$/g, "")] : null,
         references: Array.isArray(m.references)
@@ -1657,7 +1658,7 @@ export async function emailParse(
         bcc: collect(m.bcc),
         replyTo: collect(m.replyTo),
         subject: m.subject ?? null,
-        sentAt: m.date ? new Date(m.date).toISOString() : null,
+        sentAt: isoDate(m.date),
         textBody: textBody.length ? textBody : null,
         htmlBody: htmlBody.length ? htmlBody : null,
         bodyValues: Object.keys(bodyValues).length ? bodyValues : null,

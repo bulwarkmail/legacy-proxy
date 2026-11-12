@@ -187,6 +187,39 @@ interface ProcessedMeta {
   headers: ParsedHeader[];
 }
 
+// The instants a JMAP UTCDate (RFC 3339) can write: years 0000 to 9999.
+const MIN_DATE_MS = Date.parse("0000-01-01T00:00:00.000Z");
+const MAX_DATE_MS = Date.parse("9999-12-31T23:59:59.999Z");
+
+/**
+ * Milliseconds since the epoch of a date as imapflow, mailparser or the cache
+ * hands it over: a Date, a string (imapflow passes an ENVELOPE date it cannot
+ * parse through as the raw string) or a number. Null when it is not a date a
+ * JMAP UTCDate can carry, so the caller never calls toISOString on it.
+ */
+export function dateMs(v: unknown): number | null {
+  if (!(v instanceof Date) && typeof v !== "string" && typeof v !== "number") return null;
+  if (v === "") return null;
+  const ms = new Date(v).getTime();
+  return Number.isFinite(ms) && ms >= MIN_DATE_MS && ms <= MAX_DATE_MS ? ms : null;
+}
+
+/** dateMs as a UTCDate string, or null. */
+export function isoDate(v: unknown): string | null {
+  const ms = dateMs(v);
+  return ms === null ? null : new Date(ms).toISOString();
+}
+
+// A message that can't be mapped is left out of the batch, so the caller
+// reports it as notFound and every other message is still returned. The log
+// names the message, not its content.
+function logUnmappable(mailbox: MailboxRow, uid: number, e: unknown): void {
+  log.warn(
+    { mailboxId: mailbox.id, uid, err: e instanceof Error ? e.name : typeof e },
+    "message could not be mapped, reported as notFound",
+  );
+}
+
 function headersToBuffer(headers: FetchMessageObject["headers"]): Buffer {
   if (Buffer.isBuffer(headers)) return headers;
   if (typeof headers === "string") return Buffer.from(headers, "utf8");
@@ -198,7 +231,9 @@ function rawFromFetch(msg: FetchMessageObject, headersFull: boolean): RawMeta {
     uid: msg.uid!,
     flags: new Set(msg.flags ?? []),
     size: msg.size ?? 0,
-    internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : Date.now(),
+    // receivedAt can't be null in JMAP: an INTERNALDATE that is missing or
+    // can't be read is taken as now.
+    internaldate: dateMs(msg.internalDate) ?? Date.now(),
     envelope: (msg.envelope as EnvelopeLike | undefined) ?? null,
     bodystructure: msg.bodyStructure ?? null,
     headersRaw: headersToBuffer(msg.headers),
@@ -244,7 +279,7 @@ function assembleEmail(
     },
     keywords: flagsToKeywords(Array.from(p.raw.flags ?? [])),
     size: p.raw.size,
-    receivedAt: new Date(p.raw.internaldate).toISOString(),
+    receivedAt: isoDate(p.raw.internaldate) ?? new Date(0).toISOString(),
     messageId: env?.messageId ? [stripBrackets(env.messageId)] : null,
     inReplyTo: env?.inReplyTo ? [stripBrackets(env.inReplyTo)] : null,
     references: referencesIds,
@@ -255,7 +290,7 @@ function assembleEmail(
     bcc: addr(env?.bcc),
     replyTo: addr(env?.replyTo),
     subject: env?.subject ?? null,
-    sentAt: env?.date ? new Date(env.date).toISOString() : null,
+    sentAt: isoDate(env?.date),
     hasAttachment: p.sel.hasAttachment,
     preview,
     bodyStructure: p.root,
@@ -478,7 +513,11 @@ export async function fetchEmailsBatch(
       // command, including the FLAGS-only ones a server pushes when another
       // session changes flags. Those carry no structure; keep the real answer.
       if (m.uid == null || !m.bodyStructure || !m.envelope) continue;
-      raws.set(m.uid, rawFromFetch(m, needsFull));
+      try {
+        raws.set(m.uid, rawFromFetch(m, needsFull));
+      } catch (e) {
+        logUnmappable(mailbox, m.uid, e);
+      }
     }
   }
 
@@ -501,7 +540,11 @@ export async function fetchEmailsBatch(
       if (r && store) store.deleteEmailCacheUids(account.id, mailbox.id, [uid]);
       continue;
     }
-    processed.push(processMeta(account, mailbox, r));
+    try {
+      processed.push(processMeta(account, mailbox, r));
+    } catch (e) {
+      logUnmappable(mailbox, uid, e);
+    }
   }
 
   const wantsBodies =
@@ -578,16 +621,20 @@ export async function fetchEmailsBatch(
   }
 
   for (const p of processed) {
-    out.set(
-      p.raw.uid,
-      assembleEmail(
-        account,
-        mailbox,
-        p,
-        previewByUid.get(p.raw.uid) ?? "",
-        bodyValuesByUid.get(p.raw.uid) ?? {},
-      ),
-    );
+    try {
+      out.set(
+        p.raw.uid,
+        assembleEmail(
+          account,
+          mailbox,
+          p,
+          previewByUid.get(p.raw.uid) ?? "",
+          bodyValuesByUid.get(p.raw.uid) ?? {},
+        ),
+      );
+    } catch (e) {
+      logUnmappable(mailbox, p.raw.uid, e);
+    }
   }
   return out;
 }

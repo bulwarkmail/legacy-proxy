@@ -86,6 +86,12 @@ Transport:
   subscriber URL; once verified, every state change is forwarded as a
   `StateChange` POST. 404 / 410 responses retire the subscription; 8
   consecutive non-2xx responses also retire it.
+- A push URL must be `https` and its host must resolve to public addresses
+  only. This is checked when the subscription is created and again for every
+  POST: the host is resolved once and the POST goes to the address that was
+  checked. Redirects are not followed, and a failed delivery logs the host,
+  never the URL. A relay on a private network, or one reached over plain
+  `http`, needs `PUSH_ALLOW_PRIVATE_URLS=1`.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
   least one verified push subscription, watching INBOX. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
@@ -595,7 +601,8 @@ streams; addresses and message contents are never logged.
 With push configured the backend also accepts `PushSubscription/get` and
 `PushSubscription/set` (RFC 8620 §7.2), which is what a webmail needs for system
 notifications while every tab is closed. A subscription must use an `https` URL
-(typically a push relay that forwards to the browser's push service); the bridge
+on a public address (typically a push relay that forwards to the browser's push
+service), checked and connected to as on the IMAP backend; the bridge
 POSTs a `PushVerification` to it on create and only delivers once the client
 returns that code through an update. Expiry defaults to 90 days and is capped at
 a year, at most 20 subscriptions per account, and `keys` are accepted but never
@@ -669,7 +676,7 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `MAX_CALLS_IN_REQUEST`     | `64`                               | per-envelope method-call cap                         |
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
-| `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
+| `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks and plain `http` (IMAP backend) |
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
