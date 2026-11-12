@@ -594,8 +594,9 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
 // raw header so we never log or persist plaintext. TTL keeps memory bounded.
 const basicAuthCache = new Map<string, { accountId: number; gen: number; expires: number }>();
 const BASIC_TTL_MS = 5 * 60_000;
-// Basic logins in progress, by the same key: requests that arrive together
-// with one header share one login at the mail server.
+// Basic logins in progress, by header and client address: requests that
+// arrive together from one address with one header share one login at the
+// mail server.
 const basicLogins = new Map<string, Promise<AuthOutcome>>();
 
 type AccountRow = import("./state/store.js").AccountRow;
@@ -630,6 +631,18 @@ async function authn(req: {
   }
 
   if (h.startsWith("Basic ")) {
+    const decoded = Buffer.from(h.slice("Basic ".length).trim(), "base64").toString("utf8");
+    const colon = decoded.indexOf(":");
+    if (colon < 1) return UNAUTHORIZED;
+    const username = decoded.slice(0, colon);
+    const password = decoded.slice(colon + 1);
+    if (username.length > MAX_USERNAME_LENGTH || password.length > MAX_SECRET_LENGTH) return UNAUTHORIZED;
+    // The hold on this address and user name comes first: a held pair gets
+    // 429 whatever it sends, a header validated earlier or one whose login
+    // is still running included.
+    const held = logins.check(req.ip, username);
+    if (held && !held.ok) return held;
+
     const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
     const cached = basicAuthCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
@@ -638,10 +651,11 @@ async function authn(req: {
       if (account && account.cred_gen === cached.gen) return { ok: true, account };
       basicAuthCache.delete(cacheKey);
     }
-    let running = basicLogins.get(cacheKey);
+    const runningKey = `${cacheKey}\n${req.ip}`;
+    let running = basicLogins.get(runningKey);
     if (!running) {
-      running = basicLogin(h, cacheKey, req.ip).finally(() => basicLogins.delete(cacheKey));
-      basicLogins.set(cacheKey, running);
+      running = basicLogin(username, password, cacheKey, req.ip).finally(() => basicLogins.delete(runningKey));
+      basicLogins.set(runningKey, running);
     }
     return running;
   }
@@ -649,13 +663,7 @@ async function authn(req: {
   return UNAUTHORIZED;
 }
 
-async function basicLogin(h: string, cacheKey: string, ip: string): Promise<AuthOutcome> {
-  const decoded = Buffer.from(h.slice("Basic ".length).trim(), "base64").toString("utf8");
-  const colon = decoded.indexOf(":");
-  if (colon < 1) return UNAUTHORIZED;
-  const username = decoded.slice(0, colon);
-  const password = decoded.slice(colon + 1);
-  if (username.length > MAX_USERNAME_LENGTH || password.length > MAX_SECRET_LENGTH) return UNAUTHORIZED;
+async function basicLogin(username: string, password: string, cacheKey: string, ip: string): Promise<AuthOutcome> {
   if (bridgeSecretOffered(password)) return UNAUTHORIZED;
 
   let providerName: string;

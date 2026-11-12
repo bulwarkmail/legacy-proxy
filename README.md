@@ -276,8 +276,7 @@ their email, and the domain routes them to the right provider.
 ### Login limits
 
 Every login the proxy makes at the mail server for a caller without a session
-(`/api/login`, and HTTP Basic when the header is not in the 5-minute cache) is
-checked first:
+(`/api/login` and HTTP Basic) is checked first:
 
 - 10 failed logins for one user name from one client address within 15 minutes
   hold further logins for that pair, and 50 failed logins from one address,
@@ -289,6 +288,11 @@ checked first:
   reached, or answers "try again later", does not.
 - At most 20 such logins run at once; more wait up to 5 seconds and are then
   answered `503`.
+- A held pair gets `429` for HTTP Basic even when the header is in the 5-minute
+  cache or a login for it is still running; the same header from another
+  address is a different pair and keeps working. A Basic client that shares an
+  address with someone who keeps failing (one NAT, one IPv6 /64, or everyone
+  behind a reverse proxy without `TRUST_PROXY`) is held with them.
 - Requests with a Bearer token are not limited, so a user with a session keeps
   working while their login is held.
 - Failed Gmail bridge logins on the JMAP routes count against the same budget.

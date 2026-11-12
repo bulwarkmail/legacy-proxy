@@ -131,7 +131,7 @@ export class LoginLimiter {
    */
   async begin(address: string, username: string): Promise<LoginGate> {
     const addr = addressKey(address);
-    const user = `${addr}\n${username.trim().toLowerCase()}`;
+    const user = userKey(addr, username);
     const held = this.hold(addr, user);
     if (held) return held;
 
@@ -165,6 +165,16 @@ export class LoginLimiter {
         }
       },
     };
+  }
+
+  /**
+   * The hold on this address and user name right now, or null. Checked before
+   * anything answers a credential, a login already validated or one still
+   * running included, so a held pair learns nothing from the answer.
+   */
+  check(address: string, username: string): LoginGate | null {
+    const addr = addressKey(address);
+    return this.hold(addr, userKey(addr, username));
   }
 
   /** Number of tracked keys, for tests and diagnostics. */
@@ -225,6 +235,11 @@ export class LoginLimiter {
     if (next) next();
     else this.inFlight--;
   }
+}
+
+/** User names count without regard to case or surrounding space. */
+function userKey(addr: string, username: string): string {
+  return `${addr}\n${username.trim().toLowerCase()}`;
 }
 
 function stripUndefined<T extends object>(o: T): Partial<T> {
