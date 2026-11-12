@@ -1,5 +1,8 @@
 // Holds one dedicated IMAP connection per account that has at least one
-// verified PushSubscription. The connection sits in INBOX with IDLE running,
+// verified PushSubscription or an open event stream (/jmap/eventsource). After
+// an account's last stream closes the connection stays for STREAM_GRACE_MS, so
+// a client that reconnects (closeafter=state ends the stream after every event)
+// doesn't cost a new IMAP login each time. The connection sits in INBOX with IDLE running,
 // so EXISTS/EXPUNGE/FETCH-FLAGS untaggeds wake us as soon as the server emits
 // them — no client polling, no cron, no second JMAP request. New arrivals
 // bump `email_delivery` (the type the webmail subscribes to for system
@@ -31,6 +34,14 @@ const RECONNECT_MAX_MS = 60_000;
 // IDLE before that to keep the channel alive.
 const IDLE_REFRESH_MS = 25 * 60_000;
 
+/** How long the worker of an account stays after its last event stream closed. */
+export const STREAM_GRACE_MS = 2 * 60_000;
+
+/** The accounts with open event streams, as the EventSourceHub knows them. */
+export interface StreamAccounts {
+  accountsWithStreams(): number[];
+}
+
 // imapflow's IDLE helper is fire-and-await: it returns when IDLE ends. We
 // kick it off in the background and rotate before the server times us out.
 interface Worker {
@@ -43,16 +54,26 @@ interface Worker {
 
 export class PushIdleManager {
   private workers = new Map<number, Worker>();
+  // Accounts whose last event stream closed less than STREAM_GRACE_MS ago.
+  private lingering = new Map<number, NodeJS.Timeout>();
 
   constructor(
     private cfg: AppConfig,
     private store: Store,
+    private streams: StreamAccounts | null = null,
+    private streamGraceMs = STREAM_GRACE_MS,
   ) {}
 
-  // Compute the desired set from the DB and converge `workers` onto it.
-  // Idempotent — safe to call any time the subscription set changes.
+  // Compute the desired set from the DB and the open streams, and converge
+  // `workers` onto it. Idempotent — safe to call any time either set changes.
   async sync(): Promise<void> {
     const desired = new Set(this.store.accountsWithActivePushSubs());
+    for (const accountId of [...(this.streams?.accountsWithStreams() ?? []), ...this.lingering.keys()]) {
+      if (desired.has(accountId)) continue;
+      // Same rule as for push subscriptions: no worker on refused credentials.
+      const row = this.store.getAccountById(accountId);
+      if (row && !row.cred_refused) desired.add(accountId);
+    }
 
     // Drop workers for accounts that no longer need one.
     for (const [accountId, worker] of this.workers) {
@@ -75,6 +96,25 @@ export class PushIdleManager {
     void this.sync();
   };
 
+  // Hook the EventSourceHub fires when an account's first stream opens or its
+  // last one closes.
+  onStreamsChange = (accountId: number, open: boolean): void => {
+    const timer = this.lingering.get(accountId);
+    if (timer) clearTimeout(timer);
+    if (open) {
+      this.lingering.delete(accountId);
+    } else {
+      const t = setTimeout(() => {
+        if (this.lingering.get(accountId) !== t) return;
+        this.lingering.delete(accountId);
+        void this.sync();
+      }, this.streamGraceMs);
+      t.unref?.();
+      this.lingering.set(accountId, t);
+    }
+    void this.sync();
+  };
+
   // The account's stored credentials changed, or a login cleared their refused
   // mark: a worker logged in with the old ones starts over with the new ones,
   // and an account whose worker had stopped gets one again.
@@ -84,6 +124,8 @@ export class PushIdleManager {
   };
 
   async closeAll(): Promise<void> {
+    for (const timer of this.lingering.values()) clearTimeout(timer);
+    this.lingering.clear();
     for (const [accountId, worker] of this.workers) {
       await this.stop(accountId, worker);
     }

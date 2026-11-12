@@ -104,7 +104,10 @@ Transport:
   or at once with **Re-register** under "Notifications when Bulwark is
   closed" in its settings.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
-  least one verified push subscription, watching INBOX. New arrivals bump
+  least one verified push subscription or an open event stream
+  (`/jmap/eventsource`), watching INBOX. After the account's last stream
+  closes the socket stays two more minutes, so clients that reconnect (or
+  use `closeafter=state`) don't log in again each time. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
   `Email`; expunges bump `Email` and `Mailbox`.
 

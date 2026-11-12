@@ -34,8 +34,28 @@ export const MAX_STREAMS_PER_ACCOUNT = 10;
 
 export class EventSourceHub {
   private clients = new Map<number, Set<Subscriber>>();
+  private streamsListener: ((accountId: number, open: boolean) => void) | null = null;
 
   constructor(private readonly maxStreamsPerAccount = MAX_STREAMS_PER_ACCOUNT) {}
+
+  /**
+   * Called with `open: true` when an account's first stream opens and with
+   * `open: false` when its last one closes.
+   */
+  setStreamsListener(listener: ((accountId: number, open: boolean) => void) | null): void {
+    this.streamsListener = listener;
+  }
+
+  /** Accounts with at least one open stream. */
+  accountsWithStreams(): number[] {
+    return [...this.clients.keys()];
+  }
+
+  private dropAccountIfEmpty(accountId: number, set: Set<Subscriber>): void {
+    if (set.size > 0 || this.clients.get(accountId) !== set) return;
+    this.clients.delete(accountId);
+    this.streamsListener?.(accountId, false);
+  }
 
   add(
     account: AccountRow,
@@ -45,6 +65,7 @@ export class EventSourceHub {
   ): void {
     const pingSec = opts.pingSec ?? 30;
     let set = this.clients.get(account.id);
+    const first = !set;
     if (!set) {
       set = new Set();
       this.clients.set(account.id, set);
@@ -88,12 +109,13 @@ export class EventSourceHub {
       ...(opts.session ? { session: opts.session } : {}),
     };
     set.add(sub);
+    if (first) this.streamsListener?.(account.id, true);
 
     reply.raw.on("close", () => {
       clearInterval(sub.ping);
       const accountSet = this.clients.get(account.id);
-      accountSet?.delete(sub);
-      if (accountSet && accountSet.size === 0) this.clients.delete(account.id);
+      if (!accountSet?.delete(sub)) return;
+      this.dropAccountIfEmpty(account.id, accountSet);
     });
   }
 
@@ -114,7 +136,7 @@ export class EventSourceHub {
         // already gone
       }
     }
-    if (set.size === 0) this.clients.delete(accountId);
+    this.dropAccountIfEmpty(accountId, set);
   }
 
   publish(account: AccountRow, change: StateChange): void {

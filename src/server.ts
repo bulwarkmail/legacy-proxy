@@ -50,7 +50,7 @@ const store = openOrExit(() => new Store(cfg.dataDir, cfg.vaultKey));
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
 const dispatcher = new PushDispatcher(store, hub, (id) => store.getAccountById(id));
-const idleManager = new PushIdleManager(cfg, store);
+const idleManager = new PushIdleManager(cfg, store, hub);
 
 // Hook the store so every counter bump (Email/set, Mailbox/set, IDLE arrival,
 // EmailSubmission/set...) feeds the same fan-out path. The dispatcher
@@ -62,6 +62,9 @@ store.setStateListener((accountId, kind, state) => dispatcher.onBump(accountId, 
 // changed so it can spin up or tear down INBOX IDLE workers without needing
 // to sweep the DB on every JMAP call.
 dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
+// Open event streams want new mail as it arrives too, so they keep the
+// account's IDLE worker running as well.
+hub.setStreamsListener(idleManager.onStreamsChange);
 
 // Passwords the mail server accepted next to the stored one, by account and
 // credential tag, until when (epoch ms). A second device's password then
