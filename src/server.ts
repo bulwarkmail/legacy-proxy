@@ -53,10 +53,18 @@ store.setStateListener((accountId, kind, state) => dispatcher.onBump(accountId, 
 // to sweep the DB on every JMAP call.
 dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
 
+// Passwords the mail server accepted next to the stored one, by account and
+// credential tag, until when (epoch ms). A second device's password then
+// costs one login per cache lifetime, not a check of the stored one each
+// time. Forgotten when the account's credentials change.
+const confirmedAlongside = new Map<number, Map<string, number>>();
+const CONFIRMED_ALONGSIDE_MS = 60 * 60_000;
+
 // When an account's credential generation moves, nothing logged in with the
 // old credentials keeps serving it: pooled connections close and the IDLE
 // worker starts over. Cached Basic logins check the generation themselves.
 store.setCredentialListener((accountId) => {
+  confirmedAlongside.delete(accountId);
   pool.retire(accountId);
   idleManager.onCredentialsChanged(accountId);
 });
@@ -274,10 +282,25 @@ async function recordSignIn(s: SignIn): Promise<AccountRow> {
   const changed = await credentialsChanged(existing, s.creds);
   // The same password, or the server already refused the stored one.
   if (!changed || existing.cred_refused) return save(changed);
+  // Confirmed valid next to the stored one not long ago: no check again.
+  if (bothValid(existing, s.tag)) return existing;
   // One check at a time; the sessions of a sign-in that did not start it are
   // decided by the one running.
   if (!storedChecks.has(existing.id)) checkStoredPassword(existing, s, () => save(true));
   return existing;
+}
+
+function bothValid(account: AccountRow, tag: string): boolean {
+  const until = confirmedAlongside.get(account.id)?.get(tag);
+  return until !== undefined && until > Date.now();
+}
+
+function confirmAlongside(account: AccountRow, tag: string): void {
+  const tags = confirmedAlongside.get(account.id) ?? new Map<string, number>();
+  const now = Date.now();
+  for (const [t, until] of tags) if (until <= now) tags.delete(t);
+  tags.set(tag, now + CONFIRMED_ALONGSIDE_MS);
+  confirmedAlongside.set(account.id, tags);
 }
 
 function checkStoredPassword(existing: AccountRow, s: SignIn, replace: () => AccountRow): void {
@@ -297,6 +320,7 @@ function checkStoredPassword(existing: AccountRow, s: SignIn, replace: () => Acc
       const probe = await openImap({ provider: s.provider, creds: stored });
       gate.finish("accepted");
       pool.adopt(existing, probe);
+      confirmAlongside(existing, s.tag);
     } catch (e) {
       if (!isCredentialRefusal(e)) {
         gate.finish("error");

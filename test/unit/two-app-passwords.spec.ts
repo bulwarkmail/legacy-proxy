@@ -6,7 +6,7 @@
 // server refuses the stored password did the offered one replace it.
 
 import fs from "node:fs";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
 import { openCredentials } from "../../src/auth/credentials.js";
@@ -62,6 +62,32 @@ describe("two app passwords on two devices", () => {
     await until(() => imap.logins - before >= 3);
     expect(imap.logins - before).toBeLessThanOrEqual(3);
     expect(await storedPassword("vic@test.local")).toBe("app-password-1");
+  });
+
+  it("costs each device one login per cache lifetime, without checking the stored password again", async () => {
+    imap.users["ada@test.local"] = ["app-password-1", "app-password-2"];
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(start);
+      for (const pass of ["app-password-1", "app-password-2"]) {
+        expect((await session(basic("ada@test.local", pass))).statusCode).toBe(200);
+      }
+      const firstRound = imap.logins;
+      await until(() => imap.logins >= firstRound + 1);
+      // Each cached header lapses after five minutes; both devices sign in again.
+      for (let round = 1; round <= 3; round++) {
+        vi.setSystemTime(start + round * 6 * 60_000);
+        const before = imap.logins;
+        for (const pass of ["app-password-1", "app-password-2"]) {
+          expect((await session(basic("ada@test.local", pass))).statusCode).toBe(200);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+        expect(imap.logins - before, `round ${round}`).toBe(2);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the first device's sessions when the second signs in with its own password", async () => {

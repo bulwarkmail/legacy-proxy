@@ -230,7 +230,8 @@ stored password once at the mail server:
   are closed. Sessions made with the new password keep working.
 - If the server still accepts the stored password, both are valid (one app
   password per device, for example): nothing changes, and each device's Basic
-  header is cached as usual.
+  header is cached as usual. The stored password is not checked again for that
+  second password for an hour.
 
 While that check runs, the account's sessions made with other passwords wait
 for its result (at most 10 seconds). The check is a login like any other: it
