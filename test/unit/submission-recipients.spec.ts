@@ -406,6 +406,47 @@ describe("a header the envelope reads is one a reader and the Bcc stripping read
   });
 });
 
+describe("a refusal names what was refused", () => {
+  it("lists the refused header entries in invalidRecipients and in the description", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: ok@corp.example, ${CONFUSING}, John`);
+    const err = (await send()).notCreated?.s;
+    expect(err).toMatchObject({ type: "invalidRecipients", invalidRecipients: [CONFUSING, "John"] });
+    expect(err?.description).toContain(JSON.stringify(CONFUSING));
+    expect(err?.description).toContain('"John"');
+    expect(err?.description).not.toContain("ok@corp.example");
+  });
+
+  it("names client envelope entries as given, spaces included", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const err = (await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: " bob@corp.example " }, { email: " bob smith@corp.example" }] }))
+      .notCreated?.s;
+    expect(err).toMatchObject({ type: "invalidRecipients", invalidRecipients: [" bob smith@corp.example"] });
+    expect(err?.description).toContain('" bob smith@corp.example"');
+  });
+
+  it("names the refused sender, from the envelope or from the header", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const given = (await send({ mailFrom: { email: "<attacker@evil.example>" }, rcptTo: [{ email: "bob@corp.example" }] })).notCreated?.s;
+    expect(given).toMatchObject({ type: "forbiddenMailFrom", mailFrom: "<attacker@evil.example>" });
+    expect(given?.description).toContain('"<attacker@evil.example>"');
+
+    draft = mail(`From: Jane Doe jane@corp.example\r\nTo: bob@corp.example`);
+    const derived = (await send()).notCreated?.s;
+    expect(derived).toMatchObject({ type: "forbiddenMailFrom", mailFrom: "Jane Doe jane@corp.example" });
+    expect(derived?.description).toContain('"Jane Doe jane@corp.example"');
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("keeps the description short for many refused entries", async () => {
+    const bad = Array.from({ length: 15 }, (_, i) => ({ email: `user ${i}@corp.example` }));
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const err = (await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: bad })).notCreated?.s;
+    expect(err?.invalidRecipients).toHaveLength(15);
+    expect(err?.description).toContain('"user 9@corp.example" and 5 more');
+    expect(err?.description).not.toContain("user 10@");
+  });
+});
+
 describe("EmailSubmission ids", () => {
   it("are made by the proxy, whatever the client's creation id holds", async () => {
     draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);

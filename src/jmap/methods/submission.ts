@@ -174,20 +174,34 @@ function asEmail(s: string | undefined | null): string | null {
   return t;
 }
 
+// The refused entries as given, quoted so that spaces, commas and control
+// characters show; at most ten, so the description stays readable.
+function nameList(entries: string[]): string {
+  const shown = entries.slice(0, 10).map((e) => JSON.stringify(e)).join(", ");
+  return entries.length > 10 ? `${shown} and ${entries.length - 10} more` : shown;
+}
+
+/** invalidRecipients naming each refused entry as given, in the property and the description. */
 function refuseRecipients(invalid: string[]): never {
-  throw new JmapError("invalidRecipients", "recipients must be plain email addresses", {
+  const what = invalid.length === 1 ? "this recipient is" : "these recipients are";
+  throw new JmapError("invalidRecipients", `${what} not a plain email address: ${nameList(invalid)}`, {
     invalidRecipients: invalid,
   });
 }
 
-/** Accept an envelope only when all its addresses are plain. */
+/** forbiddenMailFrom naming the refused sender as given. */
+function refuseMailFrom(from: string): never {
+  throw new JmapError("forbiddenMailFrom", `the sender is not a plain email address: ${nameList([from])}`, {
+    mailFrom: from,
+  });
+}
+
+/** Accept an envelope only when all its addresses are plain; each is trimmed, and named as given when refused. */
 function checkedEnvelope(from: string, to: string[]): { from: string; to: string[] } {
-  const invalid = to.filter((a) => !isPlainAddress(a));
+  const invalid = to.filter((a) => !isPlainAddress(a.trim()));
   if (invalid.length > 0) refuseRecipients(invalid);
-  if (!isPlainAddress(from)) {
-    throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
-  }
-  return { from, to };
+  if (!isPlainAddress(from.trim())) refuseMailFrom(from);
+  return { from: from.trim(), to: to.map((a) => a.trim()) };
 }
 
 async function resolveEnvelope(
@@ -196,8 +210,8 @@ async function resolveEnvelope(
 ): Promise<{ from: string; to: string[] }> {
   if (envelope?.mailFrom?.email && envelope?.rcptTo?.length) {
     return checkedEnvelope(
-      String(envelope.mailFrom.email).trim(),
-      envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email.trim() : "")),
+      String(envelope.mailFrom.email),
+      envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email : "")),
     );
   }
   // Spec §7: if no envelope is given, derive from headers - From for
@@ -206,9 +220,7 @@ async function resolveEnvelope(
   // taken as the message wrote it whatever library version is installed.
   const entries = (name: string) => headerValues(raw, name).flatMap(parseAddressList);
   const fromEntry = entries("from")[0];
-  if (fromEntry && fromEntry.address === null) {
-    throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
-  }
+  if (fromEntry && fromEntry.address === null) refuseMailFrom(fromEntry.written);
   const fromAddr = fromEntry ? fromEntry.address : asEmail(envelope?.mailFrom?.email);
   const recipients = ["to", "cc", "bcc"].flatMap(entries);
   // An entry that isn't one plain mailbox is refused, named as the message wrote it.
