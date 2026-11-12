@@ -64,9 +64,22 @@ export const STORED_CREDENTIAL_SPREAD_MS = 5 * 60_000;
  * 0 when they have none pending). The attempts are spaced evenly over
  * STORED_CREDENTIAL_SPREAD_MS, so the last one that may set the mark comes no
  * earlier than that after the first.
+ *
+ * `requestedAt`: when a user's request that needs a connection started. After
+ * a single refusal, such a request made after it may try once right away (the
+ * refusal may have been a moment's hiccup); the attempt after that still waits
+ * for the end of the spread, so there are never more than three in it.
+ * Requests that were already waiting when the refusal came, and the IDLE
+ * worker, keep the spacing.
  */
-export function nextStoredAttemptAt(row: Pick<AccountRow, "cred_refusals" | "cred_first_refusal">): number {
+export function nextStoredAttemptAt(
+  row: Pick<AccountRow, "cred_refusals" | "cred_first_refusal">,
+  requestedAt?: number,
+): number {
   if (!row.cred_refusals) return 0;
+  if (row.cred_refusals === 1 && requestedAt !== undefined && requestedAt > row.cred_first_refusal) {
+    return row.cred_first_refusal;
+  }
   const spacing = STORED_CREDENTIAL_SPREAD_MS / (STORED_CREDENTIAL_ATTEMPTS - 1);
   return row.cred_first_refusal + row.cred_refusals * spacing;
 }

@@ -91,8 +91,9 @@ export class ImapPool {
    */
   async acquire(account: AccountRow, role: PoolRole = "interactive"): Promise<Lease> {
     const key = `${account.id}:${role}`;
+    const requestedAt = Date.now();
     for (;;) {
-      const entry = await this.takeFree(account, key, role);
+      const entry = await this.takeFree(account, key, role, requestedAt);
       if (entry) return this.leaseFor(key, entry);
       // At the cap with everything busy: park until someone releases, then
       // re-run the whole selection (the freed entry may have died meanwhile).
@@ -102,12 +103,14 @@ export class ImapPool {
 
   /**
    * Claim a usable idle connection, or open one if the role is under its cap.
-   * Returns null when every slot is taken.
+   * Returns null when every slot is taken. `requestedAt` is when the request
+   * asked for the connection (see nextStoredAttemptAt).
    */
   private async takeFree(
     account: AccountRow,
     key: string,
     role: PoolRole,
+    requestedAt: number,
   ): Promise<PoolEntry | null> {
     const list = [...(this.entries.get(key) ?? [])];
     for (const entry of list) {
@@ -148,8 +151,9 @@ export class ImapPool {
       // next successful login clears that mark.
       const current = this.store.getAccountById(account.id);
       if (!current || current.cred_refused) throw new Error("stored credentials refused by the mail server");
-      // After a refusal the next try waits its turn (see nextStoredAttemptAt).
-      if (Date.now() < nextStoredAttemptAt(current)) {
+      // After a refusal the next try waits its turn, except once for a request
+      // made after it (see nextStoredAttemptAt).
+      if (Date.now() < nextStoredAttemptAt(current, requestedAt)) {
         throw new Error("stored credentials refused by the mail server; trying again later");
       }
       const provider = resolveProvider(this.cfg, current.kind);

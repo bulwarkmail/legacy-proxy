@@ -293,8 +293,11 @@ before is answered `401` and its event streams end, and the account's push
 subscriptions end, so its push IDLE worker stops. After a refusal the
 stored password is tried again only two and a half minutes later, so the three
 refusals span at least five minutes and a server that refuses logins for a
-moment marks nobody; requests that need a new connection in between fail
-without a login. The mark is kept in the database across restarts and cleared
+moment marks nobody. After the first refusal, one request made after it may
+try once right away, so a moment's hiccup does not fail new connections for
+minutes; if that try is refused too, requests that need a new connection fail
+without a login until the five minutes are up. The IDLE worker keeps the
+spacing. The mark is kept in the database across restarts and cleared
 by the next successful sign-in; the push worker starts again once the client
 subscribes again. A
 server that cannot be reached, or answers "try again later" (`UNAVAILABLE`,
