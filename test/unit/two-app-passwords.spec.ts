@@ -9,7 +9,7 @@ import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { bootProxy, startFakeImap, type FakeImap } from "./fake-imap.js";
-import { openCredentials } from "../../src/auth/credentials.js";
+import { openAccountCredentials } from "../../src/auth/credentials.js";
 
 let imap: FakeImap;
 let app: FastifyInstance;
@@ -44,7 +44,7 @@ async function storedPassword(username: string) {
   const store = new Store(dir);
   try {
     const row = store.getAccount(`generic:${username}`)!;
-    return (await openCredentials(Buffer.from(process.env.VAULT_KEY!, "base64"), row.vault)).password;
+    return (await openAccountCredentials(Buffer.from(process.env.VAULT_KEY!, "base64"), row)).password;
   } finally {
     store.close();
   }

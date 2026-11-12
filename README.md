@@ -399,12 +399,20 @@ Every login the proxy makes at the mail server for a caller without a session
   are answered `401`, further ones `429` with `Retry-After` until the oldest is
   15 minutes old. They never hold mail logins from that address, and a valid
   bridge login is never held.
+- The bridge's `/oauth/token` is not limited: every refused request gets its own
+  `400` or `401`, however many came before. A mail client's server redeems
+  refresh tokens for all its users from one address, so a hold there would
+  answer users whose sign-in ended with `429` instead of telling them to sign in
+  again; codes and tokens are 256-bit random values, so there is nothing to
+  guess.
 
 The counters live in memory, are bounded in size and start from zero when the
 proxy restarts. IPv6 clients are counted per /64. The limits count by client
 address, so behind a reverse proxy set `TRUST_PROXY` (see
 [Configuration](#configuration)): without it every caller has the reverse
-proxy's address and all of them share one budget.
+proxy's address and all of them share one budget. The same goes for a webmail in
+front of the proxy, which checks every user's sign-in from its own server: put
+the webmail server's address in `TRUST_PROXY` too.
 
 ### Provider selection
 
@@ -499,7 +507,11 @@ Self-service onboarding: the first successful consent for an account issues a br
 password, and the result page shows server, username and password exactly once,
 bound to that browser and expiring after two minutes. Reconnecting later (for example
 after a revoked grant or Testing's seven-day expiry) keeps the existing password
-unless "Issue a new bridge password" is ticked, which replaces it. A pending consent
+unless "Issue a new bridge password" is ticked, which replaces it and signs every
+device out: the previous password stops working, and in the same step every sign-in
+token and every push subscription of the account are deleted and its open event
+streams end. That is what to do after losing a device; each device then signs in again
+and sets push up again. A pending consent
 lives in an encrypted, browser-bound cookie rather than in server memory, so abandoned
 or scripted starts cannot block other users. `npm run gmail:password` remains
 available for operators.
@@ -521,20 +533,27 @@ account whose Gmail access is already stored signs in without a consent screen. 
 other account is sent to Google's consent once, and its grant is stored as by
 **Connect Gmail**. The client then gets a single-use code, valid for a minute, and
 exchanges it at `/oauth/token` for a bridge access token (`gmat_…`, one hour, Bearer
-only) and a refresh token (`gmrt_…`). The refresh token lasts while it keeps being
-used, up to 180 days between uses. `/oauth/revoke` ends a refresh token and the
-access tokens under it. Only hashes of these tokens are stored. They are separate
-from the bridge password: every signed-in client has its own, signing in again
-revokes nothing, and disconnecting the account deletes them all. Google tokens never
+only) and a refresh token (`gmrt_…`). Every refresh answers with a new refresh token,
+which the client stores in place of the old one. The token that was used still answers
+for 60 seconds after its first use, so two tabs refreshing together both carry on and a
+lost answer can be asked for again, but at most three times in all. A fourth try inside
+the minute, or any try after it, is refused and every token of that sign-in stops
+working (a copy of it is in use); the account's other sign-ins carry on. A refresh
+token unused for 180 days lapses, and a sign-in ends 365 days after it was made,
+however often it was refreshed: the user then signs in again. `/oauth/revoke` with a
+refresh token ends its sign-in. Only keyed hashes of these tokens are stored (see [Data at rest](#data-at-rest)). They are separate
+from the bridge password: every signed-in client has its own and signing in again
+revokes nothing. Issuing a new bridge password and disconnecting the account delete
+them all. Google tokens never
 leave the bridge.
 
 In Bulwark, give the bridge's server entry an OAuth client ID equal to the
 registered `id`, and optionally a button label such as "Sign in with Google".
 
-Tokens are encrypted with the existing `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`.
-The same database caches metadata, message bodies and attachment bytes in plaintext;
-protect `DATA_DIR` and its backups. Cached values expire and are bounded to 256 MiB
-of logical data per account (SQLite may retain free pages).
+The Google grant, cached mail (metadata, message bodies, attachment bytes) and
+uploads are sealed with `VAULT_KEY` in `DATA_DIR/gmail.sqlite3`; see
+[Data at rest](#data-at-rest) for what stays in clear. Cached values expire and are
+bounded to 256 MiB of logical data per account (SQLite may retain free pages).
 Google Testing refresh tokens with Gmail scopes expire after seven days; reconnect
 when consent expires or is revoked.
 
@@ -568,8 +587,11 @@ npm run gmail:password -- tester@gmail.com /private/path/jmap-login.json
 ```
 
 The file contains `serverUrl`, `username` and `password` for the client's custom
-JMAP account. Only a SHA-256 hash of this randomly generated password is stored.
-Reissuing it immediately revokes the previous bridge password. Basic auth with
+JMAP account. Only a keyed hash of this randomly generated password is stored.
+Reissuing it immediately revokes the previous bridge password and signs every device
+out the same way as the page does: sign-in tokens and push subscriptions of the account
+are deleted. Event streams the running server holds open for the account end within
+five minutes. Basic auth with
 that username/password or Bearer auth with the bridge password is supported;
 Google tokens stay on the server. Only passwords starting with `gmap_` select the
 Gmail API backend; any other password for the same address, such as an IMAP App
@@ -917,6 +939,20 @@ A reverse proxy on another host: put that host's address in `TRUST_PROXY`, and
 publish port 8080 on the address that host reaches, not on all interfaces (for
 example `"10.0.0.5:8080:8080"` in the compose file, with `TRUST_PROXY=10.0.0.4`).
 
+A webmail in front of the proxy: Bulwark checks every sign-in from its own
+server and names the user's address in `X-Forwarded-For`, so all its users reach
+the proxy from the webmail server's address. Put that address in `TRUST_PROXY`
+as well, next to any reverse proxy, and run the webmail itself behind a reverse
+proxy it trusts, so the address it passes on is the user's. For a webmail on
+10.0.0.7 and a reverse proxy on the proxy's own host:
+
+```bash
+TRUST_PROXY=127.0.0.1,::1,10.0.0.7
+```
+
+Without it, 50 wrong passwords through the webmail within 15 minutes hold every
+sign-in that goes through it, for every user.
+
 Private, loopback and link-local ranges may be given whole (`10.0.0.0/8`,
 `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `127.0.0.0/8`,
 `169.254.0.0/16`, `fc00::/7`, `fe80::/10`, `::1`). Ranges in public space may be
@@ -967,6 +1003,80 @@ offered it) has three ways out:
 2. required STARTTLS: `"starttls": true`, with `"secure": false` or no `secure`;
 3. a plain connection on purpose: `"allowPlaintext": true`, for a server on a
    network you trust.
+
+### Data at rest
+
+Everything lives in `DATA_DIR`: `proxy.db` for the IMAP backend and
+`gmail.sqlite3` for the Gmail bridge. Both files are readable and writable by
+the proxy's user only (mode 0600): they are created that way and set to it at
+every start. Where the volume doesn't support file modes (some network or
+Windows mounts), the proxy logs one warning naming the files and starts anyway;
+restrict access to `DATA_DIR` there in another way. On Windows the folder's
+permissions decide. Protect `DATA_DIR` and its backups anyway, because not
+everything in them is sealed.
+
+Sealed with AES-256-GCM: the stored mail credentials of each IMAP account, and on
+the Gmail bridge the Google grant, the cache and uploaded files. Each table has a
+key of its own derived from `VAULT_KEY` (HKDF-SHA256), and every value is bound
+to its row: the table, the account and the row's key go in as associated data, so
+a value copied into another account's row does not open there. Values sealed by
+earlier versions (with `VAULT_KEY` itself and no binding) are rewritten on the
+first start of this version, in one transaction per database: stored IMAP
+credentials and Google grants are sealed again for their row (users stay signed
+in), Gmail cache entries are dropped and fetched again, and uploads stored in
+clear are sealed for their row. That happens once; afterwards a value in the
+earlier format opens nowhere, also one copied in from an old backup. The start
+that rewrites anything logs one warning per database with how many values of
+each kind it rewrote (no values, no key): expected once after the upgrade or
+after restoring an old backup. If it shows up at any other time, find out what
+was written into `DATA_DIR`.
+
+In clear: the IMAP backend's caches of message metadata (envelope, structure,
+headers), previews and attachment bytes, and its pending uploads; on the Gmail
+bridge the profile and label snapshot, draft and send-ledger records, scheduled
+sends with their recipients, and push subscription URLs. Bridge passwords and
+sign-in tokens are stored only as keyed hashes: an HMAC-SHA256, under a key derived
+from `VAULT_KEY`, of the secret's SHA-256, with a MAC that ties each row to its
+account, its sign-in date and its expiry. Without the key nobody can write a row
+that a password or token of their choosing opens, or move their own row to
+another account. The first start of this version keys the plain SHA-256 hashes
+earlier versions stored, so existing bridge passwords and sign-ins keep working.
+
+Each database keeps a value sealed under the key. The proxy checks both databases
+against `VAULT_KEY` before it opens either. A key that opens neither that value
+nor any stored credential of a database that holds sealed data stops the start
+with one line, `legacy-proxy: VAULT_KEY does not open the sealed values in
+<file>: ...`, and no file is changed; `npm run gmail:password` stops the same
+way. A database that holds nothing sealed takes whatever key it is started with,
+so a mistyped key on a fresh or empty database is simply replaced by the right
+one at the next start.
+
+Keep `VAULT_KEY` safe and apart from the backups of `DATA_DIR`: a backup stored
+together with its key gives whoever takes it everything the proxy sealed. Without
+the key nothing sealed can be restored: every IMAP user signs in again, every
+Gmail account reconnects at `/auth/google/start` and gets a new bridge password,
+every bridge sign-in signs in again, the Gmail cache is fetched again and
+pending uploads are attached again. To start over without the key,
+move `proxy.db` and `gmail.sqlite3` out of `DATA_DIR`.
+
+### Upgrading and rolling back
+
+- The first start of this version rewrites what earlier versions sealed and keys
+  the hashes of bridge passwords and sign-in tokens (see above); nothing else to
+  do.
+- Gmail bridge sign-ins made before the upgrade are dated at the upgrade, so all
+  of them end in the same minute one year after it; those users then sign in
+  again.
+- Rolling back to an earlier version: it can't open what this version sealed, so
+  IMAP users sign in again, Gmail accounts reconnect, the cache refills, and
+  uploads from the last day are attached again. It doesn't find this version's
+  keyed hashes either: bridge passwords must be issued again and bridge
+  sign-ins sign in again. (The retired refresh tokens this version keeps, up to
+  180 days so that a copy can be recognised, are among them: an earlier version
+  doesn't rotate refresh tokens and would accept them again if it could find
+  them.) Coming back to this version after that: what the earlier version sealed
+  or issued in the meantime doesn't open (sign in, reconnect, issue a bridge
+  password, attach again).
 
 ## Tests
 

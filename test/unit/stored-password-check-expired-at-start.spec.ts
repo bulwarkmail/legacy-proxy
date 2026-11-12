@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { startScriptedImap, type ScriptedImap } from "./scripted-imap.js";
 import { Store } from "../../src/state/store.js";
-import { sealCredentials, openCredentials } from "../../src/auth/credentials.js";
+import { sealCredentials, openAccountCredentials, sealPlace } from "../../src/auth/credentials.js";
 import { credentialTag, makeSession, signSession } from "../../src/auth/session.js";
 
 const USER = "rae@test.local";
@@ -35,7 +35,7 @@ beforeAll(async () => {
   const store = new Store(dir);
   const oldCreds = { mech: "PLAIN" as const, username: USER, password: "old-password" };
   const newCreds = { mech: "PLAIN" as const, username: USER, password: "new-password" };
-  const row = store.upsertAccount({ slug: `generic:${USER}`, kind: "generic", host: "127.0.0.1", username: USER, vault: await sealCredentials(vaultKey, oldCreds) });
+  const row = store.upsertAccount({ slug: `generic:${USER}`, kind: "generic", host: "127.0.0.1", username: USER, vault: await sealCredentials(vaultKey, sealPlace.account(`generic:${USER}`), oldCreds) });
   accountId = row.id;
   const since = Date.now() - 25 * 3600_000;
   store.insertPushSubscription({
@@ -50,7 +50,7 @@ beforeAll(async () => {
     createdAt: since - 60_000,
     lastPushAt: null,
   });
-  store.openCredentialCheck(row.id, { vault: await sealCredentials(vaultKey, newCreds), tag: credentialTag(vaultKey, newCreds), since });
+  store.openCredentialCheck(row.id, { vault: await sealCredentials(vaultKey, sealPlace.account(`generic:${USER}`), newCreds), tag: credentialTag(vaultKey, newCreds), since });
   for (let i = 0; i < 12; i++) store.noteCheckAttempt(row.id, since, since + i * 60_000);
   store.close();
   oldToken = signSession(hmacKey, makeSession({ accountSlug: `generic:${USER}`, username: USER, gen: row.cred_gen, cf: credentialTag(vaultKey, oldCreds) }));
@@ -92,7 +92,7 @@ describe("a check past its 24 hours when the proxy starts", () => {
     try {
       const row = store.getAccountById(accountId)!;
       expect(row.cred_check_tag ?? null).toBeNull();
-      expect((await openCredentials(vaultKey, row.vault)).password).toBe("new-password");
+      expect((await openAccountCredentials(vaultKey, row)).password).toBe("new-password");
       expect(store.getPushSubscription("made-before", accountId)).toBeNull();
     } finally {
       store.close();

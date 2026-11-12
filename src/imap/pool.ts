@@ -2,7 +2,7 @@ import type { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
 import type { AppConfig } from "../util/config.js";
 import { resolveProvider } from "../auth/providers.js";
-import { openCredentials } from "../auth/credentials.js";
+import { openAccountCredentials } from "../auth/credentials.js";
 import { isCredentialRefusal, openImap } from "./client.js";
 import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
@@ -157,7 +157,7 @@ export class ImapPool {
         throw new Error("stored credentials refused by the mail server; trying again later");
       }
       const provider = resolveProvider(this.cfg, current.kind);
-      const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
+      const creds: Credentials = await openAccountCredentials(this.cfg.vaultKey, current);
       let client: ImapFlow;
       try {
         client = await openImap({ provider, creds });

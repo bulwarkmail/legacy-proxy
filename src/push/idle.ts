@@ -13,7 +13,7 @@
 
 import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
-import { openCredentials } from "../auth/credentials.js";
+import { openAccountCredentials } from "../auth/credentials.js";
 import { resolveProvider } from "../auth/providers.js";
 import { isCredentialRefusal, openImap } from "../imap/client.js";
 import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
@@ -144,7 +144,7 @@ export class PushIdleManager {
     // After a refusal the next try waits its turn; scheduleReconnect waits for it.
     if (Date.now() < nextStoredAttemptAt(current)) throw new Error("stored credentials refused; trying again later");
     const provider = resolveProvider(this.cfg, current.kind);
-    const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
+    const creds: Credentials = await openAccountCredentials(this.cfg.vaultKey, current);
     let client: ImapFlow;
     try {
       client = await openImap({ provider, creds });

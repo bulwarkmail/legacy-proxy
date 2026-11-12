@@ -1,5 +1,8 @@
+import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { planSealedValues, sealPlace, verifyVaultKey, type SealPlace } from "../auth/credentials.js";
+import { log } from "../util/log.js";
 import type { Database as DB, Statement } from "better-sqlite3";
 
 export interface AccountRow {
@@ -254,6 +257,13 @@ CREATE TABLE IF NOT EXISTS ended_session (
   token_hash TEXT    PRIMARY KEY,
   expires    INTEGER NOT NULL
 );
+
+-- A value sealed under the vault key, so a start with another key is refused
+-- before anything is changed (auth/credentials.ts planSealedValues).
+CREATE TABLE IF NOT EXISTS vault_check (
+  id    INTEGER PRIMARY KEY CHECK (id = 1),
+  value BLOB    NOT NULL
+);
 `;
 
 // Columns added to tables that existing databases already have.
@@ -270,6 +280,68 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_check_attempts", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_check_last", definition: "INTEGER NOT NULL DEFAULT 0" },
 ];
+
+/**
+ * Makes database files readable and writable by their owner only (mode 0600).
+ * Where the volume refuses (a mount without POSIX modes), one warning names the
+ * files and the start goes on: the mode is a second line of defence behind the
+ * data directory's own permissions.
+ */
+export function ownerOnly(files: string[]): void {
+  const failed: string[] = [];
+  let reason = "";
+  for (const f of files) {
+    try {
+      fs.chmodSync(f, 0o600);
+    } catch (e) {
+      failed.push(f);
+      reason ||= (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+    }
+  }
+  if (failed.length) {
+    log.warn(
+      { files: failed, reason },
+      "could not make the database readable by its owner only (mode 0600); starting anyway. Restrict access to DATA_DIR another way.",
+    );
+  }
+}
+
+/** Logged once by a start that rewrote values an earlier version stored, with their counts. */
+export const SEALED_AGAIN_MESSAGE =
+  "this start rewrote values an earlier version stored, sealed again for their row; expected once after an upgrade or after restoring an old backup";
+
+/**
+ * The key check and the sealed credentials of a proxy.db, also of one an
+ * earlier version wrote (tables or columns it lacks count as empty). A row's
+ * stored credentials and the ones a check holds share the row's place.
+ */
+function sealedValues(db: DB): {
+  check: Buffer | null;
+  values: { id: number; column: string; value: Buffer; place: SealPlace }[];
+} {
+  const tables = new Set(
+    (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as { name: string }[]).map((t) => t.name),
+  );
+  const check = tables.has("vault_check")
+    ? ((db.prepare(`SELECT value FROM vault_check WHERE id = 1`).get() as { value: Buffer } | undefined)?.value ?? null)
+    : null;
+  if (!tables.has("account")) return { check, values: [] };
+  const withCheckVault = (db.prepare(`PRAGMA table_info(account)`).all() as { name: string }[]).some(
+    (c) => c.name === "cred_check_vault",
+  );
+  const rows = db
+    .prepare(`SELECT id, slug, vault, ${withCheckVault ? "cred_check_vault" : "NULL AS cred_check_vault"} FROM account`)
+    .all() as { id: number; slug: string; vault: Buffer; cred_check_vault: Buffer | null }[];
+  return {
+    check,
+    values: rows.flatMap((r) => [
+      { id: r.id, column: "vault", value: r.vault, place: sealPlace.account(r.slug) },
+      ...(r.cred_check_vault
+        ? [{ id: r.id, column: "cred_check_vault", value: r.cred_check_vault, place: sealPlace.account(r.slug) }]
+        : []),
+    ]),
+  };
+}
 
 // Clears an open check of the stored credentials, inside an UPDATE's SET list.
 const NO_CHECK =
@@ -288,14 +360,72 @@ export class Store {
   // `.run()` can be reused freely.
   private stmts = new Map<string, Statement>();
 
-  constructor(dataDir: string) {
-    this.db = new Database(path.join(dataDir, "proxy.db"));
-    this.db.exec(SCHEMA);
-    for (const { table, column, definition } of ADDED_COLUMNS) {
-      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-      if (!columns.some((c) => c.name === column)) {
-        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  /**
+   * Opens `proxy.db` in `dataDir`. With `vaultKey` (the server passes it) the
+   * sealed credentials are checked against the key first: a key that doesn't
+   * open them throws {@link VaultKeyMismatch} before any row is changed, and
+   * the first start of this version seals the values of earlier versions for
+   * their row (see planSealedValues).
+   */
+  constructor(dataDir: string, vaultKey?: Buffer) {
+    // The database holds the sealed mail credentials and, in clear, cached
+    // message metadata, previews, attachments and uploads: only the proxy's
+    // own user may read it. Permissions are set before SQLite opens the file,
+    // so the WAL and SHM files it creates next to it get the same; files from
+    // before this get them on the next start.
+    const file = path.join(dataDir, "proxy.db");
+    fs.closeSync(fs.openSync(file, "a", 0o600));
+    ownerOnly([file, `${file}-wal`, `${file}-shm`].filter((f) => fs.existsSync(f)));
+    this.db = new Database(file);
+    try {
+      this.db.exec(SCHEMA);
+      for (const { table, column, definition } of ADDED_COLUMNS) {
+        const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (!columns.some((c) => c.name === column)) {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        }
       }
+      if (vaultKey) this.prepareSealedValues(vaultKey, file);
+    } catch (e) {
+      this.db.close();
+      throw e;
+    }
+  }
+
+  /** The start step of the sealed credentials, in one transaction (see planSealedValues). */
+  private prepareSealedValues(key: Buffer, file: string): void {
+    let credentials = 0;
+    this.db.transaction(() => {
+      const { check, values } = sealedValues(this.db);
+      const plan = planSealedValues(key, file, check, values);
+      for (const { index, value } of plan.reseal) {
+        const v = values[index]!;
+        credentials += this.db
+          .prepare(`UPDATE account SET ${v.column} = ? WHERE id = ? AND ${v.column} = ?`)
+          .run(value, v.id, v.value).changes;
+      }
+      if (plan.check) this.db.prepare(`INSERT OR REPLACE INTO vault_check(id, value) VALUES(1, ?)`).run(plan.check);
+    })();
+    // The one trace of what an earlier version (or a restored backup) left:
+    // counts only, never a value.
+    if (credentials) log.warn({ file, credentials }, SEALED_AGAIN_MESSAGE);
+  }
+
+  /**
+   * Throws VaultKeyMismatch when `vaultKey` doesn't open what `proxy.db` in
+   * `dataDir` holds, without writing anything (the file is opened read-only,
+   * and not created). The server checks every database this way before it
+   * opens any, so a mistyped key changes no file.
+   */
+  static verifyVaultKey(dataDir: string, vaultKey: Buffer): void {
+    const file = path.join(dataDir, "proxy.db");
+    if (!fs.existsSync(file)) return;
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      const { check, values } = sealedValues(db);
+      verifyVaultKey(vaultKey, file, check, values);
+    } finally {
+      db.close();
     }
   }
 

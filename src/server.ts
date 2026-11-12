@@ -10,7 +10,7 @@ import { corsOptions, fromBrowser } from "./util/cors.js";
 import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
-import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
+import { sealCredentials, openCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
 import {
   credentialTag,
   generationValid,
@@ -39,7 +39,14 @@ import { isBridgeSecret, registerGmailBackend } from "./gmail/backend.js";
 import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfigOrExit();
-const store = new Store(cfg.dataDir);
+const gmailConfig = loadGmailConfig(cfg.publicUrl);
+// Every database the proxy uses is checked against VAULT_KEY before any is
+// opened, so a mistyped key changes no file.
+openOrExit(() => {
+  Store.verifyVaultKey(cfg.dataDir, cfg.vaultKey);
+  if (gmailConfig) GmailStore.verifyVaultKey(cfg.dataDir, cfg.vaultKey);
+});
+const store = openOrExit(() => new Store(cfg.dataDir, cfg.vaultKey));
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
 const dispatcher = new PushDispatcher(store, hub, (id) => store.getAccountById(id));
@@ -115,8 +122,7 @@ await app.register(compress, { global: true, threshold: 1024 });
 // reaches the mail server (see auth/loginLimit.ts).
 const logins = new LoginLimiter();
 
-const gmailConfig = loadGmailConfig(cfg.publicUrl);
-const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
+const gmailStore = gmailConfig ? openOrExit(() => new GmailStore(cfg.dataDir, cfg.vaultKey)) : null;
 // Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
 const gmailHooks: { push?: import("./gmail/push.js").GmailPush } = {};
 app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}), ...(gmailHooks.push ? { gmailPush: gmailHooks.push.stats() } : {}) }));
@@ -249,11 +255,15 @@ function sameCredentials(a: Credentials, b: Credentials): boolean {
   return oauth(a) === oauth(b) && a.username === b.username && (a.password ?? null) === (b.password ?? null);
 }
 
-/** The credentials sealed in `vault`, or null when there are none or they can't be read (another VAULT_KEY). */
-async function unsealed(vault: Buffer | null | undefined): Promise<Credentials | null> {
+/**
+ * The credentials sealed in `vault` of the account row `slug`, or null when
+ * there are none or they can't be read (another VAULT_KEY, or sealed for
+ * another row).
+ */
+async function unsealed(slug: string, vault: Buffer | null | undefined): Promise<Credentials | null> {
   if (!vault) return null;
   try {
-    return await openCredentials(cfg.vaultKey, vault);
+    return await openCredentials(cfg.vaultKey, sealPlace.account(slug), vault);
   } catch {
     return null;
   }
@@ -332,7 +342,7 @@ async function runCheckAttempt(accountId: number): Promise<CheckAttemptResult> {
   const row = store.getAccountById(accountId);
   if (!row?.cred_check_tag) return "answered";
   store.noteCheckAttempt(accountId, row.cred_check_since ?? 0);
-  const checked = await unsealed(row.cred_check_vault);
+  const checked = await unsealed(row.slug, row.cred_check_vault);
   // Stored credentials that can't be read can't be checked: the new ones replace them.
   if (!checked) {
     answerCheck(row, "refused");
@@ -388,7 +398,7 @@ type SignInOutcome = { ok: true; account: AccountRow } | { ok: false; status: 50
  */
 async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   const existing = store.getAccount(s.slug);
-  const vault = await sealCredentials(cfg.vaultKey, s.creds);
+  const vault = await sealCredentials(cfg.vaultKey, sealPlace.account(s.slug), s.creds);
   const save = (rotate: boolean): SignInOutcome => ({
     ok: true,
     account: store.upsertAccount({
@@ -404,7 +414,7 @@ async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   if (!existing) return save(false);
   // The credentials the row holds: the stored ones, or during a check the
   // ones that opened it.
-  const held = await unsealed(existing.vault);
+  const held = await unsealed(existing.slug, existing.vault);
   if (held && sameCredentials(held, s.creds)) return save(false);
   // Stored credentials that can't be read, or that the server refused
   // already, are replaced at once.
@@ -412,7 +422,7 @@ async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   if (existing.cred_check_tag) {
     // The stored password while it is being checked: the server just
     // accepted it, which answers the check.
-    const checked = await unsealed(existing.cred_check_vault);
+    const checked = await unsealed(existing.slug, existing.cred_check_vault);
     if (checked && sameCredentials(checked, s.creds)) answerCheck(existing, "accepted");
     else {
       // Another password: its session would depend on the answer, so it
@@ -1020,6 +1030,17 @@ function loadConfigOrExit(): AppConfig {
   try {
     return loadConfig();
   } catch (e) {
+    fs.writeSync(2, `legacy-proxy: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
+
+/** Opens a database; a VAULT_KEY that doesn't open it stops the start with its message, nothing changed. */
+function openOrExit<T>(open: () => T): T {
+  try {
+    return open();
+  } catch (e) {
+    if ((e as Error).name !== "VaultKeyMismatch") throw e;
     fs.writeSync(2, `legacy-proxy: ${(e as Error).message}\n`);
     process.exit(1);
   }

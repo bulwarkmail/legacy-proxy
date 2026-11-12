@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ImapFlow } from "imapflow";
 import { Store, type AccountRow } from "../../src/state/store.js";
-import { sealCredentials } from "../../src/auth/credentials.js";
+import { sealCredentials, sealPlace } from "../../src/auth/credentials.js";
 import { emailParse } from "../../src/jmap/methods/email.js";
 import { emailSubmissionSet } from "../../src/jmap/methods/submission.js";
 import { encodeEmailId } from "../../src/mapping/ids.js";
@@ -45,7 +45,7 @@ beforeAll(async () => {
     kind: "generic",
     host: "h",
     username: "u",
-    vault: await sealCredentials(vaultKey, { mech: "PLAIN", username: "u", password: "fake-password" }),
+    vault: await sealCredentials(vaultKey, sealPlace.account("generic:u"), { mech: "PLAIN", username: "u", password: "fake-password" }),
   });
   const row = store.db
     .prepare(`INSERT INTO mailbox(account_id, name) VALUES(?, 'Drafts') RETURNING id`)

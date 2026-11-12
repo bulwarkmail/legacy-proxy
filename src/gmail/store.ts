@@ -4,11 +4,16 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import {
   openCredentials,
+  planSealedValues,
   seal,
   sealCredentials,
+  sealPlace,
   unseal,
+  verifyVaultKey,
   type Credentials,
 } from "../auth/credentials.js";
+import { ownerOnly, SEALED_AGAIN_MESSAGE } from "../state/store.js";
+import { log } from "../util/log.js";
 import type { EmailPushConfig } from "./emailpush.js";
 
 export interface GmailProfile {
@@ -42,12 +47,26 @@ export class GmailStore {
     /** Logical bytes of cached Gmail data kept per account. */
     private readonly cacheLimit = 256 * 1024 * 1024,
   ) {
+    this.hashKey = Buffer.from(crypto.hkdfSync("sha256", vaultKey, Buffer.alloc(0), "legacy-proxy secret hash", 32));
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const file = path.join(dataDir, "gmail.sqlite3");
     // Set permissions before SQLite opens WAL/SHM sidecars.
     fs.closeSync(fs.openSync(file, "a", 0o600));
-    fs.chmodSync(file, 0o600);
+    ownerOnly([file]);
     this.db = new Database(file);
+    try {
+      this.setUp(file);
+    } catch (e) {
+      this.db.close();
+      throw e;
+    }
+  }
+  /**
+   * Tables, the columns earlier versions' databases lack, and the start step of
+   * the sealed values: a VAULT_KEY that doesn't open them throws
+   * VaultKeyMismatch before any row is changed.
+   */
+  private setUp(file: string): void {
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS gmail_cursor (email TEXT PRIMARY KEY, history TEXT NOT NULL);
@@ -71,10 +90,10 @@ export class GmailStore {
         created_at INTEGER NOT NULL, failures INTEGER NOT NULL DEFAULT 0, email_push TEXT
       );
       CREATE INDEX IF NOT EXISTS gmail_push_sub_email ON gmail_push_sub(email);
-      CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
+      CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, issued_at INTEGER NOT NULL DEFAULT 0, mac TEXT);
       CREATE TABLE IF NOT EXISTS gmail_token (
         hash TEXT PRIMARY KEY, email TEXT NOT NULL, client TEXT NOT NULL, kind TEXT NOT NULL,
-        parent TEXT, expires INTEGER NOT NULL
+        parent TEXT, expires INTEGER NOT NULL, family TEXT, family_since INTEGER, used_at INTEGER, mac TEXT
       );
       CREATE INDEX IF NOT EXISTS gmail_token_email ON gmail_token(email);
       CREATE INDEX IF NOT EXISTS gmail_token_parent ON gmail_token(parent);
@@ -91,6 +110,7 @@ export class GmailStore {
         snapshot TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS vault_check (id INTEGER PRIMARY KEY CHECK (id = 1), value BLOB NOT NULL);
     `);
     // Cached mail used to be stored as plain JSON. Those rows cannot be read
     // back now that entries are sealed, and a cache is by definition
@@ -102,6 +122,26 @@ export class GmailStore {
       .all() as { name: string }[];
     if (!subColumns.some((c) => c.name === "email_push"))
       this.db.exec("ALTER TABLE gmail_push_sub ADD COLUMN email_push TEXT");
+    // A password issued before issued_at existed counts as issued at 0.
+    const passwordColumns = this.db
+      .prepare("PRAGMA table_info(gmail_password)")
+      .all() as { name: string }[];
+    if (!passwordColumns.some((c) => c.name === "issued_at"))
+      this.db.exec("ALTER TABLE gmail_password ADD COLUMN issued_at INTEGER NOT NULL DEFAULT 0");
+    // Every token belongs to a sign-in (its family: the hash of the sign-in's
+    // first refresh token) made at family_since. A refresh token issued before
+    // sign-ins were recorded is a sign-in of its own, dated now, with the
+    // access tokens under it.
+    const tokenColumns = this.db
+      .prepare("PRAGMA table_info(gmail_token)")
+      .all() as { name: string }[];
+    for (const [column, type] of [["family", "TEXT"], ["family_since", "INTEGER"], ["used_at", "INTEGER"], ["mac", "TEXT"]] as const)
+      if (!tokenColumns.some((c) => c.name === column))
+        this.db.exec(`ALTER TABLE gmail_token ADD COLUMN ${column} ${type}`);
+    if (!passwordColumns.some((c) => c.name === "mac")) this.db.exec("ALTER TABLE gmail_password ADD COLUMN mac TEXT");
+    // Before any row is changed.
+    this.prepareSealedValues(file);
+    this.db.exec("CREATE INDEX IF NOT EXISTS gmail_token_family ON gmail_token(family)");
     const columns = this.db
       .prepare("PRAGMA table_info(gmail_cache)")
       .all() as { name: string; type: string }[];
@@ -118,12 +158,146 @@ export class GmailStore {
       `);
     }
   }
+  /**
+   * The start step of the sealed values, in one transaction (see
+   * planSealedValues). On the first start of this version the Google grants
+   * of earlier versions are sealed again for their row, cache entries in the
+   * earlier format are dropped (they are fetched again), uploads stored
+   * before uploads were sealed are sealed for their row, and the plain
+   * SHA-256 hashes of bridge passwords and sign-in tokens are keyed and bound
+   * to their row (see {@link secretHash}), so existing passwords and sign-ins
+   * keep working.
+   */
+  private prepareSealedValues(file: string): void {
+    const done = { credentials: 0, uploads: 0, cacheEntriesDropped: 0, passwordHashes: 0, tokenHashes: 0 };
+    this.db.transaction(() => {
+      const { check, rows, holdsOther } = gmailSealedValues(this.db);
+      const plan = planSealedValues(
+        this.vaultKey,
+        file,
+        check,
+        rows.map((r) => ({ place: sealPlace.gmailConnection(r.email), value: r.vault })),
+        holdsOther,
+      );
+      for (const { index, value } of plan.reseal) {
+        const row = rows[index]!;
+        done.credentials += this.db
+          .prepare("UPDATE gmail_connection SET vault=? WHERE email=? AND vault=?")
+          .run(value, row.email, row.vault).changes;
+      }
+      if (plan.firstStart) {
+        done.cacheEntriesDropped = this.db
+          .prepare("DELETE FROM gmail_cache WHERE NOT (length(value) >= 29 AND substr(value,1,1) = x'02')")
+          .run().changes;
+        const uploads = this.db.prepare("SELECT email, id, body FROM gmail_upload").all() as { email: string; id: string; body: Buffer }[];
+        for (const u of uploads) {
+          const place = sealPlace.gmailUpload(u.email, u.id);
+          try {
+            unseal(this.vaultKey, place, u.body);
+          } catch {
+            done.uploads += this.db
+              .prepare("UPDATE gmail_upload SET body=? WHERE email=? AND id=?")
+              .run(seal(this.vaultKey, place, u.body), u.email, u.id).changes;
+          }
+        }
+        // The hashes are keyed once: never again once any row carries a MAC.
+        const keyedBefore = this.db
+          .prepare("SELECT 1 FROM gmail_password WHERE mac IS NOT NULL UNION ALL SELECT 1 FROM gmail_token WHERE mac IS NOT NULL LIMIT 1")
+          .get();
+        if (!keyedBefore) {
+          // Every token belongs to a sign-in (its family: the hash of the
+          // sign-in's first refresh token) made at family_since. A refresh
+          // token issued before sign-ins were recorded is a sign-in of its
+          // own, dated now, with the access tokens under it.
+          this.db
+            .prepare(
+              "UPDATE gmail_token SET family=CASE WHEN kind='refresh' THEN hash ELSE COALESCE(parent,hash) END, family_since=? WHERE family IS NULL",
+            )
+            .run(Date.now());
+          // The stored hashes are SHA-256 of each secret: key them in place.
+          const passwords = this.db.prepare("SELECT email, hash FROM gmail_password").all() as { email: string; hash: string }[];
+          for (const p of passwords) {
+            const hash = this.keyed(p.hash);
+            done.passwordHashes += this.db
+              .prepare("UPDATE gmail_password SET hash=?, mac=? WHERE email=?")
+              .run(hash, this.passwordMac(p.email, hash), p.email).changes;
+          }
+          const tokens = this.db.prepare("SELECT * FROM gmail_token").all() as TokenRow[];
+          for (const t of tokens) {
+            const row: TokenRow = {
+              ...t,
+              hash: this.keyed(t.hash),
+              parent: t.parent === null ? null : this.keyed(t.parent),
+              family: t.family === null ? null : this.keyed(t.family),
+            };
+            done.tokenHashes += this.db
+              .prepare("UPDATE gmail_token SET hash=?, parent=?, family=?, mac=? WHERE hash=?")
+              .run(row.hash, row.parent, row.family, this.tokenMac(row), t.hash).changes;
+          }
+        }
+      }
+      if (plan.check) this.db.prepare("INSERT OR REPLACE INTO vault_check(id, value) VALUES(1, ?)").run(plan.check);
+    })();
+    // The one trace of what an earlier version (or a restored backup) left:
+    // counts only, never a value.
+    if (Object.values(done).some((n) => n > 0)) log.warn({ file, ...done }, SEALED_AGAIN_MESSAGE);
+  }
+  /**
+   * Throws VaultKeyMismatch when `vaultKey` doesn't open what `gmail.sqlite3`
+   * in `dataDir` holds, without writing anything (read-only, not created). The
+   * server checks every database this way before it opens any.
+   */
+  static verifyVaultKey(dataDir: string, vaultKey: Buffer): void {
+    const file = path.join(dataDir, "gmail.sqlite3");
+    if (!fs.existsSync(file)) return;
+    const db = new Database(file, { readonly: true, fileMustExist: true });
+    try {
+      const { check, rows, holdsOther } = gmailSealedValues(db);
+      verifyVaultKey(
+        vaultKey,
+        file,
+        check,
+        rows.map((r) => ({ place: sealPlace.gmailConnection(r.email), value: r.vault })),
+        holdsOther,
+      );
+    } finally {
+      db.close();
+    }
+  }
+  /** Key for the stored hashes of bridge passwords and sign-in tokens, derived from the vault key. */
+  private readonly hashKey: Buffer;
+  /** HMAC of a SHA-256 hex digest under {@link hashKey}: what the store keeps and looks up. */
+  private keyed(sha256: string): string {
+    return crypto.createHmac("sha256", this.hashKey).update(sha256).digest("hex");
+  }
+  /**
+   * What is stored for a bridge password or token: the keyed hash of its
+   * SHA-256. Without the vault key nobody can write a row a secret of their
+   * choosing opens, and the row's MAC ties it to its account, so moving one's
+   * own row to another account doesn't work either.
+   */
+  private secretHash(secret: string): string {
+    return this.keyed(crypto.createHash("sha256").update(secret).digest("hex"));
+  }
+  private rowMac(fields: unknown[]): string {
+    return crypto.createHmac("sha256", this.hashKey).update(JSON.stringify(["row", ...fields])).digest("hex");
+  }
+  private passwordMac(email: string, hash: string): string {
+    return this.rowMac(["gmail_password", email, hash]);
+  }
+  private tokenMac(t: Omit<TokenRow, "used_at" | "mac">): string {
+    return this.rowMac(["gmail_token", t.hash, t.email, t.client, t.kind, t.parent, t.expires, t.family, t.family_since]);
+  }
+  private macMatches(stored: string | null, expected: string): boolean {
+    if (!stored || stored.length !== expected.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(stored), Buffer.from(expected));
+  }
   async save(
     email: string,
     credentials: Credentials,
     snapshot: GmailSnapshot,
   ): Promise<void> {
-    const vault = await sealCredentials(this.vaultKey, credentials);
+    const vault = await sealCredentials(this.vaultKey, sealPlace.gmailConnection(email), credentials);
     this.db
       .prepare(
         `INSERT INTO gmail_connection (email, vault, snapshot, updated_at)
@@ -140,7 +314,7 @@ export class GmailStore {
       .get(email) as { vault: Buffer; snapshot: string } | undefined;
     if (!row) return null;
     return {
-      credentials: await openCredentials(this.vaultKey, row.vault),
+      credentials: await openCredentials(this.vaultKey, sealPlace.gmailConnection(email), row.vault),
       snapshot: JSON.parse(row.snapshot),
     };
   }
@@ -156,15 +330,52 @@ export class GmailStore {
       .prepare("SELECT 1 FROM gmail_connection WHERE email=?")
       .get(email);
   }
-  issuePassword(email: string): string {
+  /**
+   * Issues a new bridge password for the account and signs every device out:
+   * in the same transaction the previous password stops working and the
+   * account's sign-in tokens and push subscriptions are deleted. Sign-out
+   * listeners are told afterwards, so open event streams of the account end.
+   */
+  issuePassword(email: string, now = Date.now()): string {
     if (!this.hasConnection(email)) throw new Error("Account is not connected");
     const password = "gmap_" + crypto.randomBytes(32).toString("base64url");
-    this.db
-      .prepare(
-        "INSERT INTO gmail_password(email,hash) VALUES (?,?) ON CONFLICT(email) DO UPDATE SET hash=excluded.hash",
-      )
-      .run(email, crypto.createHash("sha256").update(password).digest("hex"));
+    // Never the same issue time twice, so a stream opened under the previous
+    // password always counts as older.
+    const issuedAt = Math.max(now, this.passwordIssuedAt(email) + 1);
+    const hash = this.secretHash(password);
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          "INSERT INTO gmail_password(email,hash,issued_at,mac) VALUES (?,?,?,?) ON CONFLICT(email) DO UPDATE SET hash=excluded.hash,issued_at=excluded.issued_at,mac=excluded.mac",
+        )
+        .run(email, hash, issuedAt, this.passwordMac(email, hash));
+      this.db.prepare("DELETE FROM gmail_token WHERE email=?").run(email);
+      this.db.prepare("DELETE FROM gmail_push_sub WHERE email=?").run(email);
+    })();
+    for (const listener of this.signOutListeners) listener(email);
     return password;
+  }
+  /**
+   * When the account's current bridge password was issued (epoch ms): 0 for a
+   * password issued before this was recorded, or when it has none. Anything
+   * opened before it belongs to devices that were signed out.
+   */
+  passwordIssuedAt(email: string): number {
+    return (
+      (
+        this.db
+          .prepare("SELECT issued_at FROM gmail_password WHERE email=?")
+          .get(email) as { issued_at: number } | undefined
+      )?.issued_at ?? 0
+    );
+  }
+  private readonly signOutListeners = new Set<(email: string) => void>();
+  /** Told after a new bridge password signed every device of an account out. Returns a function that stops telling it. */
+  onSignOut(listener: (email: string) => void): () => void {
+    this.signOutListeners.add(listener);
+    return () => {
+      this.signOutListeners.delete(listener);
+    };
   }
   hasPassword(email: string): boolean {
     return !!this.db
@@ -173,64 +384,102 @@ export class GmailStore {
   }
   authenticate(password: string, username?: string): string | null {
     if (!/^gmap_[A-Za-z0-9_-]{43}$/.test(password)) return null;
-    const hash = crypto.createHash("sha256").update(password).digest("hex");
+    const hash = this.secretHash(password);
     const row = this.db
-      .prepare("SELECT email FROM gmail_password WHERE hash=?")
-      .get(hash) as { email: string } | undefined;
-    return row && (!username || row.email === username.toLowerCase())
+      .prepare("SELECT email,mac FROM gmail_password WHERE hash=?")
+      .get(hash) as { email: string; mac: string | null } | undefined;
+    return row && this.macMatches(row.mac, this.passwordMac(row.email, hash)) && (!username || row.email === username.toLowerCase())
       ? row.email
       : null;
   }
   /**
-   * Signs a client in for an account: a refresh token that lives as long as it keeps being used, and a
-   * short-lived access token under it. Only hashes are stored, so a copy of the database signs nobody in.
+   * A token row by the token, if its row is the one the store wrote: a row
+   * whose MAC doesn't match its fields (moved to another account, its sign-in
+   * date or expiry changed, or written without the vault key) counts as none.
+   */
+  private tokenRow(token: string, kind: "access" | "refresh"): TokenRow | undefined {
+    const row = this.db.prepare("SELECT * FROM gmail_token WHERE hash=? AND kind=?").get(this.secretHash(token), kind) as
+      | TokenRow
+      | undefined;
+    return row && this.macMatches(row.mac, this.tokenMac(row)) ? row : undefined;
+  }
+  /**
+   * Signs a client in for an account: a refresh token and a short-lived access token under it, the first
+   * tokens of a new sign-in. Only keyed hashes are stored, so a copy of the database signs nobody in.
    */
   issueTokens(email: string, client: string, now = Date.now()): IssuedTokens {
     if (!this.hasConnection(email)) throw new Error("Account is not connected");
-    const refresh = TOKEN_PREFIX.refresh + crypto.randomBytes(32).toString("base64url");
-    this.db
-      .prepare("INSERT INTO gmail_token(hash,email,client,kind,parent,expires) VALUES (?,?,?,'refresh',NULL,?)")
-      .run(tokenHash(refresh), email, client, now + REFRESH_TOKEN_TTL);
-    return { ...this.accessUnder(tokenHash(refresh), email, client, now), refreshToken: refresh };
+    return this.db.transaction(() => this.tokensFor({ email, client, family: null, since: now, parent: null }, now))();
   }
-  /** A new access token for a refresh token of this client; the refresh token's lifetime starts over. */
+  /**
+   * Exchanges a refresh token of this client for a new refresh token and a new access token of the same
+   * sign-in. The token that was used stays good for {@link REFRESH_REUSE_GRACE} after its first use, so two
+   * tabs that refresh at the same moment both get an answer, and a client has room for lost answers, but
+   * it is exchanged at most {@link MAX_SUCCESSORS} times. Presented once more inside that time, or at all
+   * after it, it was copied: it is refused and every token of its sign-in stops working. A sign-in ends
+   * {@link SIGN_IN_TTL} after it was made, however often it was refreshed.
+   */
   refreshTokens(refreshToken: string, client: string, now = Date.now()): IssuedTokens | null {
     if (!TOKEN_RE.refresh.test(refreshToken)) return null;
-    const hash = tokenHash(refreshToken);
-    const row = this.db
-      .prepare("SELECT email,client,expires FROM gmail_token WHERE hash=? AND kind='refresh'")
-      .get(hash) as { email: string; client: string; expires: number } | undefined;
-    if (!row || row.client !== client || row.expires <= now || !this.hasConnection(row.email)) return null;
-    this.db.prepare("UPDATE gmail_token SET expires=? WHERE hash=?").run(now + REFRESH_TOKEN_TTL, hash);
-    return { ...this.accessUnder(hash, row.email, client, now), refreshToken };
-  }
-  private accessUnder(parent: string, email: string, client: string, now: number) {
-    const access = TOKEN_PREFIX.access + crypto.randomBytes(32).toString("base64url");
-    this.db.transaction(() => {
-      this.db.prepare("DELETE FROM gmail_token WHERE expires<=?").run(now);
-      this.db
-        .prepare("INSERT INTO gmail_token(hash,email,client,kind,parent,expires) VALUES (?,?,?,'access',?,?)")
-        .run(tokenHash(access), email, client, parent, now + ACCESS_TOKEN_TTL);
+    return this.db.transaction((): IssuedTokens | null => {
+      const row = this.tokenRow(refreshToken, "refresh");
+      if (!row || row.client !== client || row.expires <= now) return null;
+      const hash = row.hash;
+      const family = row.family ?? hash;
+      const endSignIn = () => {
+        this.db.prepare("DELETE FROM gmail_token WHERE family=?").run(family);
+        return null;
+      };
+      if (row.used_at !== null && now - row.used_at > REFRESH_REUSE_GRACE) return endSignIn();
+      const since = row.family_since ?? now;
+      if (now >= since + SIGN_IN_TTL || !this.hasConnection(row.email)) return null;
+      // A refresh token's successors record it as their parent.
+      const successors = (
+        this.db.prepare("SELECT COUNT(*) AS n FROM gmail_token WHERE kind='refresh' AND parent=?").get(hash) as { n: number }
+      ).n;
+      if (successors >= MAX_SUCCESSORS) return endSignIn();
+      if (row.used_at === null) this.db.prepare("UPDATE gmail_token SET used_at=? WHERE hash=?").run(now, hash);
+      return this.tokensFor({ email: row.email, client, family, since, parent: hash }, now);
     })();
-    return { email, accessToken: access, expiresIn: ACCESS_TOKEN_TTL / 1000 };
+  }
+  /**
+   * A new refresh token and an access token under it, in sign-in `family` (a new one when null) made at
+   * `since`; `parent` is the refresh token it replaces, if any. Callers hold a transaction.
+   */
+  private tokensFor(
+    s: { email: string; client: string; family: string | null; since: number; parent: string | null },
+    now: number,
+  ): IssuedTokens {
+    const end = s.since + SIGN_IN_TTL;
+    const refresh = TOKEN_PREFIX.refresh + crypto.randomBytes(32).toString("base64url");
+    const access = TOKEN_PREFIX.access + crypto.randomBytes(32).toString("base64url");
+    const refreshHash = this.secretHash(refresh);
+    const family = s.family ?? refreshHash;
+    const insert = (t: Omit<TokenRow, "used_at" | "mac">) =>
+      this.db
+        .prepare("INSERT INTO gmail_token(hash,email,client,kind,parent,expires,family,family_since,mac) VALUES (?,?,?,?,?,?,?,?,?)")
+        .run(t.hash, t.email, t.client, t.kind, t.parent, t.expires, t.family, t.family_since, this.tokenMac(t));
+    this.db.prepare("DELETE FROM gmail_token WHERE expires<=?").run(now);
+    const common = { email: s.email, client: s.client, family, family_since: s.since };
+    insert({ ...common, hash: refreshHash, kind: "refresh", parent: s.parent, expires: Math.min(now + REFRESH_TOKEN_TTL, end) });
+    insert({ ...common, hash: this.secretHash(access), kind: "access", parent: refreshHash, expires: Math.min(now + ACCESS_TOKEN_TTL, end) });
+    return { email: s.email, accessToken: access, expiresIn: ACCESS_TOKEN_TTL / 1000, refreshToken: refresh };
   }
   /** The account an access token signs in, while it is valid. */
   authenticateToken(accessToken: string, now = Date.now()): string | null {
     if (!TOKEN_RE.access.test(accessToken)) return null;
-    const row = this.db
-      .prepare("SELECT email,expires FROM gmail_token WHERE hash=? AND kind='access'")
-      .get(tokenHash(accessToken)) as { email: string; expires: number } | undefined;
+    const row = this.tokenRow(accessToken, "access");
     return row && row.expires > now ? row.email : null;
   }
-  /** Revokes a token issued to this client; revoking a refresh token also ends the access tokens under it. */
+  /** Revokes a token issued to this client; revoking a refresh token ends its whole sign-in. */
   revokeToken(token: string, client: string): void {
-    const hash = tokenHash(token);
     this.db.transaction(() => {
-      const row = this.db.prepare("SELECT client FROM gmail_token WHERE hash=?").get(hash) as
-        | { client: string }
-        | undefined;
+      const row = this.tokenRow(token, "refresh") ?? this.tokenRow(token, "access");
       if (!row || row.client !== client) return;
-      this.db.prepare("DELETE FROM gmail_token WHERE hash=? OR parent=?").run(hash, hash);
+      const hash = row.hash;
+      if (row.kind === "refresh")
+        this.db.prepare("DELETE FROM gmail_token WHERE hash=? OR parent=? OR family=?").run(hash, hash, row.family ?? hash);
+      else this.db.prepare("DELETE FROM gmail_token WHERE hash=?").run(hash);
     })();
   }
   async updateCredentials(
@@ -243,7 +492,8 @@ export class GmailStore {
       .prepare("SELECT vault FROM gmail_connection WHERE email=?")
       .get(email) as { vault: Buffer } | undefined;
     if (!row) return;
-    const old = await openCredentials(this.vaultKey, row.vault);
+    const place = sealPlace.gmailConnection(email);
+    const old = await openCredentials(this.vaultKey, place, row.vault);
     if (
       old.refreshToken !== expectedRefreshToken ||
       (snapshot === undefined &&
@@ -251,7 +501,7 @@ export class GmailStore {
         old.expiresAt === credentials.expiresAt)
     )
       return;
-    const vault = await sealCredentials(this.vaultKey, {
+    const vault = await sealCredentials(this.vaultKey, place, {
       ...credentials,
       scopes: old.scopes,
     });
@@ -385,10 +635,11 @@ export class GmailStore {
     if (!row) return null;
     let value: T;
     try {
-      value = JSON.parse(unseal(this.vaultKey, row.value).toString("utf8")) as T;
+      value = JSON.parse(unseal(this.vaultKey, sealPlace.gmailCache(email, key), row.value).toString("utf8")) as T;
     } catch {
-      // A row this key cannot open is unreadable for good: drop it and let the
-      // caller fetch the data again.
+      // A row that doesn't open here (a value sealed for another row, or in
+      // the earlier format) is unreadable for good: drop it and let the caller
+      // fetch the data again. The start step has checked the key.
       this.db
         .prepare("DELETE FROM gmail_cache WHERE email=? AND key=?")
         .run(email, key);
@@ -402,7 +653,7 @@ export class GmailStore {
     return value;
   }
   /**
-   * Caches one entry, encrypted under the vault key.
+   * Caches one entry, sealed for its account and key under the vault key.
    *
    * What passes through here is mail - subjects, senders, bodies - kept on
    * disk for as long as its entry lives, which is long enough to be worth
@@ -410,7 +661,7 @@ export class GmailStore {
    * costs microseconds against the network round trip it saves.
    */
   cache(email: string, key: string, data: unknown, ttl: number): void {
-    const value = seal(this.vaultKey, Buffer.from(JSON.stringify(data), "utf8"));
+    const value = seal(this.vaultKey, sealPlace.gmailCache(email, key), Buffer.from(JSON.stringify(data), "utf8"));
     const size = value.length;
     if (size > 16 * 1024 * 1024) return;
     const now = Date.now();
@@ -468,21 +719,28 @@ export class GmailStore {
       ).n;
       if (body.length > 25_000_000 || total + body.length > 100_000_000)
         throw new Error("Upload quota exceeded");
+      // Uploads are mail being written: sealed like the cache.
       this.db
-        .prepare("INSERT INTO gmail_upload VALUES(?,?,?,?,?)")
-        .run(email, id, body, type, Date.now() + 24 * 60 * 60_000);
+        .prepare("INSERT INTO gmail_upload(email,id,body,type,expires) VALUES(?,?,?,?,?)")
+        .run(email, id, seal(this.vaultKey, sealPlace.gmailUpload(email, id), body), type, Date.now() + 24 * 60 * 60_000);
     })();
     return id;
   }
   uploaded(email: string, id: string): { body: Buffer; type: string } | null {
-    return (
-      (this.db
-        .prepare(
-          "SELECT body,type FROM gmail_upload WHERE email=? AND id=? AND expires>?",
-        )
-        .get(email, id, Date.now()) as
-        { body: Buffer; type: string } | undefined) ?? null
-    );
+    const row = this.db
+      .prepare(
+        "SELECT body,type FROM gmail_upload WHERE email=? AND id=? AND expires>?",
+      )
+      .get(email, id, Date.now()) as
+      { body: Buffer; type: string } | undefined;
+    if (!row) return null;
+    try {
+      return { body: unseal(this.vaultKey, sealPlace.gmailUpload(email, id), row.body), type: row.type };
+    } catch {
+      // A body that doesn't open here is no upload of this account: it is
+      // answered like an unknown one.
+      return null;
+    }
   }
   rememberDraft(
     email: string,
@@ -946,12 +1204,56 @@ export class GmailStore {
     this.db.close();
   }
 }
-/** Access tokens are short-lived; a refresh token lasts while it keeps being used. */
+/** Access tokens are short-lived; a refresh token is exchanged for a new one on every use. */
 const ACCESS_TOKEN_TTL = 3600_000;
+/** How long a refresh token stays good when it is not used. */
 const REFRESH_TOKEN_TTL = 180 * 86400_000;
+/** How long a refresh token still answers after its first use, for a second tab that was a moment late. */
+export const REFRESH_REUSE_GRACE = 60_000;
+/** How many new refresh tokens one refresh token can be exchanged for in that time. */
+export const MAX_SUCCESSORS = 3;
+/** A sign-in ends this long after it was made, however often it was refreshed. */
+export const SIGN_IN_TTL = 365 * 86400_000;
 const TOKEN_PREFIX = { access: "gmat_", refresh: "gmrt_" } as const;
 const TOKEN_RE = { access: /^gmat_[A-Za-z0-9_-]{43}$/, refresh: /^gmrt_[A-Za-z0-9_-]{43}$/ };
-const tokenHash = (token: string) => crypto.createHash("sha256").update(token).digest("hex");
+/**
+ * The key check and the sealed grants of a gmail.sqlite3, and whether it holds
+ * anything else that depends on the key (sealed cache entries and uploads,
+ * keyed password and token hashes). Tables a database lacks count as empty.
+ */
+function gmailSealedValues(db: Database.Database): {
+  check: Buffer | null;
+  rows: { email: string; vault: Buffer }[];
+  holdsOther: boolean;
+} {
+  const tables = new Set(
+    (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name),
+  );
+  const check = tables.has("vault_check")
+    ? ((db.prepare("SELECT value FROM vault_check WHERE id=1").get() as { value: Buffer } | undefined)?.value ?? null)
+    : null;
+  const rows = tables.has("gmail_connection")
+    ? (db.prepare("SELECT email, vault FROM gmail_connection").all() as { email: string; vault: Buffer }[])
+    : [];
+  const holdsOther = ["gmail_cache", "gmail_upload", "gmail_password", "gmail_token"].some(
+    (t) => tables.has(t) && !!db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get(),
+  );
+  return { check, rows, holdsOther };
+}
+
+/** A row of gmail_token. */
+interface TokenRow {
+  hash: string;
+  email: string;
+  client: string;
+  kind: string;
+  parent: string | null;
+  expires: number;
+  family: string | null;
+  family_since: number | null;
+  used_at: number | null;
+  mac: string | null;
+}
 export interface IssuedTokens {
   email: string;
   accessToken: string;

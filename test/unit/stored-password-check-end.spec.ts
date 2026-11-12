@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { bootProxy } from "./fake-imap.js";
 import { startScriptedImap, type LoginAnswer, type ScriptedImap } from "./scripted-imap.js";
-import { openCredentials } from "../../src/auth/credentials.js";
+import { openAccountCredentials } from "../../src/auth/credentials.js";
 
 /** Per user: the answer for each password; anything else is refused. */
 const answers: Record<string, Record<string, () => LoginAnswer>> = {};
@@ -101,7 +101,7 @@ const row = (username: string) =>
     return {
       gen: r.cred_gen,
       open: !!r.cred_check_tag,
-      inRow: (await openCredentials(Buffer.from(process.env.VAULT_KEY!, "base64"), r.vault)).password,
+      inRow: (await openAccountCredentials(Buffer.from(process.env.VAULT_KEY!, "base64"), r)).password,
       subscriptions: s.listPushSubscriptions(r.id).map((p) => p.id),
     };
   });

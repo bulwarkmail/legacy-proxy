@@ -40,7 +40,7 @@ vi.mock("../../src/imap/client.js", () => ({
 }));
 
 vi.mock("../../src/auth/credentials.js", () => ({
-  openCredentials: vi.fn(async () => ({ mech: "PLAIN", username: "u", password: "p" })),
+  openAccountCredentials: vi.fn(async () => ({ mech: "PLAIN", username: "u", password: "p" })),
   sealCredentials: vi.fn(),
 }));
 
@@ -50,7 +50,7 @@ vi.mock("../../src/auth/providers.js", () => ({
 
 const { ImapPool } = await import("../../src/imap/pool.js");
 const { openImap } = await import("../../src/imap/client.js");
-const { openCredentials } = await import("../../src/auth/credentials.js");
+const { openAccountCredentials } = await import("../../src/auth/credentials.js");
 import type { AccountRow, Store } from "../../src/state/store.js";
 import type { AppConfig } from "../../src/util/config.js";
 
@@ -273,7 +273,7 @@ describe("ImapPool", () => {
     rows[1] = { ...account, vault: Buffer.from("current") } as AccountRow;
     const pool = makePool();
     await pool.acquire({ ...account, vault: Buffer.from("stale") } as AccountRow, "interactive");
-    expect(vi.mocked(openCredentials).mock.lastCall?.[1]).toEqual(Buffer.from("current"));
+    expect(vi.mocked(openAccountCredentials).mock.lastCall?.[1].vault).toEqual(Buffer.from("current"));
   });
 
   it("frees a parked caller when a held connection closes", async () => {

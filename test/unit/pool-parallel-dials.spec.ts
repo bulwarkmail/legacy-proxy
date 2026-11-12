@@ -13,7 +13,7 @@ import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ImapPool } from "../../src/imap/pool.js";
 import { Store } from "../../src/state/store.js";
-import { sealCredentials } from "../../src/auth/credentials.js";
+import { sealCredentials, sealPlace } from "../../src/auth/credentials.js";
 import type { AppConfig } from "../../src/util/config.js";
 import { startFakeImap, type FakeImap } from "./fake-imap.js";
 
@@ -64,7 +64,7 @@ describe("parallel requests and a stored password the server refuses", () => {
       kind: "generic",
       host: "127.0.0.1",
       username,
-      vault: await sealCredentials(vaultKey, { mech: "PLAIN", username, password: "the-old-password" }),
+      vault: await sealCredentials(vaultKey, sealPlace.account(`generic:${username}`), { mech: "PLAIN", username, password: "the-old-password" }),
     });
     const pool = poolFor();
     const before = imap.logins;
@@ -89,7 +89,7 @@ describe("parallel requests and a stored password the server refuses", () => {
       kind: "generic",
       host: "127.0.0.1",
       username,
-      vault: await sealCredentials(vaultKey, { mech: "PLAIN", username, password: "right" }),
+      vault: await sealCredentials(vaultKey, sealPlace.account(`generic:${username}`), { mech: "PLAIN", username, password: "right" }),
     });
     const pool = poolFor();
     const before = imap.logins;

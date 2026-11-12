@@ -155,7 +155,7 @@ export async function registerGmailRoutes(
         .type("text/html")
         .send(
           page(
-            `<p>${config.writeEnabled ? "Authorize reading and organizing mail: read/unread, stars, archive, trash and labels. Sending is available only when composition is enabled by the operator; permanent mail deletion is not available." : "Connect your Gmail account with read-only access."} Only accounts enabled by the operator can connect.</p><form method="post" action="/auth/google/start">${store ? '<p><label><input type="checkbox" name="issue" value="1"> Issue a new bridge password for Bulwark (shown once; the current one stops working). The first connection of an account always gets one.</label></p>' : ""}<button type="submit">Connect Gmail</button></form>`,
+            `<p>${config.writeEnabled ? "Authorize reading and organizing mail: read/unread, stars, archive, trash and labels. Sending is available only when composition is enabled by the operator; permanent mail deletion is not available." : "Connect your Gmail account with read-only access."} Only accounts enabled by the operator can connect.</p><form method="post" action="/auth/google/start">${store ? '<p><label><input type="checkbox" name="issue" value="1"> Issue a new bridge password for Bulwark (shown once). The current one stops working, every device signed in to this account through the bridge is signed out, and push notifications have to be set up again. The first connection of an account always gets one.</label></p>' : ""}<button type="submit">Connect Gmail</button></form>`,
           ),
         ),
     );
@@ -230,13 +230,13 @@ export async function registerGmailRoutes(
           .type("text/html")
           .send(
             page(
-              `<p>Gmail connected. Add the account in Bulwark with these credentials. The password is shown only once: copy it now.</p><dl><dt>Server</dt><dd><code>${escape(config.origin)}</code></dd><dt>Username</dt><dd><code>${escape(result.email)}</code></dd><dt>Password</dt><dd><code>${escape(result.password)}</code></dd></dl><p>Any previous bridge password for this account no longer works.</p>`,
+              `<p>Gmail connected. Add the account in Bulwark with these credentials. The password is shown only once: copy it now.</p><dl><dt>Server</dt><dd><code>${escape(config.origin)}</code></dd><dt>Username</dt><dd><code>${escape(result.email)}</code></dd><dt>Password</dt><dd><code>${escape(result.password)}</code></dd></dl><p>Any previous bridge password for this account no longer works. Every device that was signed in to this account through the bridge has been signed out, and push notifications have to be set up again on each device.</p>`,
             ),
           );
       }
       const message =
         status === "issued"
-          ? "Gmail connected and a new bridge password was issued. It was shown only once and is no longer available here; if you did not copy it, connect again with “Issue a new bridge password” ticked. The previous bridge password no longer works."
+          ? "Gmail connected and a new bridge password was issued. It was shown only once and is no longer available here; if you did not copy it, connect again with “Issue a new bridge password” ticked. The previous bridge password no longer works, every device signed in through the bridge was signed out, and push notifications have to be set up again."
           : status === "connected"
             ? "Gmail connected. Return to Bulwark and reload the page. Your existing bridge password still works."
             : status === "cancelled"
@@ -306,6 +306,10 @@ export async function registerGmailRoutes(
       const body = (req.body ?? {}) as Record<string, unknown>;
       const param = (name: string) => (typeof body[name] === "string" ? (body[name] as string) : "");
       reply.header("Pragma", "no-cache");
+      // Every refused request gets its own answer, however many came before:
+      // a client's server redeems tokens for all its users from one address,
+      // and codes and tokens are 256-bit random values, so a hold here would
+      // only keep users whose sign-in ended from being told so.
       const client = clients.get(param("client_id"));
       if (!client) return reply.code(401).send({ error: "invalid_client" });
       let result: IssuedTokens | null = null;

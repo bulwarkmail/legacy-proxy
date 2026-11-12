@@ -95,13 +95,11 @@ export function snippetPreview(snippet: string | undefined): string {
   return snippet
     .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, body: string) => {
       const ref = body.toLowerCase();
-      if (ref.startsWith("#x")) {
-        const code = Number.parseInt(ref.slice(2), 16);
-        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
-      }
       if (ref.startsWith("#")) {
-        const code = Number.parseInt(ref.slice(1), 10);
-        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
+        const code = ref.startsWith("#x") ? Number.parseInt(ref.slice(2), 16) : Number.parseInt(ref.slice(1), 10);
+        // Only a reference that names a character becomes one: up to U+10FFFF,
+        // not a surrogate half, not U+0000. Anything else stays as written.
+        return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;
       }
       return SNIPPET_ENTITIES[ref] ?? match;
     })

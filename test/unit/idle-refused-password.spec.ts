@@ -19,7 +19,7 @@ vi.mock("../../src/imap/client.js", async (importOriginal) => ({
 import { openImap } from "../../src/imap/client.js";
 import { Store } from "../../src/state/store.js";
 import { PushIdleManager } from "../../src/push/idle.js";
-import { sealCredentials } from "../../src/auth/credentials.js";
+import { sealCredentials, sealPlace } from "../../src/auth/credentials.js";
 import type { AppConfig } from "../../src/util/config.js";
 
 /** What imapflow throws for a tagged NO [AUTHENTICATIONFAILED]. */
@@ -68,7 +68,7 @@ beforeEach(async () => {
     kind: "generic",
     host: "imap.test",
     username,
-    vault: await sealCredentials(vaultKey, { mech: "PLAIN", username, password: "replaced-long-ago" }),
+    vault: await sealCredentials(vaultKey, sealPlace.account(`generic:${username}`), { mech: "PLAIN", username, password: "replaced-long-ago" }),
   });
   store.insertPushSubscription({
     id: "s1",
@@ -223,7 +223,7 @@ describe("what the refused mark keeps and what clears it", () => {
       kind: "generic",
       host: "imap.test",
       username: "u@test.local",
-      vault: await sealCredentials(vaultKey, { mech: "PLAIN", username: "u@test.local", password: "the-new-one" }),
+      vault: await sealCredentials(vaultKey, sealPlace.account("generic:u@test.local"), { mech: "PLAIN", username: "u@test.local", password: "the-new-one" }),
       rotate: true,
     });
     subscribeAgain("s3");
@@ -249,7 +249,7 @@ describe("what the refused mark keeps and what clears it", () => {
       kind: "generic",
       host: "imap.test",
       username: "u@test.local",
-      vault: await sealCredentials(vaultKey, { mech: "PLAIN", username: "u@test.local", password: "the-new-one" }),
+      vault: await sealCredentials(vaultKey, sealPlace.account("generic:u@test.local"), { mech: "PLAIN", username: "u@test.local", password: "the-new-one" }),
       rotate: true,
     });
     await vi.advanceTimersByTimeAsync(3600_000);

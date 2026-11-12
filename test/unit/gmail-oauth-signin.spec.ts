@@ -214,7 +214,8 @@ describe("sign-in for registered applications", () => {
 
     const refreshed = (await token({ grant_type: "refresh_token", client_id: "webmail", refresh_token: first.refresh_token })).json();
     expect(refreshed.access_token).not.toBe(first.access_token);
-    expect(refreshed.refresh_token).toBe(first.refresh_token);
+    expect(refreshed.refresh_token).toMatch(/^gmrt_/);
+    expect(refreshed.refresh_token).not.toBe(first.refresh_token);
     expect((await token({ grant_type: "refresh_token", client_id: "other", refresh_token: first.refresh_token })).statusCode).toBe(401);
 
     const revoke = await app.inject({
