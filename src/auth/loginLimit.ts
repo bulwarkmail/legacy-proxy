@@ -113,8 +113,11 @@ export class LoginLimiter {
   private readonly byUser: FailureLog;
   private readonly byAddress: FailureLog;
   private readonly pending = new Map<string, number>();
-  private inFlight = 0;
-  private readonly waiting: Array<() => void> = [];
+  // First logins, and re-validations of credentials the proxy validated
+  // before, each with slots of their own: callers nobody knows keeping their
+  // slots busy cannot make signed-in clients wait or get 503.
+  private readonly slots: Slots = { inFlight: 0, waiting: [] };
+  private readonly knownSlots: Slots = { inFlight: 0, waiting: [] };
 
   constructor(options: LoginLimitOptions = {}) {
     const { now, ...rest } = options;
@@ -126,22 +129,25 @@ export class LoginLimiter {
 
   /**
    * Ask to make one login at the mail server for `username` on behalf of the
-   * client at `address`. When `ok`, the caller must call `finish` exactly once
+   * client at `address`. `known` marks a re-validation of credentials the
+   * proxy validated before (a cached Basic login that lapsed): it waits for a
+   * slot of its own. When `ok`, the caller must call `finish` exactly once
    * with the outcome.
    */
-  async begin(address: string, username: string): Promise<LoginGate> {
+  async begin(address: string, username: string, options: { known?: boolean } = {}): Promise<LoginGate> {
     const addr = addressKey(address);
     const user = userKey(addr, username);
     const held = this.hold(addr, user);
     if (held) return held;
 
-    if (!(await this.acquire())) {
+    const slots = options.known ? this.knownSlots : this.slots;
+    if (!(await this.acquire(slots))) {
       return { ok: false, status: 503, retryAfterSec: Math.max(1, Math.ceil(this.opts.maxWaitMs / 1000)) };
     }
     // The counts may have moved while this request waited for a slot.
     const heldNow = this.hold(addr, user);
     if (heldNow) {
-      this.release();
+      this.release(slots);
       return heldNow;
     }
 
@@ -155,7 +161,7 @@ export class LoginLimiter {
         finished = true;
         this.bump(addr, -1);
         this.bump(user, -1);
-        this.release();
+        this.release(slots);
         const now = this.now();
         if (outcome === "refused") {
           this.byAddress.add(addr, now);
@@ -217,33 +223,39 @@ export class LoginLimiter {
     else this.pending.delete(key);
   }
 
-  private acquire(): Promise<boolean> {
-    if (this.inFlight < this.opts.maxInFlight) {
-      this.inFlight++;
+  private acquire(slots: Slots): Promise<boolean> {
+    if (slots.inFlight < this.opts.maxInFlight) {
+      slots.inFlight++;
       return Promise.resolve(true);
     }
-    if (this.waiting.length >= this.opts.maxWaiting) return Promise.resolve(false);
+    if (slots.waiting.length >= this.opts.maxWaiting) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
       const wake = () => {
         clearTimeout(timer);
         resolve(true);
       };
       const timer = setTimeout(() => {
-        const i = this.waiting.indexOf(wake);
-        if (i >= 0) this.waiting.splice(i, 1);
+        const i = slots.waiting.indexOf(wake);
+        if (i >= 0) slots.waiting.splice(i, 1);
         resolve(false);
       }, this.opts.maxWaitMs);
       timer.unref?.();
-      this.waiting.push(wake);
+      slots.waiting.push(wake);
     });
   }
 
   /** Hand the slot to the next waiter, or give it back. */
-  private release(): void {
-    const next = this.waiting.shift();
+  private release(slots: Slots): void {
+    const next = slots.waiting.shift();
     if (next) next();
-    else this.inFlight--;
+    else slots.inFlight--;
   }
+}
+
+/** Logins at the mail server running at once, and callers waiting for one to end. */
+interface Slots {
+  inFlight: number;
+  waiting: Array<() => void>;
 }
 
 /** User names count without regard to case or surrounding space. */

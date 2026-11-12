@@ -75,6 +75,25 @@ describe("LoginLimiter", () => {
     if (b.ok) b.finish("accepted");
   });
 
+  it("gives re-validations of known clients slots of their own", async () => {
+    const limiter = new LoginLimiter({ maxInFlight: 1, maxWaitMs: 20 });
+    // A stranger's login keeps the only first-login slot busy.
+    const stranger = await limiter.begin("198.51.100.9", "someone");
+    expect(held(stranger)).toBe("open");
+    expect(await limiter.begin("198.51.100.10", "other")).toMatchObject({ ok: false, status: 503 });
+    // A signed-in client re-validating its lapsed Basic login is not stuck behind it.
+    const known = await limiter.begin("192.0.2.10", "carol", { known: true });
+    expect(held(known)).toBe("open");
+    if (known.ok) known.finish("accepted");
+    if (stranger.ok) stranger.finish("refused");
+  });
+
+  it("holds a known client's re-validation like any login", async () => {
+    const limiter = new LoginLimiter();
+    await fail(limiter, "198.51.100.1", "carol", 10);
+    expect(held(await limiter.begin("198.51.100.1", "carol", { known: true }))).toBe(429);
+  });
+
   it("stays bounded in size", async () => {
     const limiter = new LoginLimiter({ maxKeys: 100, maxPerAddress: 1_000_000 });
     for (let i = 0; i < 1000; i++) await fail(limiter, `198.51.${i >> 8}.${i & 255}`, `user${i}`, 1);

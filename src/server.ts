@@ -769,10 +769,13 @@ async function authn(req: {
       }
       basicAuthCache.delete(cacheKey);
     }
+    // An entry left over from a validation that lapsed: this login re-validates
+    // a signed-in client and takes a slot of the queue for those.
+    const known = basicAuthCache.has(cacheKey);
     const runningKey = `${cacheKey}\n${req.ip}`;
     let running = basicLogins.get(runningKey);
     if (!running) {
-      running = basicLogin(username, password, cacheKey, req.ip).finally(() => basicLogins.delete(runningKey));
+      running = basicLogin(username, password, cacheKey, req.ip, known).finally(() => basicLogins.delete(runningKey));
       basicLogins.set(runningKey, running);
     }
     return running;
@@ -781,7 +784,13 @@ async function authn(req: {
   return UNAUTHORIZED;
 }
 
-async function basicLogin(username: string, password: string, cacheKey: string, ip: string): Promise<AuthOutcome> {
+async function basicLogin(
+  username: string,
+  password: string,
+  cacheKey: string,
+  ip: string,
+  known: boolean,
+): Promise<AuthOutcome> {
   if (bridgeSecretOffered(password)) return UNAUTHORIZED;
 
   let providerName: string;
@@ -794,13 +803,16 @@ async function basicLogin(username: string, password: string, cacheKey: string, 
   }
   const creds: Credentials = { mech: "PLAIN", username, password };
 
-  const gate = await logins.begin(ip, username);
+  const gate = await logins.begin(ip, username, { known });
   if (!gate.ok) return gate;
   let probe;
   try {
     probe = await openImap({ provider, creds });
   } catch (e) {
-    gate.finish(isCredentialRefusal(e) ? "refused" : "error");
+    const refused = isCredentialRefusal(e);
+    gate.finish(refused ? "refused" : "error");
+    // A header the server refused is no longer one the proxy knows.
+    if (refused) basicAuthCache.delete(cacheKey);
     log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
     return UNAUTHORIZED;
   }

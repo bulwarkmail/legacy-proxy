@@ -308,7 +308,10 @@ Every login the proxy makes at the mail server for a caller without a session
 - Only a refusal of the credentials counts. A mail server that cannot be
   reached, or answers "try again later", does not.
 - At most 20 such logins run at once; more wait up to 5 seconds and are then
-  answered `503`.
+  answered `503`. A Basic client re-validating a login the proxy validated
+  before (every 5 minutes, when its cache entry lapses) uses 20 slots of its
+  own, so first logins from unknown callers cannot keep signed-in clients
+  waiting.
 - A held pair gets `429` for HTTP Basic even when the header is in the 5-minute
   cache or a login for it is still running; the same header from another
   address is a different pair and keeps working. A Basic client that shares an
