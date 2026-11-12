@@ -12,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import { JmapError } from "../jmap/errors.js";
 import { log } from "../util/log.js";
 
 export interface CardDavOpts {
@@ -107,6 +108,61 @@ function rememberVCard(key: string, data: string): void {
 
 // HTTP methods that only read. Anything else invalidates the cached book list.
 const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
+
+// Redirects are followed by hand, at most this many hops, and only to the
+// configured origin (see absolutise).
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 4;
+
+/**
+ * Bounds on one exchange with the address book server: the deadline covers
+ * the request, its redirects and reading the answer; the size is that of the
+ * answer's body. Hitting either answers the JMAP call with serverUnavailable.
+ * Tests lower them.
+ */
+export const cardDavLimits = { timeoutMs: 30_000, maxResponseBytes: 20 * 1024 * 1024 };
+
+const isAbort = (e: unknown) =>
+  (e as { name?: unknown } | null)?.name === "TimeoutError" || (e as { name?: unknown } | null)?.name === "AbortError";
+const tooSlow = () => new JmapError("serverUnavailable", "the contacts server did not answer in time");
+const tooLarge = () => new JmapError("serverUnavailable", "the contacts server's answer is too large");
+
+async function fetchInTime(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    throw isAbort(e) ? tooSlow() : e;
+  }
+}
+
+/** The answer's body as text, refused once it passes cardDavLimits.maxResponseBytes. */
+async function readText(res: Response): Promise<string> {
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (declared > cardDavLimits.maxResponseBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooLarge();
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cardDavLimits.maxResponseBytes) {
+        await reader.cancel().catch(() => {});
+        throw tooLarge();
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    if (e instanceof JmapError) throw e;
+    throw isAbort(e) ? tooSlow() : e;
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
 
 /**
  * Drop every memoised discovery result and book list. Production code never
@@ -240,6 +296,53 @@ export class CardDavClient {
     return out;
   }
 
+  /**
+   * Whether `resourceHref` names a resource inside the address book at
+   * `bookHref`. A ContactCard id carries both, so this keeps an id to a card
+   * of that book. The resource must be a path, or an absolute URL on the DAV
+   * origin, whose segments begin with the book's and add at least one more.
+   * Empty segments (`//`, a trailing slash), a backslash, a query, a fragment,
+   * control characters, and any segment a server could take as `.` or `..`
+   * (see isDotSegment), also percent-encoded at any depth or in an overlong
+   * UTF-8 form, are refused.
+   */
+  isInBook(bookHref: string, resourceHref: string): boolean {
+    const book = this.localPath(bookHref);
+    const resource = this.localPath(resourceHref);
+    if (book === null || resource === null) return false;
+    if (/[\\?#\u0000-\u001f\u007f]/.test(resource)) return false;
+    const bookSegs = book.split("/").filter((s) => s !== "");
+    const segs = resource.split("/").slice(1);
+    if (segs.length <= bookSegs.length || segs.some((s) => s === "")) return false;
+    for (let i = 0; i < bookSegs.length; i++) {
+      if (decodeSegment(segs[i]!) !== decodeSegment(bookSegs[i]!)) return false;
+    }
+    return segs.every((s) => {
+      if (OVERLONG_UTF8.test(s)) return false;
+      const plain = unescapePathChars(s);
+      return plain !== null && plain.split(/[/\\]/).every((p) => !isDotSegment(p));
+    });
+  }
+
+  /** The path part of an href on this server; null for anything else. */
+  private localPath(href: string): string | null {
+    let path = href;
+    const abs = /^([a-z][a-z0-9+.-]*:)\/\/([^/?#\\]*)([\s\S]*)$/i.exec(href);
+    if (abs) {
+      let base: URL;
+      try {
+        base = new URL(`${abs[1]}//${abs[2]}/`);
+      } catch {
+        return null;
+      }
+      if (base.origin !== new URL(this.origin).origin || base.username || base.password) return null;
+      path = abs[3]!;
+    } else if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+      return null;
+    }
+    return path.startsWith("/") && !path.startsWith("//") ? path : null;
+  }
+
   /** Current etag for a resource, from the cached listing of its collection. */
   private knownEtag(bookHref: string, href: string): string | null {
     const key = `${this.cacheKey}|${bookHref}`;
@@ -345,9 +448,9 @@ export class CardDavClient {
     if (!res.ok) throw await httpError("MKCOL", href, res);
     // 207 from an extended MKCOL means some property failed to set.
     if (res.status === 207) {
-      const text = await res.text();
+      const text = await readText(res);
       if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
-        throw new Error(`CardDAV MKCOL ${href} → property failure: ${text.slice(0, 200)}`);
+        throw new Error("CardDAV MKCOL: the server refused a property");
       }
     }
   }
@@ -373,9 +476,9 @@ export class CardDavClient {
       `</D:propertyupdate>`;
     const res = await this.raw("PROPPATCH", href, body, { "Content-Type": "application/xml; charset=utf-8" });
     if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
-    const text = await res.text();
+    const text = await readText(res);
     if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) {
-      throw new Error(`CardDAV PROPPATCH ${href} → property failure: ${text.slice(0, 200)}`);
+      throw new Error("CardDAV PROPPATCH: the server refused a property");
     }
   }
 
@@ -387,35 +490,69 @@ export class CardDavClient {
     body: string | null,
     headers: Record<string, string> = {},
   ): Promise<Response> {
-    const url = absolutise(this.origin, path);
+    let url = absolutise(this.origin, path);
     // Any write invalidates the cached book list before it is issued: a PUT or
     // DELETE moves the collection's ctag (and so its JMAP state), and MKCOL /
     // PROPPATCH change the set itself. Dropping it up front rather than after
     // means a write that fails midway can't leave a stale list behind.
     if (!READ_METHODS.has(method.toUpperCase())) bookListCache.delete(this.cacheKey);
-    const res = await fetch(url, {
-      method,
-      headers: { Authorization: this.authHeader, ...headers },
-      ...(body === null ? {} : { body }),
-    });
-    log.debug({ method, url, status: res.status }, "carddav request");
-    return res;
+    // Redirects are followed here rather than by fetch, so every hop goes
+    // through absolutise: the request and its Authorization header stay on
+    // the configured origin, which also rules out a switch from https to http.
+    // The signal stays on the returned response, so the deadline also covers
+    // the caller reading its body.
+    const signal = AbortSignal.timeout(cardDavLimits.timeoutMs);
+    for (let hop = 0; ; hop++) {
+      const res = await fetchInTime(url, {
+        method,
+        headers: { Authorization: this.authHeader, ...headers },
+        ...(body === null ? {} : { body }),
+        redirect: "manual",
+        signal,
+      });
+      log.debug({ method, url, status: res.status }, "carddav request");
+      const location = REDIRECT_STATUSES.has(res.status) ? res.headers.get("location") : null;
+      if (!location) return res;
+      await res.body?.cancel().catch(() => {});
+      if (hop >= MAX_REDIRECTS) throw new Error("CardDAV: too many redirects");
+      url = this.redirectTarget(url, location);
+      // As fetch does: 303 turns the request into a GET without a body.
+      if (res.status === 303 && method !== "HEAD") {
+        method = "GET";
+        body = null;
+      }
+    }
+  }
+
+  /** Where a redirect from `current` leads; throws when it leaves the origin. */
+  private redirectTarget(current: string, location: string): string {
+    let target: string;
+    try {
+      target = new URL(location, current).href;
+    } catch {
+      throw new Error("CardDAV: invalid redirect");
+    }
+    return absolutise(this.origin, target);
   }
 
   private async followToCollection(path: string): Promise<string> {
     let url = absolutise(this.origin, path);
+    const signal = AbortSignal.timeout(cardDavLimits.timeoutMs);
     for (let i = 0; i < 4; i++) {
-      const res = await fetch(url, {
+      const res = await fetchInTime(url, {
         method: "PROPFIND",
         headers: { Authorization: this.authHeader, Depth: "0", "Content-Type": "application/xml" },
         body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
         redirect: "manual",
+        signal,
       });
       log.debug({ url, status: res.status }, "carddav discovery probe");
+      // Only the status and Location are used.
+      await res.body?.cancel().catch(() => {});
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
-        url = absolutise(this.origin, loc);
+        url = this.redirectTarget(url, loc);
         continue;
       }
       // surface auth/server errors here so callers see a useful message
@@ -455,7 +592,7 @@ export class CardDavClient {
       ...extra,
     });
     if (!res.ok && res.status !== 207) throw await httpError(method, path, res);
-    return await res.text();
+    return await readText(res);
   }
 }
 
@@ -466,10 +603,12 @@ export class CardDavConflict extends Error {
   }
 }
 
+// The message reaches JMAP clients as an error description, so it carries the
+// status code only: nothing of the server's answer, not even its reason phrase.
 async function httpError(method: string, path: string, res: Response): Promise<Error> {
-  const text = await res.text().catch(() => "");
+  await res.body?.cancel().catch(() => {});
   log.warn({ method, path, status: res.status }, "carddav request failed");
-  return new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
+  return new Error(`CardDAV ${method} failed with status ${res.status}`);
 }
 
 // -----------------------------------------------------------------------
@@ -491,11 +630,66 @@ function buildAuth(c: Credentials): string {
   throw new Error(`unsupported carddav auth mech: ${c.mech}`);
 }
 
+/**
+ * The URL a request for `pathOrUrl` goes to. A path is taken relative to the
+ * configured origin. An absolute URL, whether it came from the server (a
+ * multistatus href, a Location header) or anywhere else, is accepted only
+ * when it has the same scheme, host and port and no user name; anything else
+ * throws, so no request is sent.
+ */
 function absolutise(origin: string, pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  if (!pathOrUrl.startsWith("/")) pathOrUrl = "/" + pathOrUrl;
-  return origin + pathOrUrl;
+  const raw = /^[a-z][a-z0-9+.-]*:/i.test(pathOrUrl)
+    ? pathOrUrl
+    : origin + (pathOrUrl.startsWith("/") ? "" : "/") + pathOrUrl;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("CardDAV: invalid address");
+  }
+  if (url.origin !== new URL(origin).origin || url.username || url.password) {
+    throw new Error("CardDAV: refused an address outside the configured server");
+  }
+  return url.href;
 }
+
+/** One path segment, percent-decoded once; as it is when it doesn't decode. */
+function decodeSegment(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * Undo percent-encoding of `.`, `/`, `\`, `%`, `;`, NUL, space and tab until
+ * nothing changes, so a dot segment shows however often it was encoded. Null
+ * when it is still changing after more rounds than any server decodes.
+ */
+function unescapePathChars(s: string): string | null {
+  let cur = s;
+  for (let i = 0; i < 5; i++) {
+    const next = cur.replace(/%(2e|2f|5c|25|3b|00|20|09)/gi, (m) => String.fromCharCode(parseInt(m.slice(1), 16)));
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return null;
+}
+
+/**
+ * A segment a server could take as `.` or `..`: nothing but dots, optionally
+ * followed by what some servers cut off before resolving the path (a path
+ * parameter after `;` in servlet containers, everything after a NUL, trailing
+ * whitespace). `.hidden.vcf` or `..vcf` are names, not references.
+ */
+function isDotSegment(p: string): boolean {
+  return /^\.+(?:[;\u0000\s][\s\S]*)?$/.test(p);
+}
+
+// Overlong UTF-8 forms (a "." written as %c0%ae and the like), which no
+// encoder writes and some servers decode to a dot or a slash.
+const OVERLONG_UTF8 = /%(?:c0|c1)|%e0%[89][0-9a-f]|%f0%8[0-9a-f]/i;
 
 function leafName(href: string): string {
   const trimmed = href.replace(/\/+$/, "");
@@ -604,14 +798,24 @@ export function pickHref(xml: string, parentLocalName: string): string | null {
   return extractHref(m[1]);
 }
 
+const NAMED_ENTITIES: Record<string, string> = { lt: "<", gt: ">", quot: '"', apos: "'", amp: "&" };
+
+/**
+ * Element text as XML defines it, in one pass: a CDATA section is taken as it
+ * is, and each entity or character reference outside one is decoded once. A
+ * character reference that names no XML character (beyond U+10FFFF, a
+ * surrogate, U+0000) stays as written.
+ */
 function decodeXmlText(s: string): string {
-  return s
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_m, p1: string) => p1)
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_m, h: string) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_m, d: string) => String.fromCodePoint(parseInt(d, 10)))
-    .replace(/&amp;/g, "&");
+  return s.replace(
+    /<!\[CDATA\[([\s\S]*?)\]\]>|&(lt|gt|quot|apos|amp|#x[0-9a-fA-F]+|#[0-9]+);/g,
+    (m, cdata: string | undefined, ref: string) => {
+      if (cdata !== undefined) return cdata;
+      const named = NAMED_ENTITIES[ref];
+      if (named !== undefined) return named;
+      const cp = ref[1] === "x" ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
+      const valid = cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff);
+      return valid ? String.fromCodePoint(cp) : m;
+    },
+  );
 }

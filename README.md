@@ -86,6 +86,23 @@ Transport:
   subscriber URL; once verified, every state change is forwarded as a
   `StateChange` POST. 404 / 410 responses retire the subscription; 8
   consecutive non-2xx responses also retire it.
+- A push URL must be `https` and its host must resolve to public addresses
+  only. This is checked when the subscription is created and again for every
+  POST: the host is resolved once and the POST goes to the address that was
+  checked. Redirects are not followed, and a failed delivery logs the host,
+  never the URL. A relay on a private network, or one reached over plain
+  `http`, needs `PUSH_ALLOW_PRIVATE_URLS=1`.
+  When upgrading from a version without this check: a subscription whose URL
+  is `http` stops being delivered unless `PUSH_ALLOW_PRIVATE_URLS=1` is set.
+  Each delivery then fails inside the proxy (logged with the host), and after
+  8 failed deliveries the proxy removes the subscription. A released Bulwark
+  webmail then tries to create a new one at its daily push resync, is refused
+  ("push URL must use https") and doesn't tell the user, so push stays off.
+  Before upgrading, serve the push relay over `https` and point the webmail's
+  relay URL at it, or set `PUSH_ALLOW_PRIVATE_URLS=1` (which also lifts the
+  private-address check). Users get push back at the webmail's next resync,
+  or at once with **Re-register** under "Notifications when Bulwark is
+  closed" in its settings.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
   least one verified push subscription, watching INBOX. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
@@ -106,6 +123,14 @@ Backends:
   A CardDAV account with no collections at all (a fresh Radicale user, for
   example) gets a `Contacts` address book created on the first
   `ContactCard/set`.
+  Requests, and the user's credentials, go only to the configured `carddav`
+  host, port and scheme. An href or a redirect that points anywhere else is
+  not followed, during discovery too; a redirect on the same host is (at most
+  four hops). A provider whose `/.well-known/carddav` redirects to another
+  host (iCloud-style setups) therefore has no contacts until that host is
+  configured directly: set `host`, `port` and `secure` to the server the
+  redirect leads to, and `basePath` to the DAV root there, or `principalPath`
+  to the user's principal to skip discovery.
 
 Auth and storage:
 
@@ -692,7 +717,8 @@ streams; addresses and message contents are never logged.
 With push configured the backend also accepts `PushSubscription/get` and
 `PushSubscription/set` (RFC 8620 §7.2), which is what a webmail needs for system
 notifications while every tab is closed. A subscription must use an `https` URL
-(typically a push relay that forwards to the browser's push service); the bridge
+on a public address (typically a push relay that forwards to the browser's push
+service), checked and connected to as on the IMAP backend; the bridge
 POSTs a `PushVerification` to it on create and only delivers once the client
 returns that code through an update. Expiry defaults to 90 days and is capped at
 a year, at most 20 subscriptions per account, and `keys` are accepted but never
@@ -769,7 +795,7 @@ the client's address and not the reverse proxy's.
 | `MAX_CALLS_IN_REQUEST`     | `64`                               | per-envelope method-call cap                         |
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
-| `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
+| `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks and plain `http` (IMAP backend) |
 | `TRUST_PROXY`              | unset                              | client address from `X-Forwarded-For`; see below     |
 
 The limits the Session resource advertises are the ones the proxy enforces:

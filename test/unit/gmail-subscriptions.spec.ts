@@ -8,8 +8,32 @@ import { GmailMail } from "../../src/gmail/mail.js";
 import { GmailPush } from "../../src/gmail/push.js";
 import { GMAIL_MODIFY } from "../../src/gmail/config.js";
 import { JmapError } from "../../src/jmap/errors.js";
-// Relay hosts here are fake; the address check has its own spec.
-vi.mock("../../src/util/pushTarget.js", () => ({ assertPublicPushTarget: async () => {} }));
+import type { PushInit } from "../../src/util/pushTarget.js";
+import {
+  PUBLIC,
+  attempted,
+  notFoundError,
+  resolveTo,
+  startLocalServer,
+  watchSockets,
+} from "./push-sockets.js";
+// Relay hosts here are fake, so by default the address check passes and pushes
+// go to the stubbed fetch below. The cases about the check and the delivery
+// themselves switch to the real functions.
+const real = vi.hoisted(() => ({ check: false, post: false }));
+vi.mock("../../src/util/pushTarget.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/util/pushTarget.js")>();
+  return {
+    ...actual,
+    assertPublicPushTarget: (url: string) =>
+      real.check ? actual.assertPublicPushTarget(url) : Promise.resolve(),
+    postPush: async (url: string, init: PushInit) => {
+      if (real.post) return actual.postPush(url, init);
+      const res = await fetch(url, { method: "POST", ...init });
+      return { status: res.status, ok: res.ok };
+    },
+  };
+});
 const email = "pushed@example.test";
 const PUSH = {
   topic: "projects/p/topics/gmail",
@@ -40,6 +64,9 @@ afterEach(() => {
   for (const f of cleanup.splice(0)) f();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  vi.restoreAllMocks();
+  real.check = false;
+  real.post = false;
 });
 async function setup(pushEnabled = true) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-subs-"));
@@ -297,6 +324,56 @@ it("drops an endpoint the push service has discarded and expires old subscriptio
   });
   expect(second.created.s.id).toBeTruthy();
   expect(store.subscriptions(email, Date.now() + 120_000)).toHaveLength(0);
+});
+it("checks the push URL's addresses when a subscription is created", async () => {
+  const { call } = await setup();
+  real.check = true;
+  const create = async (url: string) =>
+    (await call("PushSubscription/set", {
+      create: { s: { url, types: ["EmailDelivery"] } },
+    })) as { created: Record<string, any> | null; notCreated: Record<string, any> | null };
+  for (const url of [
+    "https://10.0.0.5/x",
+    "https://[::ffff:10.0.0.5]/x",
+    "https://127.0.0.1:8443/x",
+  ]) {
+    expect((await create(url)).notCreated?.s?.type, url).toBe("invalidProperties");
+  }
+  resolveTo("192.168.1.20", "192.168.1.20");
+  expect((await create("https://printer.example.test/x")).notCreated?.s?.type).toBe("invalidProperties");
+  resolveTo([PUBLIC, "10.0.0.5"], PUBLIC);
+  expect((await create("https://mixed.example.test/x")).notCreated?.s?.type).toBe("invalidProperties");
+  resolveTo(notFoundError(), PUBLIC);
+  expect((await create("https://nowhere.example.test/x")).notCreated?.s?.type).toBe("invalidProperties");
+  expect((await call("PushSubscription/get", {})).list).toHaveLength(0);
+  resolveTo(PUBLIC, PUBLIC);
+  expect((await create(RELAY)).created?.s?.id).toBeTruthy();
+});
+it("delivers to the address it checked, not to a second answer for the same name", async () => {
+  const internal = await startLocalServer();
+  cleanup.push(() => void internal.close());
+  const url = `https://rebind.example.test:${internal.port}/push/device-1`;
+  const { call, deliver, push } = await setup();
+  const r = await call("PushSubscription/set", {
+    create: { s: { url, types: ["EmailDelivery"] } },
+  });
+  const id = r.created.s.id;
+  const code = posts.find((p) => p.kind === "PushVerification")!.body.verificationCode;
+  await call("PushSubscription/set", {
+    update: { [id]: { verificationCode: code } },
+  });
+  // From here on the real check and delivery run, over real sockets.
+  vi.unstubAllGlobals();
+  real.check = true;
+  real.post = true;
+  attempted.length = 0;
+  resolveTo(PUBLIC, "127.0.0.1");
+  watchSockets();
+  deliver("m1");
+  await push.sync(email);
+  await new Promise((r) => setTimeout(r, 300));
+  expect(internal.connections, "the local service got a connection").toBe(0);
+  expect(attempted).toEqual([PUBLIC]);
 });
 it("refuses the methods entirely when push is not configured", async () => {
   const { call } = await setup(false);

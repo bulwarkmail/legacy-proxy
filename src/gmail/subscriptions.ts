@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import { JmapError } from "../jmap/errors.js";
 import type { MethodTable } from "../jmap/router.js";
 import type { GmailStore, PushSub } from "./store.js";
-import { assertPublicPushTarget } from "../util/pushTarget.js";
+import {
+  assertPublicPushTarget,
+  postPush,
+  pushHost,
+  PushTargetError,
+} from "../util/pushTarget.js";
 import {
   matchesFilter,
   parseEmailPush,
@@ -79,13 +84,11 @@ export class GmailSubscriptions {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      await assertPublicPushTarget(sub.url);
-      const res = await fetch(sub.url, {
-        method: "POST",
+      // Checks the URL, connects to the address it checked, follows no redirect.
+      const res = await postPush(sub.url, {
         headers: { "content-type": "application/json", "x-push-type": kind },
         body: JSON.stringify(body),
         signal: controller.signal,
-        redirect: "error",
       });
       // A push service that has dropped the endpoint says so; stop trying at once.
       if (res.status === 404 || res.status === 410) {
@@ -97,9 +100,14 @@ export class GmailSubscriptions {
     } catch (err) {
       if (this.store.subscriptionFailed(sub.id) >= MAX_FAILURES)
         this.store.unsubscribe(sub.id, sub.email);
-      // The URL can carry a device token: log the reason, never the endpoint.
+      // The URL can carry a device token: log the reason and the host, never
+      // the endpoint.
       this.log.warn(
-        { err: err instanceof Error ? err.message : String(err), kind },
+        {
+          err: err instanceof Error ? err.message : String(err),
+          host: pushHost(sub.url),
+          kind,
+        },
         "gmail push delivery failed",
       );
     } finally {
@@ -193,7 +201,7 @@ export class GmailSubscriptions {
     return sent;
   }
 
-  private create(input: unknown): Record<string, unknown> {
+  private async create(input: unknown): Promise<Record<string, unknown>> {
     const p = obj(input);
     for (const key of Object.keys(p)) {
       if (
@@ -210,6 +218,15 @@ export class GmailSubscriptions {
         "invalidProperties",
         "url must be an https URL of at most 2048 characters",
       );
+    // The check every delivery makes: a name that resolves, public addresses only.
+    try {
+      await assertPublicPushTarget(url);
+    } catch (err) {
+      fail(
+        "invalidProperties",
+        err instanceof PushTargetError ? err.message : "push URL refused",
+      );
+    }
     const device =
       p.deviceClientId === undefined || p.deviceClientId === null
         ? null
@@ -341,7 +358,7 @@ export class GmailSubscriptions {
           e instanceof JmapError ? e.toMethodError() : { type: "serverFail" };
         for (const [key, input] of Object.entries(obj(a.create ?? {}))) {
           try {
-            created[key] = this.create(input);
+            created[key] = await this.create(input);
           } catch (e) {
             notCreated[key] = error(e);
           }

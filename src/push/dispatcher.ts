@@ -13,7 +13,7 @@ import { encodeCounterState, encodeEmailState } from "../state/states.js";
 import type { Store, AccountRow, PushSubscriptionRow } from "../state/store.js";
 import type { EventSourceHub } from "../jmap/eventsource.js";
 import { log } from "../util/log.js";
-import { assertPublicPushTarget } from "../util/pushTarget.js";
+import { postPush, pushHost } from "../util/pushTarget.js";
 
 // Internal store kinds → JMAP type names that share that counter.
 // `Email` and `Thread` both ride on the email counter because the IMAP
@@ -198,9 +198,9 @@ export class PushDispatcher {
     let status = 0;
     let ok = false;
     try {
-      await assertPublicPushTarget(sub.url);
-      const res = await fetch(sub.url, {
-        method: "POST",
+      // postPush checks the URL, connects to the address it checked and
+      // follows no redirect.
+      const res = await postPush(sub.url, {
         headers: {
           "content-type": "application/json",
           // Spec-mandated header so push services / proxies can identify the
@@ -209,20 +209,13 @@ export class PushDispatcher {
         },
         body: JSON.stringify(body),
         signal: controller.signal,
-        // A redirect would reach a target the address check never saw.
-        redirect: "error",
       });
       status = res.status;
       ok = res.ok;
-      // Drain so keep-alive connections don't hang on to bytes.
-      try {
-        await res.arrayBuffer();
-      } catch {
-        // ignore
-      }
     } catch (err) {
+      // The host only: the URL can carry the relay's device token.
       log.warn(
-        { err: (err as Error).message, url: sub.url, kind, subId: sub.id },
+        { err: (err as Error).message, host: pushHost(sub.url), kind, subId: sub.id },
         "push: delivery network error",
       );
     } finally {

@@ -8,8 +8,19 @@ import { GmailMail } from "../../src/gmail/mail.js";
 import { GmailPush } from "../../src/gmail/push.js";
 import { GMAIL_MODIFY } from "../../src/gmail/config.js";
 import { JmapError } from "../../src/jmap/errors.js";
-// Relay hosts here are fake; the address check has its own spec.
-vi.mock("../../src/util/pushTarget.js", () => ({ assertPublicPushTarget: async () => {} }));
+// Relay hosts here are fake; the address check and the delivery have their own
+// spec. Pushes go to the stubbed fetch below.
+vi.mock("../../src/util/pushTarget.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/util/pushTarget.js")>();
+  return {
+    ...actual,
+    assertPublicPushTarget: async () => {},
+    postPush: async (url: string, init: { headers: Record<string, string>; body: string; signal?: AbortSignal }) => {
+      const res = await fetch(url, { method: "POST", ...init });
+      return { status: res.status, ok: res.ok };
+    },
+  };
+});
 const email = "pushed@example.test";
 const PUSH = {
   topic: "projects/p/topics/gmail",

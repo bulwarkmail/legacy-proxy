@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { ImapFlow } from "imapflow";
-import { simpleParser } from "mailparser";
 import type { AccountRow, Store } from "../../state/store.js";
 import type { AppConfig } from "../../util/config.js";
 import { decodeEmailId } from "../../mapping/ids.js";
@@ -8,6 +7,7 @@ import { withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
+import { headerValues, isPlainAddress, parseAddressList, readHeaderBlock } from "../../mapping/buildMime.js";
 import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, notFound } from "../errors.js";
 import { applyEmailUpdate } from "./email.js";
 import { SIDE_RESPONSES, type MethodCall } from "../router.js";
@@ -126,27 +126,23 @@ export function messageIdOf(raw: Buffer): string | null {
   return m ? m[1]!.replace(/\s+/g, " ").trim() : null;
 }
 
-// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop it (and
-// its folded continuation lines) from the header block, leaving the body
-// byte-for-byte untouched.
+// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop every Bcc
+// field (with its folded continuation lines) from the header block, read by
+// the same reader that derives the envelope, leaving everything else
+// byte-for-byte untouched. A message whose header block can't be read is
+// refused before this (see emailSubmissionSet) and is returned unchanged.
 export function stripBccHeader(raw: Buffer): Buffer {
-  const text = raw.toString("binary");
-  const m = /\r?\n\r?\n/.exec(text);
-  // Include the last header line's own line break so every line we keep is
-  // terminated and the blank separator line follows untouched.
-  const headerEnd = m ? m.index + (text[m.index] === "\r" ? 2 : 1) : text.length;
-  const lines = text.slice(0, headerEnd).split(/(?<=\n)/);
-  const kept: string[] = [];
-  let dropping = false;
-  for (const line of lines) {
-    if (/^[ \t]/.test(line)) {
-      if (!dropping) kept.push(line);
-      continue;
-    }
-    dropping = /^bcc[ \t]*:/i.test(line);
-    if (!dropping) kept.push(line);
+  const fields = readHeaderBlock(raw);
+  const bcc = (fields ?? []).filter((f) => f.name === "bcc");
+  if (bcc.length === 0) return raw;
+  const kept: Buffer[] = [];
+  let pos = 0;
+  for (const f of bcc) {
+    kept.push(raw.subarray(pos, f.start));
+    pos = f.end;
   }
-  return Buffer.from(kept.join("") + text.slice(headerEnd), "binary");
+  kept.push(raw.subarray(pos));
+  return Buffer.concat(kept);
 }
 
 // Gmail keeps one message per Message-ID, and the copy its SMTP server files in
@@ -169,50 +165,85 @@ export function withFreshMessageId(raw: Buffer): Buffer {
   );
 }
 
-function asEmail(s: string | undefined | null): string | null {
-  if (!s) return null;
-  const t = s.trim();
-  if (!t) return null;
-  return t;
+export { headerValues, isPlainAddress, parseAddressList };
+
+// The refused entries as given, quoted so that spaces, commas and control
+// characters show; at most ten, so the description stays readable.
+function nameList(entries: string[]): string {
+  const shown = entries.slice(0, 10).map((e) => JSON.stringify(e)).join(", ");
+  return entries.length > 10 ? `${shown} and ${entries.length - 10} more` : shown;
+}
+
+/** invalidRecipients naming each refused entry as given, in the property and the description. */
+function refuseRecipients(invalid: string[]): never {
+  const what = invalid.length === 1 ? "this recipient is" : "these recipients are";
+  throw new JmapError("invalidRecipients", `${what} not a plain email address: ${nameList(invalid)}`, {
+    invalidRecipients: invalid,
+  });
+}
+
+/** forbiddenMailFrom naming the refused sender as given. */
+function refuseMailFrom(from: string): never {
+  throw new JmapError("forbiddenMailFrom", `the sender is not a plain email address: ${nameList([from])}`, {
+    mailFrom: from,
+  });
+}
+
+/** Accept an envelope only when all its addresses are plain; each is trimmed, and named as given when refused. */
+function checkedEnvelope(from: string, to: string[]): { from: string; to: string[] } {
+  const invalid = to.filter((a) => !isPlainAddress(a.trim()));
+  if (invalid.length > 0) refuseRecipients(invalid);
+  if (!isPlainAddress(from.trim())) refuseMailFrom(from);
+  return { from: from.trim(), to: to.map((a) => a.trim()) };
 }
 
 async function resolveEnvelope(
   raw: Buffer,
   envelope: SubmissionCreate["envelope"],
 ): Promise<{ from: string; to: string[] }> {
-  if (envelope?.mailFrom?.email && envelope?.rcptTo?.length) {
-    return {
-      from: envelope.mailFrom.email,
-      to: envelope.rcptTo.map((r) => r.email!).filter(Boolean),
-    };
-  }
-  // Spec §7: if no envelope is given, derive from headers - From for
-  // mailFrom, To+Cc+Bcc for rcptTo.
-  const parsed = await simpleParser(raw);
-  const fromAddr =
-    asEmail(parsed.from?.value?.[0]?.address) ?? asEmail(envelope?.mailFrom?.email) ?? null;
-  const collect = (
-    field: { value?: { address?: string }[] } | { value?: { address?: string }[] }[] | undefined,
-  ): string[] => {
-    if (!field) return [];
-    const arr = Array.isArray(field) ? field : [field];
-    const out: string[] = [];
-    for (const f of arr) {
-      for (const v of f.value ?? []) {
-        const e = asEmail(v.address);
-        if (e) out.push(e);
-      }
+  if (envelope != null) {
+    // A client envelope is used whole (RFC 8621 §7.5): it needs both parts.
+    const invalidEnvelope = (what: string) => new JmapError("invalidProperties", what, { properties: ["envelope"] });
+    if (typeof envelope !== "object" || Array.isArray(envelope)) throw invalidEnvelope("envelope must be an object");
+    const mailFrom = envelope.mailFrom;
+    if (!mailFrom || typeof mailFrom !== "object" || typeof mailFrom.email !== "string") {
+      throw invalidEnvelope("envelope.mailFrom must be an address with an email");
     }
-    return out;
-  };
-  const to = [...collect(parsed.to), ...collect(parsed.cc), ...collect(parsed.bcc)];
+    if (!Array.isArray(envelope.rcptTo)) throw invalidEnvelope("envelope.rcptTo must be a list of addresses");
+    if (envelope.rcptTo.length === 0) throw new JmapError("noRecipients", "envelope.rcptTo is empty");
+    return checkedEnvelope(
+      mailFrom.email,
+      envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email : "")),
+    );
+  }
+  // RFC 8621 §7.5: without an envelope, mailFrom is the address in the Sender
+  // header field when there is one, otherwise the one in From; rcptTo is the
+  // addresses in To, Cc and Bcc, each member of a group being a recipient.
+  // More than one such field, or more than one address in it, is refused, as
+  // the RFC advises. The headers are read here, not by a mail library, so
+  // every address is taken as the message wrote it whatever library version
+  // is installed.
+  const entries = (name: string) => headerValues(raw, name).flatMap(parseAddressList);
+  const source = headerValues(raw, "sender").some((v) => v.trim() !== "") ? "sender" : "from";
+  const senders = entries(source);
+  if (headerValues(raw, source).length > 1 || senders.length > 1) {
+    throw new JmapError("invalidEmail", `the message names more than one ${source === "sender" ? "Sender" : "From"} address`);
+  }
+  const fromEntry = senders[0];
+  if (fromEntry && fromEntry.address === null) refuseMailFrom(fromEntry.written);
+  const fromAddr = fromEntry ? fromEntry.address : null;
+  const recipients = ["to", "cc", "bcc"].flatMap(entries);
+  // An entry that isn't one plain mailbox is refused, named as the message wrote it.
+  const invalid = recipients.filter((e) => e.address === null || !isPlainAddress(e.address));
+  if (invalid.length > 0) refuseRecipients(invalid.map((e) => e.address ?? e.written));
+  const to = recipients.map((e) => e.address!);
   if (!fromAddr) {
     throw new JmapError("invalidEmail", "could not derive envelope From");
   }
   if (to.length === 0) {
     throw new JmapError("noRecipients", "no recipients in envelope or headers");
   }
-  return { from: fromAddr, to };
+  return checkedEnvelope(fromAddr, to);
 }
 
 export async function emailSubmissionSet(
@@ -240,6 +271,15 @@ export async function emailSubmissionSet(
     try {
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
+      // Whatever envelope is used, the message goes out as stored: a header
+      // block that readers could split differently (and so a Bcc that stays
+      // in it) is refused.
+      if (!readHeaderBlock(raw)) {
+        throw new JmapError(
+          "invalidEmail",
+          "the message's header lines must all end in CRLF, or all in LF, with no other CR and no blank-looking line",
+        );
+      }
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
       const outgoing = gmail ? withFreshMessageId(stripBccHeader(raw)) : stripBccHeader(raw);
       const result = await submit({
@@ -264,7 +304,8 @@ export async function emailSubmissionSet(
       };
       if (result.rejected.length > 0) log.warn(sendLog, "submission: SMTP server rejected some recipients");
       else log.info(sendLog, "submission: accepted by SMTP server");
-      const id = `s-${ctx.account.id}-${Date.now()}-${tempId}`;
+      // Made here, from nothing the client sent: JMAP ids are server-set.
+      const id = `s-${randomUUID()}`;
       const sub: SubmissionResult = {
         id,
         emailId: payload.emailId,

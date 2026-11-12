@@ -84,4 +84,21 @@ describe("CardDAV XML helpers", () => {
     expect(textOf(xml, "n")).toBe("A & B");
     expect(textOf(xml, "m")).toBe("raw <bytes>");
   });
+
+  it("takes CDATA as it is and decodes each reference outside it once", () => {
+    const xml = `<x:r xmlns:x="DAV:">` +
+      `<x:a><![CDATA[a &amp;lt; b &lt;tag&gt; &#x41;]]></x:a>` +
+      `<x:b>&amp;lt; &#38;lt; &#x41;&#66;</x:b>` +
+      `<x:c>A &amp; <![CDATA[&amp;]]> B</x:c>` +
+      `<x:href>/a/&amp;amp;.vcf</x:href></x:r>`;
+    expect(textOf(xml, "a")).toBe("a &amp;lt; b &lt;tag&gt; &#x41;");
+    expect(textOf(xml, "b")).toBe("&lt; &lt; AB");
+    expect(textOf(xml, "c")).toBe("A & &amp; B");
+    expect(extractHref(xml)).toBe("/a/&amp;.vcf");
+  });
+
+  it("leaves a character reference that names no character as written", () => {
+    const xml = `<x:r xmlns:x="DAV:"><x:a>x &#x110000; &#1114112; &#xD800; &#0; &#99999999999999999999; y</x:a></x:r>`;
+    expect(textOf(xml, "a")).toBe("x &#x110000; &#1114112; &#xD800; &#0; &#99999999999999999999; y");
+  });
 });
