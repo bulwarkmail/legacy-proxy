@@ -11,6 +11,7 @@ import {
   unseal,
   type Credentials,
 } from "../auth/credentials.js";
+import { ownerOnly } from "../state/store.js";
 import type { EmailPushConfig } from "./emailpush.js";
 
 export interface GmailProfile {
@@ -48,7 +49,7 @@ export class GmailStore {
     const file = path.join(dataDir, "gmail.sqlite3");
     // Set permissions before SQLite opens WAL/SHM sidecars.
     fs.closeSync(fs.openSync(file, "a", 0o600));
-    fs.chmodSync(file, 0o600);
+    ownerOnly([file]);
     this.db = new Database(file);
     try {
       this.setUp(file);

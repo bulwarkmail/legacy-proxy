@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { planSealedValues, sealPlace } from "../auth/credentials.js";
+import { log } from "../util/log.js";
 import type { Database as DB, Statement } from "better-sqlite3";
 
 export interface AccountRow {
@@ -280,6 +281,31 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_check_last", definition: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
+/**
+ * Makes database files readable and writable by their owner only (mode 0600).
+ * Where the volume refuses (a mount without POSIX modes), one warning names the
+ * files and the start goes on: the mode is a second line of defence behind the
+ * data directory's own permissions.
+ */
+export function ownerOnly(files: string[]): void {
+  const failed: string[] = [];
+  let reason = "";
+  for (const f of files) {
+    try {
+      fs.chmodSync(f, 0o600);
+    } catch (e) {
+      failed.push(f);
+      reason ||= (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+    }
+  }
+  if (failed.length) {
+    log.warn(
+      { files: failed, reason },
+      "could not make the database readable by its owner only (mode 0600); starting anyway. Restrict access to DATA_DIR another way.",
+    );
+  }
+}
+
 // Clears an open check of the stored credentials, inside an UPDATE's SET list.
 const NO_CHECK =
   "cred_check_vault = NULL, cred_check_tag = NULL, cred_check_since = 0, cred_check_attempts = 0, cred_check_last = 0";
@@ -312,7 +338,7 @@ export class Store {
     // before this get them on the next start.
     const file = path.join(dataDir, "proxy.db");
     fs.closeSync(fs.openSync(file, "a", 0o600));
-    for (const f of [file, `${file}-wal`, `${file}-shm`]) if (fs.existsSync(f)) fs.chmodSync(f, 0o600);
+    ownerOnly([file, `${file}-wal`, `${file}-shm`].filter((f) => fs.existsSync(f)));
     this.db = new Database(file);
     try {
       this.db.exec(SCHEMA);

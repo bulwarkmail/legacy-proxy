@@ -993,8 +993,11 @@ offered it) has three ways out:
 Everything lives in `DATA_DIR`: `proxy.db` for the IMAP backend and
 `gmail.sqlite3` for the Gmail bridge. Both files are readable and writable by
 the proxy's user only (mode 0600): they are created that way and set to it at
-every start. Protect `DATA_DIR` and its backups anyway, because not everything
-in them is sealed.
+every start. Where the volume doesn't support file modes (some network or
+Windows mounts), the proxy logs one warning naming the files and starts anyway;
+restrict access to `DATA_DIR` there in another way. On Windows the folder's
+permissions decide. Protect `DATA_DIR` and its backups anyway, because not
+everything in them is sealed.
 
 Sealed with AES-256-GCM: the stored mail credentials of each IMAP account, and on
 the Gmail bridge the Google grant, the cache and uploaded files. Each table has a
