@@ -414,10 +414,9 @@ export class GmailStore {
   /**
    * Exchanges a refresh token of this client for a new refresh token and a new access token of the same
    * sign-in. The token that was used stays good for {@link REFRESH_REUSE_GRACE} after its first use, so two
-   * tabs that refresh at the same moment both get an answer, but it is exchanged at most
-   * {@link MAX_SUCCESSORS} times: a further exchange inside that time is refused and leaves the sign-in as
-   * it is, so a client that retries too often loses only that answer. Presented after that time, it was
-   * copied: it is refused and every token of its sign-in stops working. A sign-in ends
+   * tabs that refresh at the same moment both get an answer, and a client has room for lost answers, but
+   * it is exchanged at most {@link MAX_SUCCESSORS} times. Presented once more inside that time, or at all
+   * after it, it was copied: it is refused and every token of its sign-in stops working. A sign-in ends
    * {@link SIGN_IN_TTL} after it was made, however often it was refreshed.
    */
   refreshTokens(refreshToken: string, client: string, now = Date.now()): IssuedTokens | null {
@@ -427,17 +426,18 @@ export class GmailStore {
       if (!row || row.client !== client || row.expires <= now) return null;
       const hash = row.hash;
       const family = row.family ?? hash;
-      if (row.used_at !== null && now - row.used_at > REFRESH_REUSE_GRACE) {
+      const endSignIn = () => {
         this.db.prepare("DELETE FROM gmail_token WHERE family=?").run(family);
         return null;
-      }
+      };
+      if (row.used_at !== null && now - row.used_at > REFRESH_REUSE_GRACE) return endSignIn();
       const since = row.family_since ?? now;
       if (now >= since + SIGN_IN_TTL || !this.hasConnection(row.email)) return null;
       // A refresh token's successors record it as their parent.
       const successors = (
         this.db.prepare("SELECT COUNT(*) AS n FROM gmail_token WHERE kind='refresh' AND parent=?").get(hash) as { n: number }
       ).n;
-      if (successors >= MAX_SUCCESSORS) return null;
+      if (successors >= MAX_SUCCESSORS) return endSignIn();
       if (row.used_at === null) this.db.prepare("UPDATE gmail_token SET used_at=? WHERE hash=?").run(now, hash);
       return this.tokensFor({ email: row.email, client, family, since, parent: hash }, now);
     })();

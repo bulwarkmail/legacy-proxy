@@ -533,9 +533,9 @@ other account is sent to Google's consent once, and its grant is stored as by
 exchanges it at `/oauth/token` for a bridge access token (`gmat_…`, one hour, Bearer
 only) and a refresh token (`gmrt_…`). Every refresh answers with a new refresh token,
 which the client stores in place of the old one. The token that was used still answers
-for 60 seconds after its first use, so two tabs refreshing together both carry on, but
-at most three times in all; a fourth try inside the minute is refused and the sign-in
-carries on. Presented again after the minute, it is refused and every token of that sign-in stops
+for 60 seconds after its first use, so two tabs refreshing together both carry on and a
+lost answer can be asked for again, but at most three times in all. A fourth try inside
+the minute, or any try after it, is refused and every token of that sign-in stops
 working (a copy of it is in use); the account's other sign-ins carry on. A refresh
 token unused for 180 days lapses, and a sign-in ends 365 days after it was made,
 however often it was refreshed: the user then signs in again. `/oauth/revoke` with a
