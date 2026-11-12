@@ -1,6 +1,6 @@
 // How the Gmail bridge's request hook treats credentials that look like bridge
 // secrets: bridge passwords and sign-in tokens select the Gmail backend, and
-// failed bridge logins count against the same per-address login budget.
+// failed bridge logins have a per-address budget of their own.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -216,7 +216,7 @@ describe("bridge secrets on the JMAP routes", () => {
 });
 
 describe("failed bridge logins", () => {
-  it("count against the address's budget for mail logins and never hold a valid bridge login", async () => {
+  it("have a budget of their own, never hold mail logins and never hold a valid bridge login", async () => {
     const store = await connectedStore();
     const password = store.issuePassword(EMAIL);
     const app = Fastify();
@@ -238,11 +238,17 @@ describe("failed bridge logins", () => {
       app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: basic(EMAIL, pass) } });
 
     for (let i = 0; i < 50; i++) expect((await session(`gmap_wrong${i}`)).statusCode).toBe(401);
+    // Past the budget, a made-up secret is told to back off.
+    const held = await session("gmap_wrong-more");
+    expect(held.statusCode).toBe(429);
+    expect(Number(held.headers["retry-after"])).toBeGreaterThan(0);
     const valid = await session(password);
     await app.close();
     expect(valid.statusCode).toBe(200);
     expect(valid.json()).not.toEqual({ legacy: true });
-    // The 50 failed lookups hold mail logins from that address.
-    expect(await limiter.begin("127.0.0.1", "someone@imap.test")).toMatchObject({ ok: false, status: 429 });
+    // The failed lookups don't hold mail logins from that address.
+    const mail = await limiter.begin("127.0.0.1", "someone@imap.test");
+    expect(mail).toMatchObject({ ok: true });
+    if (mail.ok) mail.finish("accepted");
   });
 });

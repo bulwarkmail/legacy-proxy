@@ -166,9 +166,15 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
     let email: string | null = null;
     if (signedIn) email = store.authenticateToken(password);
     else if (password.startsWith("gmap_")) email = store.authenticate(password, username);
-    // A valid bridge login is served without the login limits. Only a failed
-    // lookup counts, against its address's budget for mail logins.
-    if (!email) logins?.noteFailedLookup(req.ip);
+    // A valid bridge login is served without the login limits. A failed lookup
+    // counts toward its address's budget for failed lookups, which is apart
+    // from the one for mail logins; past it, failures are answered 429.
+    if (!email) {
+      const held = logins?.noteFailedLookup(req.ip);
+      if (held && !held.ok) {
+        return reply.header("Retry-After", String(held.retryAfterSec)).code(429).send({ error: "too many failed logins" });
+      }
+    }
     if (
       !email ||
       !google.allowedEmails.has(email) ||

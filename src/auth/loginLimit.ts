@@ -112,6 +112,9 @@ export class LoginLimiter {
   private readonly now: () => number;
   private readonly byUser: FailureLog;
   private readonly byAddress: FailureLog;
+  // Failed lookups of bridge secrets, per address: a budget of their own, so
+  // made-up secrets never hold mail logins.
+  private readonly lookupsByAddress: FailureLog;
   private readonly pending = new Map<string, number>();
   // First logins, and re-validations of credentials the proxy validated
   // before, each with slots of their own: callers nobody knows keeping their
@@ -125,6 +128,7 @@ export class LoginLimiter {
     this.now = now ?? Date.now;
     this.byUser = new FailureLog(this.opts.maxPerUser, this.opts.windowMs, this.opts.maxKeys);
     this.byAddress = new FailureLog(this.opts.maxPerAddress, this.opts.windowMs, this.opts.maxKeys);
+    this.lookupsByAddress = new FailureLog(this.opts.maxPerAddress, this.opts.windowMs, this.opts.maxKeys);
   }
 
   /**
@@ -185,16 +189,23 @@ export class LoginLimiter {
 
   /**
    * Count a failed lookup of a secret the proxy checks itself (no login at the
-   * mail server) against the address's budget. It takes no slot and is never
-   * held: a valid secret is not looked up through here at all.
+   * mail server). These have a budget of their own per address, as large as
+   * the one for mail logins and apart from it: they never hold mail logins.
+   * Returns a 429 once the address used up that budget before this failure,
+   * else null. It takes no slot, and a valid secret is never looked up
+   * through here.
    */
-  noteFailedLookup(address: string): void {
-    this.byAddress.add(addressKey(address), this.now());
+  noteFailedLookup(address: string): LoginGate | null {
+    const addr = addressKey(address);
+    const now = this.now();
+    const held = this.lookupsByAddress.count(addr, now) >= this.opts.maxPerAddress;
+    this.lookupsByAddress.add(addr, now);
+    return held ? { ok: false, status: 429, retryAfterSec: this.lookupsByAddress.retryAfterSec(addr, now) } : null;
   }
 
   /** Number of tracked keys, for tests and diagnostics. */
   get trackedKeys(): number {
-    return this.byUser.size + this.byAddress.size;
+    return this.byUser.size + this.byAddress.size + this.lookupsByAddress.size;
   }
 
   private hold(addr: string, user: string): LoginGate | null {

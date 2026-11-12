@@ -374,9 +374,11 @@ Every login the proxy makes at the mail server for a caller without a session
 - Requests with a Bearer token are not limited, so a user with a session keeps
   working while their login is held.
 - A request with a valid Gmail bridge password or sign-in token is never
-  limited and takes no login slot. A failed bridge lookup on the JMAP routes is
-  answered `401` as before and counts toward its address's 50, so it can hold
-  mail logins from that address, never a valid bridge login.
+  limited and takes no login slot. Failed bridge lookups on the JMAP routes
+  have a budget of their own: the first 50 from one address within 15 minutes
+  are answered `401`, further ones `429` with `Retry-After` until the oldest is
+  15 minutes old. They never hold mail logins from that address, and a valid
+  bridge login is never held.
 
 The counters live in memory, are bounded in size and start from zero when the
 proxy restarts. IPv6 clients are counted per /64. The limits count by client

@@ -94,3 +94,29 @@ describe("bridge secrets offered as mail passwords", () => {
     expect(imap.logins - before).toBe(1);
   });
 });
+
+describe("made-up bridge tokens", () => {
+  it("get a budget of their own and leave the address's mail logins alone", async () => {
+    const remoteAddress = "198.51.100.7";
+    const statuses: number[] = [];
+    for (let i = 0; i < 60; i++) {
+      const token = "gmat_" + crypto.createHash("sha256").update(String(i)).digest("base64url");
+      const res = await app.inject({ method: "GET", url: "/jmap/session", remoteAddress, headers: { authorization: `Bearer ${token}` } });
+      statuses.push(res.statusCode);
+    }
+    expect(statuses.filter((s) => s === 401)).toHaveLength(50);
+    expect(statuses.slice(50).every((s) => s === 429)).toBe(true);
+
+    // Mail logins from the same address still reach the IMAP server.
+    const before = { logins: imap.logins, failed: imap.failedLogins };
+    const wrong = await app.inject({ method: "POST", url: "/api/login", remoteAddress, payload: { username: "pat@test.local", password: "wrong" } });
+    const right = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      remoteAddress,
+      payload: { username: "pat@test.local", password: "right-password" },
+    });
+    expect([wrong.statusCode, right.statusCode]).toEqual([401, 200]);
+    expect({ logins: imap.logins - before.logins, failed: imap.failedLogins - before.failed }).toEqual({ logins: 2, failed: 1 });
+  });
+});
