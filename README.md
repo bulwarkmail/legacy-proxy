@@ -539,7 +539,7 @@ carries on. Presented again after the minute, it is refused and every token of t
 working (a copy of it is in use); the account's other sign-ins carry on. A refresh
 token unused for 180 days lapses, and a sign-in ends 365 days after it was made,
 however often it was refreshed: the user then signs in again. `/oauth/revoke` with a
-refresh token ends its sign-in. Only hashes of these tokens are stored. They are separate
+refresh token ends its sign-in. Only keyed hashes of these tokens are stored (see [Data at rest](#data-at-rest)). They are separate
 from the bridge password: every signed-in client has its own and signing in again
 revokes nothing. Issuing a new bridge password and disconnecting the account delete
 them all. Google tokens never
@@ -585,7 +585,7 @@ npm run gmail:password -- tester@gmail.com /private/path/jmap-login.json
 ```
 
 The file contains `serverUrl`, `username` and `password` for the client's custom
-JMAP account. Only a SHA-256 hash of this randomly generated password is stored.
+JMAP account. Only a keyed hash of this randomly generated password is stored.
 Reissuing it immediately revokes the previous bridge password and signs every device
 out the same way as the page does: sign-in tokens and push subscriptions of the account
 are deleted. Event streams the running server holds open for the account end within
@@ -1015,7 +1015,12 @@ In clear: the IMAP backend's caches of message metadata (envelope, structure,
 headers), previews and attachment bytes, and its pending uploads; on the Gmail
 bridge the profile and label snapshot, draft and send-ledger records, scheduled
 sends with their recipients, and push subscription URLs. Bridge passwords and
-sign-in tokens are stored only as SHA-256 hashes.
+sign-in tokens are stored only as keyed hashes: an HMAC-SHA256, under a key derived
+from `VAULT_KEY`, of the secret's SHA-256, with a MAC that ties each row to its
+account, its sign-in date and its expiry. Without the key nobody can write a row
+that a password or token of their choosing opens, or move their own row to
+another account. The first start of this version keys the plain SHA-256 hashes
+earlier versions stored, so existing bridge passwords and sign-ins keep working.
 
 Each database keeps a value sealed under the key. A start with a `VAULT_KEY` that
 opens neither it nor any stored credential stops with one line,
@@ -1025,23 +1030,29 @@ any row is changed; `npm run gmail:password` stops the same way.
 Keep `VAULT_KEY` safe and apart from the backups of `DATA_DIR`: a backup stored
 together with its key gives whoever takes it everything the proxy sealed. Without
 the key nothing sealed can be restored: every IMAP user signs in again, every
-Gmail account reconnects at `/auth/google/start`, the Gmail cache is fetched
-again and pending uploads are attached again. To start over without the key,
+Gmail account reconnects at `/auth/google/start` and gets a new bridge password,
+every bridge sign-in signs in again, the Gmail cache is fetched again and
+pending uploads are attached again. To start over without the key,
 move `proxy.db` and `gmail.sqlite3` out of `DATA_DIR`.
 
 ### Upgrading and rolling back
 
-- The first start of this version rewrites what earlier versions sealed (see
-  above); nothing else to do.
+- The first start of this version rewrites what earlier versions sealed and keys
+  the hashes of bridge passwords and sign-in tokens (see above); nothing else to
+  do.
 - Gmail bridge sign-ins made before the upgrade are dated at the upgrade, so all
   of them end in the same minute one year after it; those users then sign in
   again.
 - Rolling back to an earlier version: it can't open what this version sealed, so
   IMAP users sign in again, Gmail accounts reconnect, the cache refills, and
-  uploads from the last day are attached again. It also accepts retired refresh
-  tokens again (kept up to 180 days so that a copy can be recognised), since it
-  doesn't rotate them. Coming back to this version after that: what the earlier
-  version sealed in the meantime doesn't open (sign in, reconnect, attach again).
+  uploads from the last day are attached again. It doesn't find this version's
+  keyed hashes either: bridge passwords must be issued again and bridge
+  sign-ins sign in again. (The retired refresh tokens this version keeps, up to
+  180 days so that a copy can be recognised, are among them: an earlier version
+  doesn't rotate refresh tokens and would accept them again if it could find
+  them.) Coming back to this version after that: what the earlier version sealed
+  or issued in the meantime doesn't open (sign in, reconnect, issue a bridge
+  password, attach again).
 
 ## Tests
 
