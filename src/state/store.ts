@@ -306,6 +306,10 @@ export function ownerOnly(files: string[]): void {
   }
 }
 
+/** Logged once by a start that rewrote values an earlier version stored, with their counts. */
+export const SEALED_AGAIN_MESSAGE =
+  "this start rewrote values an earlier version stored, sealed again for their row; expected once after an upgrade or after restoring an old backup";
+
 /**
  * The key check and the sealed credentials of a proxy.db, also of one an
  * earlier version wrote (tables or columns it lacks count as empty). A row's
@@ -390,15 +394,21 @@ export class Store {
 
   /** The start step of the sealed credentials, in one transaction (see planSealedValues). */
   private prepareSealedValues(key: Buffer, file: string): void {
+    let credentials = 0;
     this.db.transaction(() => {
       const { check, values } = sealedValues(this.db);
       const plan = planSealedValues(key, file, check, values);
       for (const { index, value } of plan.reseal) {
         const v = values[index]!;
-        this.db.prepare(`UPDATE account SET ${v.column} = ? WHERE id = ? AND ${v.column} = ?`).run(value, v.id, v.value);
+        credentials += this.db
+          .prepare(`UPDATE account SET ${v.column} = ? WHERE id = ? AND ${v.column} = ?`)
+          .run(value, v.id, v.value).changes;
       }
       if (plan.check) this.db.prepare(`INSERT OR REPLACE INTO vault_check(id, value) VALUES(1, ?)`).run(plan.check);
     })();
+    // The one trace of what an earlier version (or a restored backup) left:
+    // counts only, never a value.
+    if (credentials) log.warn({ file, credentials }, SEALED_AGAIN_MESSAGE);
   }
 
   /**

@@ -12,7 +12,8 @@ import {
   verifyVaultKey,
   type Credentials,
 } from "../auth/credentials.js";
-import { ownerOnly } from "../state/store.js";
+import { ownerOnly, SEALED_AGAIN_MESSAGE } from "../state/store.js";
+import { log } from "../util/log.js";
 import type { EmailPushConfig } from "./emailpush.js";
 
 export interface GmailProfile {
@@ -168,6 +169,7 @@ export class GmailStore {
    * keep working.
    */
   private prepareSealedValues(file: string): void {
+    const done = { credentials: 0, uploads: 0, cacheEntriesDropped: 0, passwordHashes: 0, tokenHashes: 0 };
     this.db.transaction(() => {
       const { check, rows, holdsOther } = gmailSealedValues(this.db);
       const plan = planSealedValues(
@@ -179,19 +181,23 @@ export class GmailStore {
       );
       for (const { index, value } of plan.reseal) {
         const row = rows[index]!;
-        this.db.prepare("UPDATE gmail_connection SET vault=? WHERE email=? AND vault=?").run(value, row.email, row.vault);
+        done.credentials += this.db
+          .prepare("UPDATE gmail_connection SET vault=? WHERE email=? AND vault=?")
+          .run(value, row.email, row.vault).changes;
       }
       if (plan.firstStart) {
-        this.db.exec("DELETE FROM gmail_cache WHERE NOT (length(value) >= 29 AND substr(value,1,1) = x'02')");
+        done.cacheEntriesDropped = this.db
+          .prepare("DELETE FROM gmail_cache WHERE NOT (length(value) >= 29 AND substr(value,1,1) = x'02')")
+          .run().changes;
         const uploads = this.db.prepare("SELECT email, id, body FROM gmail_upload").all() as { email: string; id: string; body: Buffer }[];
         for (const u of uploads) {
           const place = sealPlace.gmailUpload(u.email, u.id);
           try {
             unseal(this.vaultKey, place, u.body);
           } catch {
-            this.db
+            done.uploads += this.db
               .prepare("UPDATE gmail_upload SET body=? WHERE email=? AND id=?")
-              .run(seal(this.vaultKey, place, u.body), u.email, u.id);
+              .run(seal(this.vaultKey, place, u.body), u.email, u.id).changes;
           }
         }
         // The hashes are keyed once: never again once any row carries a MAC.
@@ -212,7 +218,9 @@ export class GmailStore {
           const passwords = this.db.prepare("SELECT email, hash FROM gmail_password").all() as { email: string; hash: string }[];
           for (const p of passwords) {
             const hash = this.keyed(p.hash);
-            this.db.prepare("UPDATE gmail_password SET hash=?, mac=? WHERE email=?").run(hash, this.passwordMac(p.email, hash), p.email);
+            done.passwordHashes += this.db
+              .prepare("UPDATE gmail_password SET hash=?, mac=? WHERE email=?")
+              .run(hash, this.passwordMac(p.email, hash), p.email).changes;
           }
           const tokens = this.db.prepare("SELECT * FROM gmail_token").all() as TokenRow[];
           for (const t of tokens) {
@@ -222,14 +230,17 @@ export class GmailStore {
               parent: t.parent === null ? null : this.keyed(t.parent),
               family: t.family === null ? null : this.keyed(t.family),
             };
-            this.db
+            done.tokenHashes += this.db
               .prepare("UPDATE gmail_token SET hash=?, parent=?, family=?, mac=? WHERE hash=?")
-              .run(row.hash, row.parent, row.family, this.tokenMac(row), t.hash);
+              .run(row.hash, row.parent, row.family, this.tokenMac(row), t.hash).changes;
           }
         }
       }
       if (plan.check) this.db.prepare("INSERT OR REPLACE INTO vault_check(id, value) VALUES(1, ?)").run(plan.check);
     })();
+    // The one trace of what an earlier version (or a restored backup) left:
+    // counts only, never a value.
+    if (Object.values(done).some((n) => n > 0)) log.warn({ file, ...done }, SEALED_AGAIN_MESSAGE);
   }
   /**
    * Throws VaultKeyMismatch when `vaultKey` doesn't open what `gmail.sqlite3`

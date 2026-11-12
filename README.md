@@ -1009,7 +1009,11 @@ first start of this version, in one transaction per database: stored IMAP
 credentials and Google grants are sealed again for their row (users stay signed
 in), Gmail cache entries are dropped and fetched again, and uploads stored in
 clear are sealed for their row. That happens once; afterwards a value in the
-earlier format opens nowhere, also one copied in from an old backup.
+earlier format opens nowhere, also one copied in from an old backup. The start
+that rewrites anything logs one warning per database with how many values of
+each kind it rewrote (no values, no key): expected once after the upgrade or
+after restoring an old backup. If it shows up at any other time, find out what
+was written into `DATA_DIR`.
 
 In clear: the IMAP backend's caches of message metadata (envelope, structure,
 headers), previews and attachment bytes, and its pending uploads; on the Gmail
