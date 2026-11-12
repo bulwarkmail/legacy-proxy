@@ -447,6 +447,47 @@ describe("a refusal names what was refused", () => {
   });
 });
 
+describe("the client envelope and the sender", () => {
+  beforeEach(() => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+  });
+
+  it.each<[string, unknown, string]>([
+    ["only rcptTo", { rcptTo: [{ email: "carol@corp.example" }] }, "invalidProperties"],
+    ["only mailFrom", { mailFrom: { email: "alice@corp.example" } }, "invalidProperties"],
+    ["mailFrom without an email", { mailFrom: {}, rcptTo: [{ email: "carol@corp.example" }] }, "invalidProperties"],
+    ["an envelope that isn't an object", "alice@corp.example", "invalidProperties"],
+    ["an empty rcptTo", { mailFrom: { email: "alice@corp.example" }, rcptTo: [] }, "noRecipients"],
+  ])("refuses a client envelope with %s and sends nothing", async (_label, envelope, type) => {
+    const err = (await send(envelope as Record<string, unknown>)).notCreated?.s;
+    expect(err?.type).toBe(type);
+    if (type === "invalidProperties") expect(err?.properties).toEqual(["envelope"]);
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("takes MAIL FROM from the Sender header when there is one", async () => {
+    draft = mail(`From: Alice <alice@corp.example>\r\nSender: Desk <desk@corp.example>\r\nTo: bob@corp.example`);
+    const res = await send();
+    expect(res.created?.s?.envelope.mailFrom).toEqual({ email: "desk@corp.example" });
+    expect(mailFroms()).toEqual(["MAIL FROM:<desk@corp.example>"]);
+  });
+
+  it("takes MAIL FROM from Sender when From names several authors", async () => {
+    draft = mail(`From: alice@corp.example, carol@corp.example\r\nSender: alice@corp.example\r\nTo: bob@corp.example`);
+    expect((await send()).created?.s?.envelope.mailFrom).toEqual({ email: "alice@corp.example" });
+  });
+
+  it.each([
+    ["two From fields", "From: alice@corp.example\r\nFrom: mallory@corp.example\r\nTo: bob@corp.example"],
+    ["two addresses in From and no Sender", "From: alice@corp.example, mallory@corp.example\r\nTo: bob@corp.example"],
+    ["two Sender fields", "From: alice@corp.example\r\nSender: a@corp.example\r\nSender: b@corp.example\r\nTo: bob@corp.example"],
+  ])("refuses a message with %s", async (_label, headers) => {
+    draft = mail(headers);
+    expect((await send()).notCreated?.s?.type).toBe("invalidEmail");
+    expect(smtpLines).toEqual([]);
+  });
+});
+
 describe("EmailSubmission ids", () => {
   it("are made by the proxy, whatever the client's creation id holds", async () => {
     draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);

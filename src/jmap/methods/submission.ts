@@ -167,13 +167,6 @@ export function withFreshMessageId(raw: Buffer): Buffer {
 
 export { headerValues, isPlainAddress, parseAddressList };
 
-function asEmail(s: string | undefined | null): string | null {
-  if (!s) return null;
-  const t = s.trim();
-  if (!t) return null;
-  return t;
-}
-
 // The refused entries as given, quoted so that spaces, commas and control
 // characters show; at most ten, so the description stays readable.
 function nameList(entries: string[]): string {
@@ -208,20 +201,37 @@ async function resolveEnvelope(
   raw: Buffer,
   envelope: SubmissionCreate["envelope"],
 ): Promise<{ from: string; to: string[] }> {
-  if (envelope?.mailFrom?.email && envelope?.rcptTo?.length) {
+  if (envelope != null) {
+    // A client envelope is used whole (RFC 8621 §7.5): it needs both parts.
+    const invalidEnvelope = (what: string) => new JmapError("invalidProperties", what, { properties: ["envelope"] });
+    if (typeof envelope !== "object" || Array.isArray(envelope)) throw invalidEnvelope("envelope must be an object");
+    const mailFrom = envelope.mailFrom;
+    if (!mailFrom || typeof mailFrom !== "object" || typeof mailFrom.email !== "string") {
+      throw invalidEnvelope("envelope.mailFrom must be an address with an email");
+    }
+    if (!Array.isArray(envelope.rcptTo)) throw invalidEnvelope("envelope.rcptTo must be a list of addresses");
+    if (envelope.rcptTo.length === 0) throw new JmapError("noRecipients", "envelope.rcptTo is empty");
     return checkedEnvelope(
-      String(envelope.mailFrom.email),
+      mailFrom.email,
       envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email : "")),
     );
   }
-  // Spec §7: if no envelope is given, derive from headers - From for
-  // mailFrom, To+Cc+Bcc for rcptTo. Each member of a group is a recipient.
-  // The headers are read here, not by a mail library, so every address is
-  // taken as the message wrote it whatever library version is installed.
+  // RFC 8621 §7.5: without an envelope, mailFrom is the address in the Sender
+  // header field when there is one, otherwise the one in From; rcptTo is the
+  // addresses in To, Cc and Bcc, each member of a group being a recipient.
+  // More than one such field, or more than one address in it, is refused, as
+  // the RFC advises. The headers are read here, not by a mail library, so
+  // every address is taken as the message wrote it whatever library version
+  // is installed.
   const entries = (name: string) => headerValues(raw, name).flatMap(parseAddressList);
-  const fromEntry = entries("from")[0];
+  const source = headerValues(raw, "sender").some((v) => v.trim() !== "") ? "sender" : "from";
+  const senders = entries(source);
+  if (headerValues(raw, source).length > 1 || senders.length > 1) {
+    throw new JmapError("invalidEmail", `the message names more than one ${source === "sender" ? "Sender" : "From"} address`);
+  }
+  const fromEntry = senders[0];
   if (fromEntry && fromEntry.address === null) refuseMailFrom(fromEntry.written);
-  const fromAddr = fromEntry ? fromEntry.address : asEmail(envelope?.mailFrom?.email);
+  const fromAddr = fromEntry ? fromEntry.address : null;
   const recipients = ["to", "cc", "bcc"].flatMap(entries);
   // An entry that isn't one plain mailbox is refused, named as the message wrote it.
   const invalid = recipients.filter((e) => e.address === null || !isPlainAddress(e.address));
