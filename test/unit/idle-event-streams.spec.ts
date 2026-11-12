@@ -175,5 +175,4 @@ describe("the IDLE worker of an account without a push subscription", () => {
     expect(clients[0].logout).not.toHaveBeenCalled();
     await idle.closeAll();
   });
-
 });
