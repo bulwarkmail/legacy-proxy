@@ -1,9 +1,10 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { Transform, pipeline, type Readable } from "node:stream";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import compress from "@fastify/compress";
-import { loadConfig, type ProviderConfig } from "./util/config.js";
+import { loadConfig, type AppConfig, type ProviderConfig } from "./util/config.js";
 import { log } from "./util/log.js";
 import { corsOptions, fromBrowser } from "./util/cors.js";
 import { Store } from "./state/store.js";
@@ -37,7 +38,7 @@ import { GmailConnection } from "./gmail/connection.js";
 import { isBridgeSecret, registerGmailBackend } from "./gmail/backend.js";
 import { registerGmailRoutes } from "./gmail/routes.js";
 
-const cfg = loadConfig();
+const cfg = loadConfigOrExit();
 const store = new Store(cfg.dataDir);
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
@@ -1010,5 +1011,18 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   log.error({ reason: String(reason) }, "unhandledRejection - continuing");
 });
+
+/**
+ * The configuration, or exit 1 when a setting can't be used. The message says
+ * which setting and what to write instead; a stack trace would only bury it.
+ */
+function loadConfigOrExit(): AppConfig {
+  try {
+    return loadConfig();
+  } catch (e) {
+    fs.writeSync(2, `legacy-proxy: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
 
 export { app };

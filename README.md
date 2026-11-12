@@ -878,11 +878,11 @@ The Gmail backend advertises and enforces its own object limits (100 per get,
 proxy believes, as a comma-separated list of IP addresses and CIDR ranges. The
 [login limits](#login-limits) count by the client address this gives:
 
-- Unset (or empty): the socket's address is the client's. Behind a reverse
-  proxy that is the proxy's address, so everyone behind it shares one budget:
-  ten wrong passwords from anyone hold that user name for everyone, and 50 hold
-  every login. Docker's userland proxy (Docker Desktop, published IPv6 ports)
-  hides client addresses the same way.
+- Unset, empty, `false`, `0`, `no` or `off`: the socket's address is the
+  client's. Behind a reverse proxy that is the proxy's address, so everyone
+  behind it shares one budget: ten wrong passwords from anyone hold that user
+  name for everyone, and 50 hold every login. Docker's userland proxy (Docker
+  Desktop, published IPv6 ports) hides client addresses the same way.
 - The reverse proxy's own address or network: a request that arrives from one
   of them is counted by the address that proxy appended to `X-Forwarded-For`
   (Caddy and Traefik do this by default, nginx with
@@ -909,13 +909,19 @@ the quickstart):
 TRUST_PROXY=172.18.0.0/16
 ```
 
-Anything else stops the proxy at start with a message that says what to write
-instead: a hop count such as `1` (the proxy couldn't tell the reverse proxy
-from a caller that reaches port 8080 directly and writes its own header),
-`true` or a `/0` range (they trust every address), `false` (leave the setting
-unset instead), a host name, or an empty entry. If you set `TRUST_PROXY=1` or
-`TRUST_PROXY=true` before, replace it with the reverse proxy's address or
-network when you upgrade.
+A reverse proxy on another host: put that host's address in `TRUST_PROXY`, and
+publish port 8080 on the address that host reaches, not on all interfaces (for
+example `"10.0.0.5:8080:8080"` in the compose file, with `TRUST_PROXY=10.0.0.4`).
+
+Ranges may be at most a `/8` for IPv4 and a `/32` for IPv6; no reverse proxy's
+network is larger. Anything else stops the proxy at start with one line that
+says what to write instead: a hop count such as `1` (the proxy couldn't tell
+the reverse proxy from a caller that reaches port 8080 directly and writes its
+own header), `true` or `yes`, a wider range, an IPv6 range that covers
+IPv4-mapped addresses (`::ffff:0:0/96`; write the IPv4 address or range
+itself), entries that together cover every address, a host name, or an empty
+entry. If you set `TRUST_PROXY=1` or `TRUST_PROXY=true` before, replace it with
+the reverse proxy's address or network when you upgrade.
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.

@@ -72,46 +72,117 @@ function b64Key(name: string, fallback: string | null): Buffer {
 
 const TRUST_PROXY_HINT =
   "Set it to the address or network of the reverse proxy in front of the proxy, for example " +
-  "TRUST_PROXY=127.0.0.1 for a reverse proxy on the same host or TRUST_PROXY=172.18.0.0/16 for one " +
-  "on a container network, or leave it unset when nothing is in front.";
+  "TRUST_PROXY=127.0.0.1 for a reverse proxy on the same host, TRUST_PROXY=172.18.0.0/16 for one " +
+  "on a container network, or that proxy's own address for one on another host; leave it unset " +
+  "when nothing is in front.";
+
+/**
+ * The widest range accepted per address family. A reverse proxy's network is
+ * never larger; a wider one would let a large part of the internet name its
+ * own address.
+ */
+export const TRUST_PROXY_MIN_PREFIX = { 4: 8, 6: 32 } as const;
+
+/** One accepted entry as an inclusive range of addresses. */
+interface AddressRange {
+  family: 4 | 6;
+  start: bigint;
+  end: bigint;
+}
+
+// IPv6 addresses that stand for IPv4 clients (::ffff:0:0/96): the web
+// framework matches every IPv4 client against them.
+const MAPPED_START = 0xffffn << 32n;
+const MAPPED_END = MAPPED_START + (1n << 32n) - 1n;
 
 /**
  * `TRUST_PROXY`: the reverse proxies whose X-Forwarded-For entries name the
  * client, as a comma-separated list of IP addresses and CIDR ranges
- * (`127.0.0.1`, `::1`, `10.0.0.0/8`). Unset or empty trusts no one: the
- * socket's address is the client's. Any other value stops the start with a
- * message: a hop count can't tell the reverse proxy from a client that reaches
- * the port directly, `true` or a /0 range trusts every address, and host names
- * are not looked up.
+ * (`127.0.0.1`, `::1`, `10.0.0.0/8`). Unset, empty, `false`, `0`, `no` or
+ * `off` trusts no one: the socket's address is the client's. Any other value
+ * stops the start with a message: a hop count can't tell the reverse proxy
+ * from a client that reaches the port directly; `true`, a range wider than
+ * TRUST_PROXY_MIN_PREFIX, an IPv4-mapped IPv6 range, or entries that together
+ * cover every address would trust everyone or a large part of the internet;
+ * and host names are not looked up.
  */
 export function parseTrustProxy(value: string | undefined): string[] {
   const raw = value ?? "";
-  if (raw.trim() === "") return [];
+  if (/^\s*(false|no|off|0)?\s*$/i.test(raw)) return [];
+  const fail = (problem: string) => new Error(`TRUST_PROXY=${JSON.stringify(raw)}: ${problem}. ${TRUST_PROXY_HINT}`);
   const entries = raw.split(",").map((s) => s.trim());
+  const ranges: AddressRange[] = [];
   for (const entry of entries) {
-    const problem = trustProxyProblem(entry);
-    if (problem) throw new Error(`TRUST_PROXY=${JSON.stringify(raw)}: ${problem}. ${TRUST_PROXY_HINT}`);
+    const parsed = parseTrustProxyEntry(entry);
+    if (typeof parsed === "string") throw fail(parsed);
+    ranges.push(parsed);
+  }
+  for (const family of [4, 6] as const) {
+    if (coversEverything(ranges.filter((r) => r.family === family), family)) {
+      throw fail(`together the entries cover every IPv${family} address, which would trust everyone`);
+    }
   }
   return entries;
 }
 
-function trustProxyProblem(entry: string): string | null {
+function parseTrustProxyEntry(entry: string): AddressRange | string {
   if (entry === "") return "it has an empty entry";
   if (/^\d+$/.test(entry)) {
     return `"${entry}" is a hop count, which can't tell the reverse proxy from a client that reaches the port directly`;
   }
   if (/^(true|yes|on)$/i.test(entry)) return `"${entry}" would trust every address`;
-  if (/^(false|no|off)$/i.test(entry)) return `"${entry}" is not an address`;
+  if (/^(false|no|off)$/i.test(entry)) return `"${entry}" is not an address (leave TRUST_PROXY unset to trust no reverse proxy)`;
   const slash = entry.indexOf("/");
   const address = slash < 0 ? entry : entry.slice(0, slash);
   const family = address.includes("%") ? 0 : net.isIP(address);
-  if (!family) return `"${entry}" is not an IP address or CIDR range (host names are not accepted)`;
-  if (slash < 0) return null;
-  const bits = entry.slice(slash + 1);
-  const max = family === 4 ? 32 : 128;
-  if (!/^\d{1,3}$/.test(bits) || Number(bits) > max) return `"${entry}" needs a prefix length from 1 to ${max}`;
-  if (Number(bits) === 0) return `"${entry}" covers every address, which would trust everyone`;
-  return null;
+  if (family !== 4 && family !== 6) return `"${entry}" is not an IP address or CIDR range (host names are not accepted)`;
+  const width = family === 4 ? 32 : 128;
+  const widest = TRUST_PROXY_MIN_PREFIX[family];
+  let bits = width;
+  if (slash >= 0) {
+    const text = entry.slice(slash + 1);
+    if (!/^\d{1,3}$/.test(text) || Number(text) > width) return `"${entry}" needs a prefix length from ${widest} to ${width}`;
+    bits = Number(text);
+    if (bits < widest) {
+      return `"${entry}" is wider than /${widest}, which is larger than any reverse proxy's network`;
+    }
+  }
+  const size = 1n << BigInt(width - bits);
+  const start = (addressValue(address, family) / size) * size;
+  const end = start + size - 1n;
+  if (family === 6 && start <= MAPPED_END && end >= MAPPED_START) {
+    return `"${entry}" covers IPv4-mapped addresses (::ffff:0:0/96), which stand for IPv4 clients; write the IPv4 address or range itself`;
+  }
+  return { family, start, end };
+}
+
+/** An address net.isIP accepted, as a number. */
+function addressValue(address: string, family: 4 | 6): bigint {
+  if (family === 4) return address.split(".").reduce((n, part) => (n << 8n) | BigInt(Number(part)), 0n);
+  let text = address.toLowerCase();
+  // A trailing dotted quad stands for the last two groups.
+  const quad = /(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+  if (quad) {
+    const v4 = addressValue(quad[1]!, 4);
+    text = `${text.slice(0, quad.index)}${(v4 >> 16n).toString(16)}:${(v4 & 0xffffn).toString(16)}`;
+  }
+  const [head, tail] = text.includes("::") ? (text.split("::") as [string, string]) : [text, null];
+  const h = head ? head.split(":") : [];
+  const t = tail ? tail.split(":") : [];
+  const groups = [...h, ...new Array(8 - h.length - t.length).fill("0"), ...t];
+  return groups.reduce((n, g) => (n << 16n) | BigInt(parseInt(g, 16) || 0), 0n);
+}
+
+/** True when the ranges together cover every address of the family. */
+function coversEverything(ranges: AddressRange[], family: 4 | 6): boolean {
+  const last = (1n << BigInt(family === 4 ? 32 : 128)) - 1n;
+  let covered = -1n;
+  for (const r of [...ranges].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0))) {
+    if (r.start > covered + 1n) return false;
+    if (r.end > covered) covered = r.end;
+    if (covered >= last) return true;
+  }
+  return false;
 }
 
 export function loadConfig(): AppConfig {
