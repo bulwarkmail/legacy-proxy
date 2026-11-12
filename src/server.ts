@@ -26,6 +26,7 @@ import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
 import { LoginLimiter } from "./auth/loginLimit.js";
+import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -60,11 +61,21 @@ dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
 const confirmedAlongside = new Map<number, Map<string, number>>();
 const CONFIRMED_ALONGSIDE_MS = 60 * 60_000;
 
+// Attempts of the open checks of stored passwords (see recordSignIn), and the
+// client address of the sign-in that opened each, which the attempts are
+// counted for. After a restart the address is gone, like the login counters.
+const checks = new StoredPasswordChecks((accountId) => runCheckAttempt(accountId));
+const checkAddress = new Map<number, string>();
+
 // When an account's credential generation moves, nothing logged in with the
 // old credentials keeps serving it: pooled connections close and the IDLE
 // worker starts over. Cached Basic logins check the generation themselves.
 store.setCredentialListener((accountId) => {
   confirmedAlongside.delete(accountId);
+  if (!store.getAccountById(accountId)?.cred_check_tag) {
+    checks.close(accountId);
+    checkAddress.delete(accountId);
+  }
   pool.retire(accountId);
   idleManager.onCredentialsChanged(accountId);
 });
@@ -115,11 +126,14 @@ if (gmailConfig && gmailStore) {
   app.addHook("onClose", async () => gmailStore.close());
 }
 
-function sendLimited(reply: import("fastify").FastifyReply, gate: { status: 429 | 503; retryAfterSec: number }) {
+function sendLimited(
+  reply: import("fastify").FastifyReply,
+  gate: { status: 429 | 503; retryAfterSec: number; error?: string },
+) {
   reply.header("Retry-After", String(gate.retryAfterSec));
   return reply
     .code(gate.status)
-    .send({ error: gate.status === 429 ? "too many failed logins" : "too many logins in progress" });
+    .send({ error: gate.error ?? (gate.status === 429 ? "too many failed logins" : "too many logins in progress") });
 }
 
 // Login names and secrets longer than this are not credentials anyone uses.
@@ -193,7 +207,12 @@ app.post("/api/login", async (req, reply) => {
 
   const slug = `${providerName}:${body.username}`;
   const tag = credentialTag(cfg.vaultKey, creds);
-  const account = await recordSignIn({ slug, providerName, provider, creds, ip: req.ip, tag });
+  const signedIn = await recordSignIn({ slug, providerName, provider, creds, ip: req.ip, tag });
+  if (!signedIn.ok) {
+    probe.logout().catch(() => {});
+    return sendLimited(reply, signedIn);
+  }
+  const account = signedIn.account;
   // Reuse the probe as the account's pooled connection instead of logging out
   // and paying a second TCP+TLS+LOGIN when the client's first JMAP call lands.
   pool.adopt(account, probe);
@@ -216,43 +235,116 @@ app.post("/api/logout", async (req, reply) => {
 });
 
 /**
- * True when `creds` differ from what the account row holds: another password
- * or user name, or OAuth instead of a password. PLAIN and LOGIN are two ways
- * to send the same password. An OAuth access token is not a password and
- * renews by itself, so a new one alone does not count.
+ * True when `a` and `b` are the same credentials: the same user name and
+ * password, or OAuth for the same user name. PLAIN and LOGIN are two ways to
+ * send the same password. An OAuth access token is not a password and renews
+ * by itself, so a new one alone does not count.
  */
-async function credentialsChanged(existing: AccountRow, creds: Credentials): Promise<boolean> {
+function sameCredentials(a: Credentials, b: Credentials): boolean {
   const oauth = (c: Credentials) => c.mech === "XOAUTH2";
+  return oauth(a) === oauth(b) && a.username === b.username && (a.password ?? null) === (b.password ?? null);
+}
+
+/** The credentials sealed in `vault`, or null when there are none or they can't be read (another VAULT_KEY). */
+async function unsealed(vault: Buffer | null | undefined): Promise<Credentials | null> {
+  if (!vault) return null;
   try {
-    const stored = await openCredentials(cfg.vaultKey, existing.vault);
-    return (
-      oauth(stored) !== oauth(creds) ||
-      stored.username !== creds.username ||
-      (stored.password ?? null) !== (creds.password ?? null)
-    );
+    return await openCredentials(cfg.vaultKey, vault);
   } catch {
-    return true;
+    return null;
   }
 }
 
-// Checks of an account's stored password, by account. A sign-in that offers a
-// password other than the stored one starts one after it is answered: the
-// stored password is tried once at the mail server. If the server refuses it,
-// the offered password replaced it and the credential generation moves; the
-// sessions made with the offered password stay valid. If the server still
-// accepts it, both are valid (one app password per device) and nothing
-// changes. While a check runs, the account's sessions made with other
-// credentials wait for its result, at most STORED_CHECK_WAIT_MS.
-const storedChecks = new Map<number, { tag: string; done: Promise<void> }>();
-const STORED_CHECK_WAIT_MS = 10_000;
+// Checks of an account's stored password. A sign-in that succeeds with a
+// password other than the stored one is answered at once and opens a check:
+// the stored password is tried at the mail server until the server accepts or
+// refuses it (auth/storedCheck.ts says when the attempts run).
+// - Refused: the new password replaced it. The credential generation moves;
+//   sessions made with the new password stay valid.
+// - Accepted: both are valid (one app password per device). Nothing moves and
+//   the stored password stays in place.
+// While the check is open the row holds the new password (see
+// store.openCredentialCheck) and only sessions made with it are served. Every
+// other session of the account waits for the answer while an attempt is due
+// within CHECK_WAIT_MS and is then judged, or is answered 503 with
+// Retry-After. A sign-in with yet another password is treated the same way; a
+// sign-in with the stored password is itself the answer "accepted". The check
+// is kept in the database, so a restart resumes it and holds the same sessions.
 
-/** Wait for a check of the account's stored password, unless `tag` started it. */
-async function awaitStoredCheck(accountId: number, tag: string | undefined): Promise<void> {
-  const check = storedChecks.get(accountId);
-  if (!check || check.tag === tag) return;
-  let timer: NodeJS.Timeout | undefined;
-  await Promise.race([check.done, new Promise<void>((resolve) => (timer = setTimeout(resolve, STORED_CHECK_WAIT_MS)))]);
-  clearTimeout(timer);
+const TRY_AGAIN = "try again later";
+
+/**
+ * Null when a session made with credentials tagged `tag` may be served, or a
+ * 503 while a check of the account's stored password is open and `tag` is not
+ * the password that opened it.
+ */
+async function holdForCheck(account: AccountRow, tag: string | undefined): Promise<AuthOutcome | null> {
+  if (!account.cred_check_tag || account.cred_check_tag === tag) return null;
+  resumeCheck(account);
+  const retryAfterSec = await checks.waitForAnswer(account.id);
+  const now = store.getAccountById(account.id);
+  if (!now?.cred_check_tag || now.cred_check_tag === tag) return null;
+  return { ok: false, status: 503, retryAfterSec: retryAfterSec ?? 1, error: TRY_AGAIN };
+}
+
+/** Run the attempts of the row's open check, if they don't run yet (after a restart). */
+function resumeCheck(row: AccountRow): void {
+  if (!row.cred_check_tag) return;
+  checks.open(row.id, { attempts: row.cred_check_attempts ?? 0, lastAt: row.cred_check_last ?? 0 });
+}
+
+/** Record the answer to the row's open check; the row after it, or undefined when that check was closed already. */
+function answerCheck(row: AccountRow, answer: "accepted" | "refused"): AccountRow | undefined {
+  const answered = store.answerCredentialCheck(row.id, row.cred_check_since ?? 0, answer);
+  if (!answered) return undefined;
+  if (answer === "accepted" && row.cred_check_tag) confirmAlongside(row.id, row.cred_check_tag);
+  checks.close(row.id);
+  checkAddress.delete(row.id);
+  return answered;
+}
+
+/** One attempt of the open check of an account's stored password. */
+async function runCheckAttempt(accountId: number): Promise<CheckAttemptResult> {
+  const row = store.getAccountById(accountId);
+  if (!row?.cred_check_tag) return "answered";
+  store.noteCheckAttempt(accountId, row.cred_check_since ?? 0);
+  const checked = await unsealed(row.cred_check_vault);
+  // Stored credentials that can't be read can't be checked: the new ones replace them.
+  if (!checked) {
+    answerCheck(row, "refused");
+    return "answered";
+  }
+  let provider: ProviderConfig;
+  try {
+    provider = resolveProvider(cfg, row.kind);
+  } catch {
+    return "unanswered";
+  }
+  // Each attempt is a login like any other: never for a held address, and a
+  // refusal counts toward the limits.
+  const gate = await logins.begin(checkAddress.get(accountId) ?? "", row.username);
+  if (!gate.ok) return "unanswered";
+  let probe;
+  try {
+    probe = await openImap({ provider, creds: checked });
+  } catch (e) {
+    // Only a refusal of the credentials answers the check. A server that
+    // can't be reached, or answers "try again later" (UNAVAILABLE,
+    // CONTACTADMIN and the other codes isCredentialRefusal names), does not.
+    if (!isCredentialRefusal(e)) {
+      gate.finish("error");
+      log.info({ account: row.slug, ...imapErrorDetails(e) }, "stored password check got no answer; trying again later");
+      return "unanswered";
+    }
+    gate.finish("refused");
+    answerCheck(row, "refused");
+    return "answered";
+  }
+  gate.finish("accepted");
+  const answered = answerCheck(row, "accepted");
+  if (answered) pool.adopt(answered, probe);
+  else probe.logout().catch(() => {});
+  return "answered";
 }
 
 interface SignIn {
@@ -265,12 +357,18 @@ interface SignIn {
   tag: string;
 }
 
-/** Record what a successful sign-in proved; returns the row its session belongs to. */
-async function recordSignIn(s: SignIn): Promise<AccountRow> {
+type SignInOutcome = { ok: true; account: AccountRow } | { ok: false; status: 503; retryAfterSec: number; error: string };
+
+/**
+ * Record what a successful sign-in proved; returns the row its session
+ * belongs to, or a 503 while a check of another password is open.
+ */
+async function recordSignIn(s: SignIn, again = false): Promise<SignInOutcome> {
   const existing = store.getAccount(s.slug);
   const vault = await sealCredentials(cfg.vaultKey, s.creds);
-  const save = (rotate: boolean, keepSince?: number) =>
-    store.upsertAccount({
+  const save = (rotate: boolean): SignInOutcome => ({
+    ok: true,
+    account: store.upsertAccount({
       slug: s.slug,
       kind: s.providerName,
       host: s.provider.imap.host,
@@ -278,70 +376,50 @@ async function recordSignIn(s: SignIn): Promise<AccountRow> {
       vault,
       rotate,
       rotatedBy: rotate ? s.tag : null,
-      keepSince,
-    });
+    }),
+  });
   if (!existing) return save(false);
-  const changed = await credentialsChanged(existing, s.creds);
-  // The same password, or the server already refused the stored one.
-  if (!changed || existing.cred_refused) return save(changed);
-  // Confirmed valid next to the stored one not long ago: no check again.
-  if (bothValid(existing, s.tag)) return existing;
-  // One check at a time; the sessions of a sign-in that did not start it are
-  // decided by the one running. While it runs only the sessions of the new
-  // password are served, so the push subscriptions made meanwhile are theirs
-  // and stay when the check moves the generation.
-  if (!storedChecks.has(existing.id)) {
-    const started = Date.now();
-    checkStoredPassword(existing, s, () => save(true, started));
+  // The credentials the row holds: the stored ones, or during a check the
+  // ones that opened it.
+  const held = await unsealed(existing.vault);
+  if (held && sameCredentials(held, s.creds)) return save(false);
+  // Stored credentials that can't be read, or that the server refused
+  // already, are replaced at once.
+  if (!held || existing.cred_refused) return save(true);
+  if (existing.cred_check_tag) {
+    // The stored password while it is being checked: the server just
+    // accepted it, which answers the check.
+    const checked = await unsealed(existing.cred_check_vault);
+    if (checked && sameCredentials(checked, s.creds)) answerCheck(existing, "accepted");
+    else {
+      // Another password: its session would depend on the answer, so it
+      // waits for it like the account's other sessions.
+      resumeCheck(existing);
+      const retryAfterSec = await checks.waitForAnswer(existing.id);
+      if (retryAfterSec !== null || again) return { ok: false, status: 503, retryAfterSec: retryAfterSec ?? 1, error: TRY_AGAIN };
+    }
+    return again ? { ok: false, status: 503, retryAfterSec: 1, error: TRY_AGAIN } : recordSignIn(s, true);
   }
-  return existing;
+  // Confirmed valid next to the stored one not long ago: no check again.
+  if (bothValid(existing.id, s.tag)) return { ok: true, account: existing };
+  const opened = store.openCredentialCheck(existing.id, { vault, tag: s.tag, since: Date.now() });
+  if (!opened) return again ? { ok: false, status: 503, retryAfterSec: 1, error: TRY_AGAIN } : recordSignIn(s, true);
+  checkAddress.set(opened.id, s.ip);
+  checks.open(opened.id);
+  return { ok: true, account: opened };
 }
 
-function bothValid(account: AccountRow, tag: string): boolean {
-  const until = confirmedAlongside.get(account.id)?.get(tag);
+function bothValid(accountId: number, tag: string): boolean {
+  const until = confirmedAlongside.get(accountId)?.get(tag);
   return until !== undefined && until > Date.now();
 }
 
-function confirmAlongside(account: AccountRow, tag: string): void {
-  const tags = confirmedAlongside.get(account.id) ?? new Map<string, number>();
+function confirmAlongside(accountId: number, tag: string): void {
+  const tags = confirmedAlongside.get(accountId) ?? new Map<string, number>();
   const now = Date.now();
   for (const [t, until] of tags) if (until <= now) tags.delete(t);
   tags.set(tag, now + CONFIRMED_ALONGSIDE_MS);
-  confirmedAlongside.set(account.id, tags);
-}
-
-function checkStoredPassword(existing: AccountRow, s: SignIn, replace: () => AccountRow): void {
-  const done: Promise<void> = (async () => {
-    let stored: Credentials;
-    try {
-      stored = await openCredentials(cfg.vaultKey, existing.vault);
-    } catch {
-      replace();
-      return;
-    }
-    // The check is a login like any other: never for a held address, and a
-    // refusal counts.
-    const gate = await logins.begin(s.ip, s.creds.username);
-    if (!gate.ok) return;
-    try {
-      const probe = await openImap({ provider: s.provider, creds: stored });
-      gate.finish("accepted");
-      pool.adopt(existing, probe);
-      confirmAlongside(existing, s.tag);
-    } catch (e) {
-      if (!isCredentialRefusal(e)) {
-        gate.finish("error");
-        return;
-      }
-      gate.finish("refused");
-      replace();
-    }
-  })()
-    .catch((err) => log.warn({ err: (err as Error).message }, "stored password check failed"))
-    .finally(() => {
-      if (storedChecks.get(existing.id)?.done === done) storedChecks.delete(existing.id);
-    });
-  storedChecks.set(existing.id, { tag: s.tag, done });
+  confirmedAlongside.set(accountId, tags);
 }
 
 function tokenHash(token: string): string {
@@ -715,7 +793,7 @@ type AccountRow = import("./state/store.js").AccountRow;
 type AuthOutcome =
   | { ok: true; account: AccountRow }
   | { ok: false; status: 401 }
-  | { ok: false; status: 429 | 503; retryAfterSec: number };
+  | { ok: false; status: 429 | 503; retryAfterSec: number; error?: string };
 const UNAUTHORIZED: AuthOutcome = { ok: false, status: 401 };
 
 /** The caller's account, or null after answering 401, 429 or 503. */
@@ -741,7 +819,8 @@ async function authn(req: {
     const token = h.slice("Bearer ".length).trim();
     const first = bearerSession(token);
     if (!first) return UNAUTHORIZED;
-    await awaitStoredCheck(first.account.id, first.token.cf);
+    const held = await holdForCheck(first.account, first.token.cf);
+    if (held) return held;
     const session = bearerSession(token);
     return session ? { ok: true, account: session.account } : UNAUTHORIZED;
   }
@@ -762,7 +841,9 @@ async function authn(req: {
     const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
     const cached = basicAuthCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
-      await awaitStoredCheck(cached.accountId, cached.tag);
+      const before = store.getAccountById(cached.accountId);
+      const held = before ? await holdForCheck(before, cached.tag) : null;
+      if (held) return held;
       const account = store.getAccountById(cached.accountId);
       // A header validated under an older credential generation is asked again.
       if (account && generationValid(cached.gen, cached.tag, account.cred_gen, account.cred_rotated_by)) {
@@ -820,13 +901,23 @@ async function basicLogin(
   gate.finish("accepted");
   const slug = `${providerName}:${username}`;
   const tag = credentialTag(cfg.vaultKey, creds);
-  const account = await recordSignIn({ slug, providerName, provider, creds, ip, tag });
+  const signedIn = await recordSignIn({ slug, providerName, provider, creds, ip, tag });
+  if (!signedIn.ok) {
+    probe.logout().catch(() => {});
+    return signedIn;
+  }
+  const account = signedIn.account;
   // Keep the validated connection: the JMAP request this auth is for will
   // need one immediately.
   pool.adopt(account, probe);
   basicAuthCache.set(cacheKey, { accountId: account.id, gen: account.cred_gen, tag, expires: Date.now() + BASIC_TTL_MS });
   return { ok: true, account };
 }
+
+// Checks of stored passwords that were still open when the proxy stopped go on
+// where they left off.
+for (const row of store.accountsWithOpenCheck()) resumeCheck(row);
+app.addHook("onClose", async () => checks.closeAll());
 
 const port = cfg.port;
 app

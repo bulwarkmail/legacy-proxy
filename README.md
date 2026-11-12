@@ -247,8 +247,9 @@ vault, and only mints a token if IMAP accepts.
 
 A token is valid for 7 days. It ends earlier when the password behind it is
 replaced. When a sign-in (through `/api/login` or HTTP Basic) succeeds with a
-password other than the stored one, the proxy answers it and then tries the
-stored password once at the mail server:
+password other than the stored one, the proxy answers it at once and then
+checks the stored password at the mail server until the server accepts or
+refuses it:
 
 - If the server refuses the stored password, the new one replaced it: the proxy
   stores the new password and moves the account's credential generation. From
@@ -261,9 +262,23 @@ stored password once at the mail server:
   header is cached as usual. The stored password is not checked again for that
   second password for an hour.
 
-While that check runs, the account's sessions made with other passwords wait
-for its result (at most 10 seconds). The check is a login like any other: it
-never runs for a held address, and a refusal counts toward the login limits.
+Until the check has an answer, only sessions made with the new password are
+served, and the proxy logs in with the new password for its own connections.
+Every other session of the account, and a sign-in with yet another password,
+waits for the answer while an attempt is due within 15 seconds and is then
+answered `401` or served as the answer says; otherwise it gets `503` with
+`Retry-After`. A sign-in with the stored password answers the check itself:
+both are valid.
+
+Only a refusal of the credentials answers "refused". An attempt that gets no
+answer (the server can't be reached, answers "try again later" with one of the
+codes listed below, no login slot is free, or the address is held) is repeated
+after 5 seconds, 30 seconds, 1, 2 and 5 minutes, then every 10 minutes: at most
+11 attempts in the first hour and 6 in each hour after that. Each attempt is a
+login like any other: it never runs for a held address, and a refusal counts
+toward the login limits. The check is kept in the database, so a restart holds
+the same sessions and goes on with the attempts where it left off.
+
 Signing in again with the same password ends nothing. Tokens issued by versions
 before this check carry no generation and keep working until the account's
 password first changes.

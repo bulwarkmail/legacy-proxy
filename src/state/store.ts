@@ -32,6 +32,21 @@ export interface AccountRow {
    * generation. Null otherwise.
    */
   cred_rotated_by: string | null;
+  /**
+   * A check of the stored credentials that has no answer yet (see
+   * `openCredentialCheck`): the credentials it checks, the ones held before a
+   * sign-in with other credentials. Null when no check is open. The fields of
+   * the check are optional so rows made up outside the database need none.
+   */
+  cred_check_vault?: Buffer | null;
+  /** The credential tag of the sign-in that opened the check; its credentials are in `vault` meanwhile. */
+  cred_check_tag?: string | null;
+  /** When the check opened (epoch ms); identifies it. */
+  cred_check_since?: number;
+  /** Attempts the check made at the mail server so far. */
+  cred_check_attempts?: number;
+  /** When its last attempt started (epoch ms), 0 before the first. */
+  cred_check_last?: number;
 }
 
 /** Refusals of the stored credentials in a row before they are marked refused. */
@@ -236,7 +251,16 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_rotated_by", definition: "TEXT" },
   { table: "account", column: "cred_first_refusal", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "push_subscription", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_check_vault", definition: "BLOB" },
+  { table: "account", column: "cred_check_tag", definition: "TEXT" },
+  { table: "account", column: "cred_check_since", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_check_attempts", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "account", column: "cred_check_last", definition: "INTEGER NOT NULL DEFAULT 0" },
 ];
+
+// Clears an open check of the stored credentials, inside an UPDATE's SET list.
+const NO_CHECK =
+  "cred_check_vault = NULL, cred_check_tag = NULL, cred_check_since = 0, cred_check_attempts = 0, cred_check_last = 0";
 
 export class Store {
   readonly db: DB;
@@ -305,6 +329,8 @@ export class Store {
     );
     const rotate = p.rotate ? 1 : 0;
     stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, rotate, rotate, p.rotatedBy ?? null);
+    // Replaced credentials have nothing left to check.
+    if (rotate) this.prep(`UPDATE account SET ${NO_CHECK} WHERE slug = ?`).run(p.slug);
     const row = this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
     if (before && before.cred_gen !== row.cred_gen) this.endOldSubscriptions(row.id, row.cred_gen, p.keepSince);
     if (before && (before.cred_gen !== row.cred_gen || before.cred_refused)) this.credentialListener?.(row.id);
@@ -331,7 +357,7 @@ export class Store {
     if (now - row.cred_first_refusal < STORED_CREDENTIAL_SPREAD_MS) return false;
     this.prep(
       `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_first_refusal = 0,
-         cred_gen = cred_gen + 1, cred_rotated_by = NULL
+         cred_gen = cred_gen + 1, cred_rotated_by = NULL, ${NO_CHECK}
        WHERE id = ?`,
     ).run(accountId);
     this.endOldSubscriptions(accountId, row.cred_gen + 1);
@@ -344,6 +370,64 @@ export class Store {
     this.prep(`UPDATE account SET cred_refusals = 0, cred_first_refusal = 0 WHERE id = ? AND cred_refusals > 0`).run(
       accountId,
     );
+  }
+
+  /**
+   * A sign-in succeeded with credentials (`vault`, tag `tag`) other than the
+   * stored ones: open a check of the stored ones. Until it has an answer the
+   * row holds the new credentials, so everything the proxy opens for the
+   * account meanwhile logs in with credentials the server just accepted, and
+   * keeps the stored ones in `cred_check_vault`. The generation does not move.
+   * Returns the row, or undefined when a check is open already.
+   */
+  openCredentialCheck(accountId: number, p: { vault: Buffer; tag: string; since: number }): AccountRow | undefined {
+    // SQLite evaluates every SET expression on the row as it was, so the
+    // stored vault moves to cred_check_vault as the new one takes its place.
+    const changed = this.prep(
+      `UPDATE account SET cred_check_vault = vault, vault = ?, cred_check_tag = ?, cred_check_since = ?,
+         cred_check_attempts = 0, cred_check_last = 0
+       WHERE id = ? AND cred_check_tag IS NULL AND cred_refused = 0`,
+    ).run(p.vault, p.tag, p.since, accountId).changes;
+    return changed ? this.getAccountById(accountId) : undefined;
+  }
+
+  /** Count an attempt of the check opened at `since` (epoch ms) that starts `at`. */
+  noteCheckAttempt(accountId: number, since: number, at = Date.now()): void {
+    this.prep(
+      `UPDATE account SET cred_check_attempts = cred_check_attempts + 1, cred_check_last = ?
+       WHERE id = ? AND cred_check_tag IS NOT NULL AND cred_check_since = ?`,
+    ).run(at, accountId, since);
+  }
+
+  /**
+   * The answer to the check opened at `since`. "accepted": the server still
+   * takes the stored credentials, so both are valid; they go back in place
+   * and nothing moves. "refused": the new credentials replaced them; the
+   * generation moves, sessions made with the new credentials (the check's tag)
+   * stay valid, and so do the push subscriptions made since the check opened,
+   * because only those sessions were served meanwhile. Returns the row, or
+   * undefined when that check is no longer open.
+   */
+  answerCredentialCheck(accountId: number, since: number, answer: "accepted" | "refused"): AccountRow | undefined {
+    const sql =
+      answer === "accepted"
+        ? `UPDATE account SET vault = cred_check_vault, cred_refusals = 0, cred_first_refusal = 0, ${NO_CHECK}
+           WHERE id = ? AND cred_check_tag IS NOT NULL AND cred_check_vault IS NOT NULL AND cred_check_since = ?`
+        : `UPDATE account SET cred_gen = cred_gen + 1, cred_rotated_by = cred_check_tag,
+             cred_refused = 0, cred_refusals = 0, cred_first_refusal = 0, ${NO_CHECK}
+           WHERE id = ? AND cred_check_tag IS NOT NULL AND cred_check_since = ?`;
+    if (!this.prep(sql).run(accountId, since).changes) return undefined;
+    const row = this.getAccountById(accountId);
+    if (row && answer === "refused") {
+      this.endOldSubscriptions(row.id, row.cred_gen, since);
+      this.credentialListener?.(row.id);
+    }
+    return row;
+  }
+
+  /** Accounts with a check of their stored credentials still open, to resume after a restart. */
+  accountsWithOpenCheck(): AccountRow[] {
+    return this.prep(`SELECT * FROM account WHERE cred_check_tag IS NOT NULL`).all() as AccountRow[];
   }
 
   // Told when an account's credential generation moved or its refused mark
