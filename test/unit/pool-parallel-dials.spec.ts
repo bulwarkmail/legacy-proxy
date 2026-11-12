@@ -72,7 +72,9 @@ describe("parallel requests and a stored password the server refuses", () => {
     const roles = ["interactive", "interactive", "interactive", "bulk", "bulk", "bulk", "bulk", "bulk"] as const;
     const results = await Promise.allSettled(roles.map((role) => pool.acquire(account, role)));
     expect(results.every((r) => r.status === "rejected")).toBe(true);
-    expect(store.getAccountById(account.id)!.cred_refused).toBe(1);
+    // One refusal; the next try waits its turn, so the burst cannot set the
+    // refused mark by itself (that takes three refusals over five minutes).
+    expect(store.getAccountById(account.id)).toMatchObject({ cred_refusals: 1, cred_refused: 0 });
     expect(imap.logins - before).toBeLessThanOrEqual(3);
     await pool.closeAll();
   });

@@ -243,10 +243,15 @@ The proxy also notices a password that was changed at the mail server. When the
 server refuses the stored password three times in a row (when the push IDLE
 worker reconnects, or the pool opens a new connection), the stored credentials
 are marked refused: the proxy stops logging in with them, every token issued
-before is answered `401`, and the push IDLE worker stops. The mark is kept in
-the database across restarts and cleared by the next successful sign-in, which
-also starts the push worker again. A server that cannot be reached, or answers
-"try again later", is not a refusal and is retried with backoff, at most once a
+before is answered `401`, and the push IDLE worker stops. After a refusal the
+stored password is tried again only two and a half minutes later, so the three
+refusals span at least five minutes and a server that refuses logins for a
+moment marks nobody; requests that need a new connection in between fail
+without a login. The mark is kept in the database across restarts and cleared
+by the next successful sign-in, which also starts the push worker again. A
+server that cannot be reached, or answers "try again later" (`UNAVAILABLE`,
+`SERVERBUG`, `INUSE`, `LIMIT`, or `CONTACTADMIN`, which Stalwart sends for a
+store error), is not a refusal and is retried with backoff, at most once a
 minute.
 
 `POST /api/logout` with `Authorization: Bearer <token>` ends that one token and

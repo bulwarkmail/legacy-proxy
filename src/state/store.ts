@@ -24,6 +24,8 @@ export interface AccountRow {
   cred_refused: number;
   /** Refusals of the stored credentials in a row, while not yet marked refused. */
   cred_refusals: number;
+  /** When the first of those refusals came (epoch ms), 0 when there are none. */
+  cred_first_refusal: number;
   /**
    * The credential tag of the sign-in that moved the generation last, when a
    * sign-in did: sessions made with those credentials stay valid under the new
@@ -34,6 +36,25 @@ export interface AccountRow {
 
 /** Refusals of the stored credentials in a row before they are marked refused. */
 export const STORED_CREDENTIAL_ATTEMPTS = 3;
+/**
+ * The least time those refusals must span. A server that refuses logins for a
+ * moment (a restart, a store hiccup it reports as a refusal) does not mark
+ * anyone; a password that was really changed ends the sessions within this
+ * time, or at once when the owner signs in with the new one.
+ */
+export const STORED_CREDENTIAL_SPREAD_MS = 5 * 60_000;
+
+/**
+ * When the stored credentials may be tried again after a refusal (epoch ms;
+ * 0 when they have none pending). The attempts are spaced evenly over
+ * STORED_CREDENTIAL_SPREAD_MS, so the last one that may set the mark comes no
+ * earlier than that after the first.
+ */
+export function nextStoredAttemptAt(row: Pick<AccountRow, "cred_refusals" | "cred_first_refusal">): number {
+  if (!row.cred_refusals) return 0;
+  const spacing = STORED_CREDENTIAL_SPREAD_MS / (STORED_CREDENTIAL_ATTEMPTS - 1);
+  return row.cred_first_refusal + row.cred_refusals * spacing;
+}
 
 export interface MailboxRow {
   id: number;
@@ -213,6 +234,7 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_refused", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_refusals", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_rotated_by", definition: "TEXT" },
+  { table: "account", column: "cred_first_refusal", definition: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
 export class Store {
@@ -275,7 +297,7 @@ export class Store {
        VALUES(?,?,?,?,?,?)
        ON CONFLICT(slug) DO UPDATE SET kind=excluded.kind, host=excluded.host,
          username=excluded.username, vault=excluded.vault,
-         cred_gen = cred_gen + ?, cred_refused = 0, cred_refusals = 0,
+         cred_gen = cred_gen + ?, cred_refused = 0, cred_refusals = 0, cred_first_refusal = 0,
          cred_rotated_by = CASE WHEN ? THEN ? ELSE cred_rotated_by END`,
     );
     const rotate = p.rotate ? 1 : 0;
@@ -287,21 +309,25 @@ export class Store {
 
   /**
    * The mail server refused the stored credentials of generation `gen`. After
-   * {@link STORED_CREDENTIAL_ATTEMPTS} refusals in a row they are marked
-   * refused and the generation moves. Returns true when the account is marked.
-   * A refusal of credentials the row no longer holds is not counted.
+   * {@link STORED_CREDENTIAL_ATTEMPTS} refusals in a row that span at least
+   * {@link STORED_CREDENTIAL_SPREAD_MS} they are marked refused and the
+   * generation moves. Returns true when the account is marked. A refusal of
+   * credentials the row no longer holds is not counted.
    */
-  noteCredentialRefusal(accountId: number, gen: number): boolean {
+  noteCredentialRefusal(accountId: number, gen: number, now = Date.now()): boolean {
     this.prep(
-      `UPDATE account SET cred_refusals = cred_refusals + 1
+      `UPDATE account SET cred_refusals = cred_refusals + 1,
+         cred_first_refusal = CASE WHEN cred_refusals = 0 THEN ? ELSE cred_first_refusal END
        WHERE id = ? AND cred_gen = ? AND cred_refused = 0`,
-    ).run(accountId, gen);
+    ).run(now, accountId, gen);
     const row = this.getAccountById(accountId);
     if (!row) return true;
     if (row.cred_refused) return true;
     if (row.cred_refusals < STORED_CREDENTIAL_ATTEMPTS) return false;
+    if (now - row.cred_first_refusal < STORED_CREDENTIAL_SPREAD_MS) return false;
     this.prep(
-      `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_gen = cred_gen + 1, cred_rotated_by = NULL
+      `UPDATE account SET cred_refused = 1, cred_refusals = 0, cred_first_refusal = 0,
+         cred_gen = cred_gen + 1, cred_rotated_by = NULL
        WHERE id = ?`,
     ).run(accountId);
     this.credentialListener?.(accountId);
@@ -310,7 +336,9 @@ export class Store {
 
   /** The stored credentials just worked: refusals so far were not in a row. */
   noteCredentialSuccess(accountId: number): void {
-    this.prep(`UPDATE account SET cred_refusals = 0 WHERE id = ? AND cred_refusals > 0`).run(accountId);
+    this.prep(`UPDATE account SET cred_refusals = 0, cred_first_refusal = 0 WHERE id = ? AND cred_refusals > 0`).run(
+      accountId,
+    );
   }
 
   // Told when an account's credential generation moved or its refused mark

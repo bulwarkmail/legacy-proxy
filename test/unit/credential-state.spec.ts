@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { Store } from "../../src/state/store.js";
+import { nextStoredAttemptAt, Store, STORED_CREDENTIAL_SPREAD_MS } from "../../src/state/store.js";
 
 const open: Store[] = [];
 const dirs: string[] = [];
@@ -70,6 +70,10 @@ describe("credential generation", () => {
   });
 });
 
+// Three refusals spread over the least time that may set the mark.
+const t0 = 1_700_000_000_000;
+const spread = [t0, t0 + STORED_CREDENTIAL_SPREAD_MS / 2, t0 + STORED_CREDENTIAL_SPREAD_MS];
+
 describe("refused mark", () => {
   it("is set after three refusals in a row and moves the generation", () => {
     const store = storeIn(tempDir());
@@ -77,12 +81,29 @@ describe("refused mark", () => {
     store.setCredentialListener((id) => moved.push(id));
     const { id } = store.upsertAccount(account());
 
-    expect(store.noteCredentialRefusal(id, 0)).toBe(false);
-    expect(store.noteCredentialRefusal(id, 0)).toBe(false);
-    expect(store.noteCredentialRefusal(id, 0)).toBe(true);
+    expect(store.noteCredentialRefusal(id, 0, spread[0])).toBe(false);
+    expect(store.noteCredentialRefusal(id, 0, spread[1])).toBe(false);
+    expect(store.noteCredentialRefusal(id, 0, spread[2])).toBe(true);
     expect(store.getAccountById(id)).toMatchObject({ cred_refused: 1, cred_gen: 1 });
     expect(moved).toEqual([id]);
     expect(store.accountsWithActivePushSubs()).toEqual([]);
+  });
+
+  it("is not set by refusals that come faster than the least spread", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    for (let i = 0; i < 5; i++) expect(store.noteCredentialRefusal(id, 0, t0 + i * 1000)).toBe(false);
+    expect(store.getAccountById(id)).toMatchObject({ cred_refused: 0, cred_gen: 0 });
+  });
+
+  it("spaces the next try after each refusal evenly over the least spread", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    expect(nextStoredAttemptAt(store.getAccountById(id)!)).toBe(0);
+    store.noteCredentialRefusal(id, 0, spread[0]);
+    expect(nextStoredAttemptAt(store.getAccountById(id)!)).toBe(spread[1]);
+    store.noteCredentialRefusal(id, 0, spread[1]);
+    expect(nextStoredAttemptAt(store.getAccountById(id)!)).toBe(spread[2]);
   });
 
   it("needs the refusals in a row", () => {
@@ -106,7 +127,7 @@ describe("refused mark", () => {
   it("is cleared by the next successful login, which tells the listener", () => {
     const store = storeIn(tempDir());
     const { id } = store.upsertAccount(account());
-    for (let i = 0; i < 3; i++) store.noteCredentialRefusal(id, 0);
+    for (const at of spread) store.noteCredentialRefusal(id, 0, at);
     const told: number[] = [];
     store.setCredentialListener((acc) => told.push(acc));
     expect(store.upsertAccount(account(false))).toMatchObject({ cred_refused: 0, cred_refusals: 0, cred_gen: 1 });

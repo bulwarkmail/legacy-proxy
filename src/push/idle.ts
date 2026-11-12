@@ -16,7 +16,7 @@ import type { Credentials } from "../auth/credentials.js";
 import { openCredentials } from "../auth/credentials.js";
 import { resolveProvider } from "../auth/providers.js";
 import { isCredentialRefusal, openImap } from "../imap/client.js";
-import type { Store, AccountRow } from "../state/store.js";
+import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
@@ -141,6 +141,8 @@ export class PushIdleManager {
     // since the worker started.
     const current = this.store.getAccountById(account.id);
     if (!current || current.cred_refused) throw new StoredCredentialsRefused();
+    // After a refusal the next try waits its turn; scheduleReconnect waits for it.
+    if (Date.now() < nextStoredAttemptAt(current)) throw new Error("stored credentials refused; trying again later");
     const provider = resolveProvider(this.cfg, current.kind);
     const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
     let client: ImapFlow;
@@ -230,7 +232,10 @@ export class PushIdleManager {
   private scheduleReconnect(account: AccountRow, worker: Worker): void {
     if (worker.closing) return;
     if (worker.reconnectTimer) clearTimeout(worker.reconnectTimer);
-    const delay = worker.backoffMs;
+    // Not before the stored credentials may be tried again after a refusal.
+    const row = this.store.getAccountById(account.id);
+    const resting = row ? nextStoredAttemptAt(row) - Date.now() : 0;
+    const delay = Math.max(worker.backoffMs, resting);
     worker.backoffMs = Math.min(worker.backoffMs * 2, RECONNECT_MAX_MS);
     log.info({ accountId: account.id, delayMs: delay }, "idle: scheduling reconnect");
     worker.reconnectTimer = setTimeout(() => {

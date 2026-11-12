@@ -4,7 +4,7 @@ import type { AppConfig } from "../util/config.js";
 import { resolveProvider } from "../auth/providers.js";
 import { openCredentials } from "../auth/credentials.js";
 import { isCredentialRefusal, openImap } from "./client.js";
-import type { Store, AccountRow } from "../state/store.js";
+import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
 
 interface PoolEntry {
@@ -148,6 +148,10 @@ export class ImapPool {
       // next successful login clears that mark.
       const current = this.store.getAccountById(account.id);
       if (!current || current.cred_refused) throw new Error("stored credentials refused by the mail server");
+      // After a refusal the next try waits its turn (see nextStoredAttemptAt).
+      if (Date.now() < nextStoredAttemptAt(current)) {
+        throw new Error("stored credentials refused by the mail server; trying again later");
+      }
       const provider = resolveProvider(this.cfg, current.kind);
       const creds: Credentials = await openCredentials(this.cfg.vaultKey, current.vault);
       let client: ImapFlow;

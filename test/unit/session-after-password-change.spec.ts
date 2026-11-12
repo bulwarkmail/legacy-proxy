@@ -123,12 +123,16 @@ describe("what a password change and a sign-out leave working", () => {
   it("answers an old token with 401, without a login, once the server refused the stored password", async () => {
     imap.users["lou@test.local"] = "old-password";
     const token = await tokenOf("lou@test.local", "old-password");
-    // The pool and the IDLE worker report refusals of the stored password to the store.
-    const { Store } = await import("../../src/state/store.js");
+    // The pool and the IDLE worker report refusals of the stored password to
+    // the store, spread over at least the least time that may set the mark.
+    const { Store, STORED_CREDENTIAL_SPREAD_MS } = await import("../../src/state/store.js");
     const other = new Store(dir);
     try {
       const row = other.getAccount("generic:lou@test.local")!;
-      for (let i = 0; i < 3; i++) other.noteCredentialRefusal(row.id, row.cred_gen);
+      const t0 = Date.now() - STORED_CREDENTIAL_SPREAD_MS;
+      for (const at of [t0, t0 + STORED_CREDENTIAL_SPREAD_MS / 2, t0 + STORED_CREDENTIAL_SPREAD_MS]) {
+        other.noteCredentialRefusal(row.id, row.cred_gen, at);
+      }
     } finally {
       other.close();
     }

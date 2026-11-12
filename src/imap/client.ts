@@ -71,8 +71,9 @@ export async function withMailbox<T>(
 
 // Response codes (RFC 5530) a server gives to a login it cannot serve right
 // now. imapflow flags every NO to LOGIN/AUTHENTICATE as an authentication
-// failure; these mean "try again later", not "wrong credentials".
-const TEMPORARY_LOGIN_CODES = new Set(["UNAVAILABLE", "SERVERBUG", "INUSE", "LIMIT"]);
+// failure; these mean "try again later", not "wrong credentials". Stalwart
+// answers a store error during the login with CONTACTADMIN.
+const TEMPORARY_LOGIN_CODES = new Set(["UNAVAILABLE", "SERVERBUG", "INUSE", "LIMIT", "CONTACTADMIN"]);
 
 /**
  * True when the mail server refused the credentials themselves, as opposed to

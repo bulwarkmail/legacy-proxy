@@ -269,6 +269,7 @@ export class GmailPush {
       cred_gen: 0,
       cred_refused: 0,
       cred_refusals: 0,
+      cred_first_refusal: 0,
       cred_rotated_by: null,
     };
   }

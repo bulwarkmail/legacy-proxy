@@ -165,6 +165,32 @@ describe("what the refused mark keeps and what clears it", () => {
     expect(await attemptsOver(6)).toBeLessThanOrEqual(3);
   });
 
+  it("spreads its three tries over five minutes before the mark is set", async () => {
+    vi.mocked(openImap).mockImplementation(async () => refused());
+    vi.useFakeTimers();
+    const idle = new PushIdleManager(cfg, store);
+    await idle.sync();
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    // A refusal that lasts a few minutes is not enough.
+    expect(vi.mocked(openImap).mock.calls.length).toBe(2);
+    expect(store.getAccountById(accountId())!.cred_refused).toBe(0);
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(vi.mocked(openImap).mock.calls.length).toBe(3);
+    expect(store.getAccountById(accountId())!.cred_refused).toBe(1);
+    await idle.closeAll();
+  });
+
+  it("does not count Stalwart's answer to a store error", async () => {
+    vi.mocked(openImap).mockImplementation(async () => {
+      const err = new Error("Command failed") as Error & Record<string, unknown>;
+      err.authenticationFailed = true;
+      err.serverResponseCode = "CONTACTADMIN";
+      throw err;
+    });
+    expect(await attemptsOver(1)).toBeGreaterThanOrEqual(20);
+    expect(store.getAccountById(accountId())!).toMatchObject({ cred_refused: 0, cred_refusals: 0 });
+  });
+
   it("keeps the mark across a restart of the proxy", async () => {
     vi.mocked(openImap).mockImplementation(async () => refused());
     await attemptsOver(1);
