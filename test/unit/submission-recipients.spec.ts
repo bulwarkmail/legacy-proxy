@@ -11,13 +11,17 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
 import { Store, type AccountRow } from "../../src/state/store.js";
 import { sealCredentials } from "../../src/auth/credentials.js";
 import { emailSubmissionGet, emailSubmissionSet, isPlainAddress } from "../../src/jmap/methods/submission.js";
 import { encodeEmailId } from "../../src/mapping/ids.js";
+import { buildRfc822 } from "../../src/mapping/buildMime.js";
 import type { AppConfig } from "../../src/util/config.js";
 
 const smtpLines: string[] = [];
+/** The message each DATA command carried, as it reached the server. */
+const smtpData: string[] = [];
 let smtp: net.Server;
 let dir: string;
 let store: Store;
@@ -38,6 +42,7 @@ beforeAll(async () => {
         if (data) {
           const end = buf.indexOf("\r\n.\r\n");
           if (end < 0) return;
+          smtpData.push(buf.slice(0, end));
           buf = buf.slice(end + 5);
           data = false;
           sock.write("250 queued\r\n");
@@ -94,6 +99,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   smtpLines.length = 0;
+  smtpData.length = 0;
 });
 afterAll(async () => {
   await new Promise<void>((r) => smtp.close(() => r()));
@@ -285,6 +291,229 @@ describe("the envelope derived from the headers", () => {
       const res = await send();
       expect(res.notCreated?.s?.type, from).toBe("forbiddenMailFrom");
     }
+    expect(smtpLines).toEqual([]);
+  });
+});
+
+describe("a message built from JSON addresses and sent without an envelope", () => {
+  type Addr = { name?: string; email: string };
+  // The draft Email/set create makes from the client's JSON addresses.
+  const jsonDraft = (to: Addr[]) =>
+    buildRfc822(
+      {
+        from: [{ name: "Alice", email: "alice@corp.example" }],
+        to,
+        subject: "s",
+        bodyValues: { "1": { value: "hi" } },
+        textBody: [{ partId: "1" }],
+      },
+      "corp.example",
+    );
+  const sent = () => rcpts().map((l) => l.replace(/^RCPT TO:<(.*?)>.*$/i, "$1"));
+
+  it.each<[string, Addr, string]>([
+    ["quoted local part holding an address", { email: '"attacker@evil.example x"@corp.example' }, "attacker@evil.example"],
+    ["angle brackets in the local part", { email: "<attacker@evil.example>@corp.example" }, "attacker@evil.example"],
+    ["space in the local part", { email: "john smith@corp.example" }, "smith@corp.example"],
+    ["a name and an address in the email field", { email: "a@corp.example <b@evil.example>" }, "b@evil.example"],
+  ])("%s: is sent to that address or refused, never to another mailbox", async (_label, addr, elsewhere) => {
+    try {
+      draft = await jsonDraft([addr]);
+    } catch {
+      return; // refused at Email/set: fine
+    }
+    const res = await send();
+    expect(sent(), `To header written: ${String(draft).split(/\r?\n/).find((l) => /^To:/i.test(l))}`).not.toContain(elsewhere);
+    if (!res.notCreated) expect(sent()).toEqual([addr.email]);
+  });
+
+  it.each<[string, Addr[], string[]]>([
+    ["a name with a comma", [{ name: "Doe, Jane", email: "jane@corp.example" }], ["jane@corp.example"]],
+    ["non-ASCII names with an @ and an emoji", [{ name: "Jörg @ Work", email: "joerg@corp.example" }, { name: "Team 🚀", email: "ops@corp.example" }], ["joerg@corp.example", "ops@corp.example"]],
+    ["a name that looks like an encoded address", [{ name: "=?utf-8?Q?a=40evil.example?=", email: "b@corp.example" }], ["b@corp.example"]],
+    ["an internationalised domain", [{ email: "bob@bücher.example" }], ["bob@xn--bcher-kva.example"]],
+  ])("%s: is sent to exactly the addresses given", async (_label, to, expected) => {
+    draft = await jsonDraft(to);
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(sent()).toEqual(expected);
+  });
+});
+
+describe("a header the envelope reads is one a reader and the Bcc stripping read too", () => {
+  /** What a reader shows as recipients: mailparser over the stored message. */
+  async function readerRecipients(raw: Buffer): Promise<string[]> {
+    const m = await simpleParser(raw, { skipHtmlToText: true, skipTextToHtml: true, skipImageLinks: true });
+    const out: string[] = [];
+    type A = { address?: string; group?: A[] };
+    const walk = (v: A[]) => {
+      for (const a of v) {
+        if (a.address) out.push(a.address.toLowerCase());
+        if (Array.isArray(a.group)) walk(a.group);
+      }
+    };
+    for (const f of [m.to, m.cc, m.bcc]) {
+      if (!f) continue;
+      for (const x of Array.isArray(f) ? f : [f]) walk(x.value as A[]);
+    }
+    return out;
+  }
+  const sent = () => rcpts().map((l) => l.replace(/^RCPT TO:<(.*?)>.*$/i, "$1").toLowerCase());
+
+  it.each<[string, string]>([
+    ["bare CR before a Bcc line", "From: alice@corp.example\r\nTo: bob@corp.example\r\nSubject: hi\rBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+    ["LF CR LF ends the header block", "From: alice@corp.example\r\nTo: bob@corp.example\n\r\nBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+  ])("%s", async (_label, raw) => {
+    draft = Buffer.from(raw);
+    const res = await send();
+    if (res.notCreated) return; // refusing such a header block is fine
+    const shown = await readerRecipients(draft);
+    for (const s of sent()) expect(shown, `sent ${s}, reader shows ${JSON.stringify(shown)}`).toContain(s);
+    if (sent().includes("hidden@evil.example")) expect(smtpData.join("\n")).not.toContain("hidden@evil.example");
+  });
+
+  it.each<[string, string]>([
+    ["a bare CR in the Subject", "From: alice@corp.example\r\nTo: bob@corp.example\r\nSubject: a\rb\r\n\r\nbody\r\n"],
+    ["CRLF and LF lines mixed", "From: alice@corp.example\r\nTo: bob@corp.example\nSubject: x\r\n\r\nbody\r\n"],
+    ["a line of only spaces before a Bcc", "From: alice@corp.example\r\nTo: bob@corp.example\r\n   \r\nBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+    ["a line that is neither a field nor a continuation", "From: alice@corp.example\r\nTo: bob@corp.example\r\nnot a header\r\nBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+  ])("refuses a header block with %s, also with a client envelope, and sends nothing", async (_label, raw) => {
+    draft = Buffer.from(raw);
+    expect((await send()).notCreated?.s?.type).toBe("invalidEmail");
+    const withEnvelope = await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: "bob@corp.example" }] });
+    expect(withEnvelope.notCreated?.s?.type).toBe("invalidEmail");
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("sends a message whose lines all end in LF to the same recipients, without its Bcc on the wire", async () => {
+    draft = Buffer.from("From: alice@corp.example\nTo: bob@corp.example\nBcc: carol@corp.example,\n dave@corp.example\nSubject: unix\n\nbody\nBcc: not-a-header@corp.example\n");
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(sent()).toEqual(["bob@corp.example", "carol@corp.example", "dave@corp.example"]);
+    const wire = smtpData.join("\n");
+    const head = wire.slice(0, wire.indexOf("\r\n\r\n"));
+    expect(head).not.toMatch(/^Bcc:/im);
+    expect(wire).not.toContain("dave@corp.example");
+    expect(head).toMatch(/^To: bob@corp\.example$/m);
+    expect(wire.slice(head.length)).toContain("Bcc: not-a-header@corp.example");
+  });
+
+  it("leaves a bare CR in the body alone", async () => {
+    draft = Buffer.from("From: alice@corp.example\r\nTo: bob@corp.example\r\nSubject: x\r\n\r\nline\rwith CR\r\n");
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(sent()).toEqual(["bob@corp.example"]);
+  });
+});
+
+describe("a draft saved while a recipient was still being typed", () => {
+  const save = (to: { name?: string; email: string }[]) =>
+    buildRfc822(
+      { from: [{ name: "Alice", email: "alice@corp.example" }], to, subject: "s", bodyValues: { "1": { value: "hi" } }, textBody: [{ partId: "1" }] },
+      "corp.example",
+    );
+
+  it("is refused when sent without an envelope, naming the text", async () => {
+    draft = await save([{ email: "carol@corp.example" }, { email: "bob" }]);
+    expect((await send()).notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: ["bob"] });
+    draft = await save([{ email: "Bob Smith" }]);
+    expect((await send()).notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: ["<Bob Smith>"] });
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("is refused when the client's envelope lists every recipient, as the webmail's does", async () => {
+    draft = await save([{ email: "carol@corp.example" }, { email: "bob" }]);
+    const res = await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: "carol@corp.example" }, { email: "bob" }] });
+    expect(res.notCreated?.s).toMatchObject({ type: "invalidRecipients", invalidRecipients: ["bob"] });
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("goes only to the client's envelope when that leaves the text out", async () => {
+    draft = await save([{ email: "carol@corp.example" }, { email: "bob" }]);
+    const res = await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: "carol@corp.example" }] });
+    expect(res.notCreated).toBeNull();
+    expect(rcpts()).toEqual(["RCPT TO:<carol@corp.example>"]);
+  });
+});
+
+describe("a refusal names what was refused", () => {
+  it("lists the refused header entries in invalidRecipients and in the description", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: ok@corp.example, ${CONFUSING}, John`);
+    const err = (await send()).notCreated?.s;
+    expect(err).toMatchObject({ type: "invalidRecipients", invalidRecipients: [CONFUSING, "John"] });
+    expect(err?.description).toContain(JSON.stringify(CONFUSING));
+    expect(err?.description).toContain('"John"');
+    expect(err?.description).not.toContain("ok@corp.example");
+  });
+
+  it("names client envelope entries as given, spaces included", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const err = (await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: " bob@corp.example " }, { email: " bob smith@corp.example" }] }))
+      .notCreated?.s;
+    expect(err).toMatchObject({ type: "invalidRecipients", invalidRecipients: [" bob smith@corp.example"] });
+    expect(err?.description).toContain('" bob smith@corp.example"');
+  });
+
+  it("names the refused sender, from the envelope or from the header", async () => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const given = (await send({ mailFrom: { email: "<attacker@evil.example>" }, rcptTo: [{ email: "bob@corp.example" }] })).notCreated?.s;
+    expect(given).toMatchObject({ type: "forbiddenMailFrom", mailFrom: "<attacker@evil.example>" });
+    expect(given?.description).toContain('"<attacker@evil.example>"');
+
+    draft = mail(`From: Jane Doe jane@corp.example\r\nTo: bob@corp.example`);
+    const derived = (await send()).notCreated?.s;
+    expect(derived).toMatchObject({ type: "forbiddenMailFrom", mailFrom: "Jane Doe jane@corp.example" });
+    expect(derived?.description).toContain('"Jane Doe jane@corp.example"');
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("keeps the description short for many refused entries", async () => {
+    const bad = Array.from({ length: 15 }, (_, i) => ({ email: `user ${i}@corp.example` }));
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+    const err = (await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: bad })).notCreated?.s;
+    expect(err?.invalidRecipients).toHaveLength(15);
+    expect(err?.description).toContain('"user 9@corp.example" and 5 more');
+    expect(err?.description).not.toContain("user 10@");
+  });
+});
+
+describe("the client envelope and the sender", () => {
+  beforeEach(() => {
+    draft = mail(`From: alice@corp.example\r\nTo: bob@corp.example`);
+  });
+
+  it.each<[string, unknown, string]>([
+    ["only rcptTo", { rcptTo: [{ email: "carol@corp.example" }] }, "invalidProperties"],
+    ["only mailFrom", { mailFrom: { email: "alice@corp.example" } }, "invalidProperties"],
+    ["mailFrom without an email", { mailFrom: {}, rcptTo: [{ email: "carol@corp.example" }] }, "invalidProperties"],
+    ["an envelope that isn't an object", "alice@corp.example", "invalidProperties"],
+    ["an empty rcptTo", { mailFrom: { email: "alice@corp.example" }, rcptTo: [] }, "noRecipients"],
+  ])("refuses a client envelope with %s and sends nothing", async (_label, envelope, type) => {
+    const err = (await send(envelope as Record<string, unknown>)).notCreated?.s;
+    expect(err?.type).toBe(type);
+    if (type === "invalidProperties") expect(err?.properties).toEqual(["envelope"]);
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("takes MAIL FROM from the Sender header when there is one", async () => {
+    draft = mail(`From: Alice <alice@corp.example>\r\nSender: Desk <desk@corp.example>\r\nTo: bob@corp.example`);
+    const res = await send();
+    expect(res.created?.s?.envelope.mailFrom).toEqual({ email: "desk@corp.example" });
+    expect(mailFroms()).toEqual(["MAIL FROM:<desk@corp.example>"]);
+  });
+
+  it("takes MAIL FROM from Sender when From names several authors", async () => {
+    draft = mail(`From: alice@corp.example, carol@corp.example\r\nSender: alice@corp.example\r\nTo: bob@corp.example`);
+    expect((await send()).created?.s?.envelope.mailFrom).toEqual({ email: "alice@corp.example" });
+  });
+
+  it.each([
+    ["two From fields", "From: alice@corp.example\r\nFrom: mallory@corp.example\r\nTo: bob@corp.example"],
+    ["two addresses in From and no Sender", "From: alice@corp.example, mallory@corp.example\r\nTo: bob@corp.example"],
+    ["two Sender fields", "From: alice@corp.example\r\nSender: a@corp.example\r\nSender: b@corp.example\r\nTo: bob@corp.example"],
+  ])("refuses a message with %s", async (_label, headers) => {
+    draft = mail(headers);
+    expect((await send()).notCreated?.s?.type).toBe("invalidEmail");
     expect(smtpLines).toEqual([]);
   });
 });

@@ -302,8 +302,9 @@ export class CardDavClient {
    * of that book. The resource must be a path, or an absolute URL on the DAV
    * origin, whose segments begin with the book's and add at least one more.
    * Empty segments (`//`, a trailing slash), a backslash, a query, a fragment,
-   * control characters and `.` or `..` segments, also percent-encoded at any
-   * depth, are refused.
+   * control characters, and any segment a server could take as `.` or `..`
+   * (see isDotSegment), also percent-encoded at any depth or in an overlong
+   * UTF-8 form, are refused.
    */
   isInBook(bookHref: string, resourceHref: string): boolean {
     const book = this.localPath(bookHref);
@@ -317,8 +318,9 @@ export class CardDavClient {
       if (decodeSegment(segs[i]!) !== decodeSegment(bookSegs[i]!)) return false;
     }
     return segs.every((s) => {
+      if (OVERLONG_UTF8.test(s)) return false;
       const plain = unescapePathChars(s);
-      return plain !== null && plain.split(/[/\\]/).every((p) => p !== "." && p !== "..");
+      return plain !== null && plain.split(/[/\\]/).every((p) => !isDotSegment(p));
     });
   }
 
@@ -661,19 +663,33 @@ function decodeSegment(s: string): string {
 }
 
 /**
- * Undo percent-encoding of `.`, `/`, `\` and `%` until nothing changes, so a
- * dot segment shows however often it was encoded. Null when it is still
- * changing after more rounds than any server decodes.
+ * Undo percent-encoding of `.`, `/`, `\`, `%`, `;`, NUL, space and tab until
+ * nothing changes, so a dot segment shows however often it was encoded. Null
+ * when it is still changing after more rounds than any server decodes.
  */
 function unescapePathChars(s: string): string | null {
   let cur = s;
   for (let i = 0; i < 5; i++) {
-    const next = cur.replace(/%(2e|2f|5c|25)/gi, (m) => String.fromCharCode(parseInt(m.slice(1), 16)));
+    const next = cur.replace(/%(2e|2f|5c|25|3b|00|20|09)/gi, (m) => String.fromCharCode(parseInt(m.slice(1), 16)));
     if (next === cur) return cur;
     cur = next;
   }
   return null;
 }
+
+/**
+ * A segment a server could take as `.` or `..`: nothing but dots, optionally
+ * followed by what some servers cut off before resolving the path (a path
+ * parameter after `;` in servlet containers, everything after a NUL, trailing
+ * whitespace). `.hidden.vcf` or `..vcf` are names, not references.
+ */
+function isDotSegment(p: string): boolean {
+  return /^\.+(?:[;\u0000\s][\s\S]*)?$/.test(p);
+}
+
+// Overlong UTF-8 forms (a "." written as %c0%ae and the like), which no
+// encoder writes and some servers decode to a dot or a slash.
+const OVERLONG_UTF8 = /%(?:c0|c1)|%e0%[89][0-9a-f]|%f0%8[0-9a-f]/i;
 
 function leafName(href: string): string {
   const trimmed = href.replace(/\/+$/, "");

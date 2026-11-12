@@ -92,6 +92,17 @@ Transport:
   checked. Redirects are not followed, and a failed delivery logs the host,
   never the URL. A relay on a private network, or one reached over plain
   `http`, needs `PUSH_ALLOW_PRIVATE_URLS=1`.
+  When upgrading from a version without this check: a subscription whose URL
+  is `http` stops being delivered unless `PUSH_ALLOW_PRIVATE_URLS=1` is set.
+  Each delivery then fails inside the proxy (logged with the host), and after
+  8 failed deliveries the proxy removes the subscription. A released Bulwark
+  webmail then tries to create a new one at its daily push resync, is refused
+  ("push URL must use https") and doesn't tell the user, so push stays off.
+  Before upgrading, serve the push relay over `https` and point the webmail's
+  relay URL at it, or set `PUSH_ALLOW_PRIVATE_URLS=1` (which also lifts the
+  private-address check). Users get push back at the webmail's next resync,
+  or at once with **Re-register** under "Notifications when Bulwark is
+  closed" in its settings.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
   least one verified push subscription, watching INBOX. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
@@ -112,6 +123,14 @@ Backends:
   A CardDAV account with no collections at all (a fresh Radicale user, for
   example) gets a `Contacts` address book created on the first
   `ContactCard/set`.
+  Requests, and the user's credentials, go only to the configured `carddav`
+  host, port and scheme. An href or a redirect that points anywhere else is
+  not followed, during discovery too; a redirect on the same host is (at most
+  four hops). A provider whose `/.well-known/carddav` redirects to another
+  host (iCloud-style setups) therefore has no contacts until that host is
+  configured directly: set `host`, `port` and `secure` to the server the
+  redirect leads to, and `basePath` to the DAV root there, or `principalPath`
+  to the user's principal to skip discovery.
 
 Auth and storage:
 

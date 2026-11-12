@@ -7,6 +7,7 @@ import { withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
+import { headerValues, isPlainAddress, parseAddressList, readHeaderBlock } from "../../mapping/buildMime.js";
 import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, notFound } from "../errors.js";
 import { applyEmailUpdate } from "./email.js";
 import { SIDE_RESPONSES, type MethodCall } from "../router.js";
@@ -125,27 +126,23 @@ export function messageIdOf(raw: Buffer): string | null {
   return m ? m[1]!.replace(/\s+/g, " ").trim() : null;
 }
 
-// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop it (and
-// its folded continuation lines) from the header block, leaving the body
-// byte-for-byte untouched.
+// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop every Bcc
+// field (with its folded continuation lines) from the header block, read by
+// the same reader that derives the envelope, leaving everything else
+// byte-for-byte untouched. A message whose header block can't be read is
+// refused before this (see emailSubmissionSet) and is returned unchanged.
 export function stripBccHeader(raw: Buffer): Buffer {
-  const text = raw.toString("binary");
-  const m = /\r?\n\r?\n/.exec(text);
-  // Include the last header line's own line break so every line we keep is
-  // terminated and the blank separator line follows untouched.
-  const headerEnd = m ? m.index + (text[m.index] === "\r" ? 2 : 1) : text.length;
-  const lines = text.slice(0, headerEnd).split(/(?<=\n)/);
-  const kept: string[] = [];
-  let dropping = false;
-  for (const line of lines) {
-    if (/^[ \t]/.test(line)) {
-      if (!dropping) kept.push(line);
-      continue;
-    }
-    dropping = /^bcc[ \t]*:/i.test(line);
-    if (!dropping) kept.push(line);
+  const fields = readHeaderBlock(raw);
+  const bcc = (fields ?? []).filter((f) => f.name === "bcc");
+  if (bcc.length === 0) return raw;
+  const kept: Buffer[] = [];
+  let pos = 0;
+  for (const f of bcc) {
+    kept.push(raw.subarray(pos, f.start));
+    pos = f.end;
   }
-  return Buffer.from(kept.join("") + text.slice(headerEnd), "binary");
+  kept.push(raw.subarray(pos));
+  return Buffer.concat(kept);
 }
 
 // Gmail keeps one message per Message-ID, and the copy its SMTP server files in
@@ -168,230 +165,73 @@ export function withFreshMessageId(raw: Buffer): Buffer {
   );
 }
 
-function asEmail(s: string | undefined | null): string | null {
-  if (!s) return null;
-  const t = s.trim();
-  if (!t) return null;
-  return t;
+export { headerValues, isPlainAddress, parseAddressList };
+
+// The refused entries as given, quoted so that spaces, commas and control
+// characters show; at most ten, so the description stays readable.
+function nameList(entries: string[]): string {
+  const shown = entries.slice(0, 10).map((e) => JSON.stringify(e)).join(", ");
+  return entries.length > 10 ? `${shown} and ${entries.length - 10} more` : shown;
 }
 
-// Whitespace, control characters and everything an address parser reads as
-// syntax: list separators, angle brackets, quotes, escapes, comments and the
-// colon of a group. U+FFFD stands for header bytes that weren't UTF-8.
-const NOT_PLAIN = /[\s,;:<>"\\()\u0000-\u001f\u007f-\u009f\ufffd]/u;
-
-/**
- * A plain address: one "@" between a non-empty local part and a non-empty
- * domain, and none of the characters in NOT_PLAIN. nodemailer parses every
- * envelope string again before it writes MAIL FROM and RCPT TO; for a plain
- * address every parser agrees on the mailbox, so what reaches the SMTP server
- * is the address the user was shown, one entry being one recipient.
- */
-export function isPlainAddress(s: string): boolean {
-  const at = s.indexOf("@");
-  return at > 0 && at === s.lastIndexOf("@") && at < s.length - 1 && !NOT_PLAIN.test(s);
-}
-
+/** invalidRecipients naming each refused entry as given, in the property and the description. */
 function refuseRecipients(invalid: string[]): never {
-  throw new JmapError("invalidRecipients", "recipients must be plain email addresses", {
+  const what = invalid.length === 1 ? "this recipient is" : "these recipients are";
+  throw new JmapError("invalidRecipients", `${what} not a plain email address: ${nameList(invalid)}`, {
     invalidRecipients: invalid,
   });
 }
 
-/** Accept an envelope only when all its addresses are plain. */
+/** forbiddenMailFrom naming the refused sender as given. */
+function refuseMailFrom(from: string): never {
+  throw new JmapError("forbiddenMailFrom", `the sender is not a plain email address: ${nameList([from])}`, {
+    mailFrom: from,
+  });
+}
+
+/** Accept an envelope only when all its addresses are plain; each is trimmed, and named as given when refused. */
 function checkedEnvelope(from: string, to: string[]): { from: string; to: string[] } {
-  const invalid = to.filter((a) => !isPlainAddress(a));
+  const invalid = to.filter((a) => !isPlainAddress(a.trim()));
   if (invalid.length > 0) refuseRecipients(invalid);
-  if (!isPlainAddress(from)) {
-    throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
-  }
-  return { from, to };
-}
-
-/** Every value of a header field (name in lower case), unfolded, from the message's header block. */
-export function headerValues(raw: Buffer, name: string): string[] {
-  const crlf = raw.indexOf("\r\n\r\n");
-  const lf = raw.indexOf("\n\n");
-  const ends = [crlf, lf].filter((i) => i >= 0);
-  const head = raw.subarray(0, ends.length ? Math.min(...ends) : raw.length).toString("utf8");
-  const out: string[] = [];
-  for (const m of head.matchAll(/^([!-9;-~]+)[ \t]*:([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/gm)) {
-    if (m[1]!.toLowerCase() === name) out.push(m[2]!.replace(/\r?\n(?=[ \t])/g, ""));
-  }
-  return out;
-}
-
-/** One entry of an address list: the mailbox's address as written, or null when the entry isn't one mailbox. */
-export interface AddressEntry {
-  address: string | null;
-  /** The entry as the header wrote it, trimmed: what an error names when there is no address. */
-  written: string;
-}
-
-type Token = { kind: "word" | "quoted" | "literal" | "space" | "bad" | "<" | ">" | "," | ";" | ":"; start: number; end: number };
-
-function tokenize(s: string): Token[] {
-  const out: Token[] = [];
-  let i = 0;
-  // Skips a quoted string, comment or domain literal; returns the index after it, or -1 if it never closes.
-  const skip = (open: number, close: string, nests: boolean): number => {
-    let depth = 0;
-    for (let j = open; j < s.length; j++) {
-      const c = s[j]!;
-      if (c === "\\") j++;
-      else if (j > open && c === close && depth === 0) return j + 1;
-      else if (nests && j > open && c === "(") depth++;
-      else if (nests && c === ")") depth--;
-    }
-    return -1;
-  };
-  while (i < s.length) {
-    const c = s[i]!;
-    const start = i;
-    if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === "(") {
-      // Whitespace and comments separate words; neither is part of an address.
-      while (i < s.length) {
-        const d = s[i]!;
-        if (d === " " || d === "\t" || d === "\r" || d === "\n") i++;
-        else if (d === "(") {
-          const end = skip(i, ")", true);
-          if (end < 0) {
-            out.push({ kind: "bad", start, end: s.length });
-            return out;
-          }
-          i = end;
-        } else break;
-      }
-      out.push({ kind: "space", start, end: i });
-    } else if (c === '"' || c === "[") {
-      const end = skip(i, c === '"' ? '"' : "]", false);
-      if (end < 0) {
-        out.push({ kind: "bad", start, end: s.length });
-        return out;
-      }
-      out.push({ kind: c === '"' ? "quoted" : "literal", start, end });
-      i = end;
-    } else if (c === "<" || c === ">" || c === "," || c === ";" || c === ":") {
-      out.push({ kind: c, start, end: i + 1 });
-      i++;
-    } else {
-      while (i < s.length && !/[ \t\r\n("[<>,;:]/.test(s[i]!)) i++;
-      out.push({ kind: "word", start, end: i });
-    }
-  }
-  return out;
-}
-
-/**
- * An RFC 5322 address list (To, Cc, Bcc, From), read strictly. An entry is
- * an address, or a display name followed by an address in angle brackets,
- * with comments and whitespace only around them; a group's members are
- * entries of their own. The address is kept as written. Anything else (two
- * addresses without a comma, text after the angle brackets, an unquoted "@"
- * or ";" in the wrong place, an unclosed quote, bracket or group) is an entry
- * without an address, named as written, so the envelope check refuses it
- * instead of guessing a mailbox.
- */
-export function parseAddressList(value: string): AddressEntry[] {
-  const tokens = tokenize(value);
-  const entries: AddressEntry[] = [];
-  const text = (ts: Token[]) => (ts.length ? value.slice(ts[0]!.start, ts[ts.length - 1]!.end) : "");
-  // A display name (of a mailbox or a group): words and quoted strings, no unquoted "@".
-  const isName = (ts: Token[]) =>
-    ts.every((t) => t.kind === "space" || t.kind === "quoted" || (t.kind === "word" && !value.slice(t.start, t.end).includes("@")));
-
-  let current: Token[] = [];
-  let valid = true;
-  let depth = 0;
-  let group: { start: number } | null = null;
-  const finish = () => {
-    const ts = trimSpace(current);
-    if (ts.length > 0) entries.push({ address: valid ? mailboxOf(ts, value, isName) : null, written: text(ts).trim() });
-    current = [];
-    valid = true;
-    depth = 0;
-  };
-
-  for (const t of tokens) {
-    if (t.kind === "bad") valid = false;
-    if (t.kind === "<") depth++;
-    if (t.kind === ">") depth--;
-    if (t.kind === "," && depth === 0) {
-      finish();
-    } else if (t.kind === ":" && depth === 0 && !group && isName(current)) {
-      // The display name of a group; its members follow, up to the ";".
-      const name = trimSpace(current);
-      group = { start: name.length ? name[0]!.start : t.start };
-      current = [];
-      valid = true;
-    } else if (t.kind === ";" && depth === 0 && group) {
-      finish();
-      group = null;
-    } else {
-      // A ":" or ";" anywhere else makes the entry something other than a mailbox.
-      if (t.kind === ":" || t.kind === ";") valid = false;
-      current.push(t);
-    }
-  }
-  if (group) {
-    // A group that never closes: none of it counts as an address.
-    entries.push({ address: null, written: value.slice(group.start).trim() });
-    current = [];
-  }
-  finish();
-  return entries;
-}
-
-function trimSpace(ts: Token[]): Token[] {
-  let a = 0;
-  let b = ts.length;
-  while (a < b && ts[a]!.kind === "space") a++;
-  while (b > a && ts[b - 1]!.kind === "space") b--;
-  return ts.slice(a, b);
-}
-
-/**
- * The address of one entry (tokens without leading or trailing space): a bare
- * address, or a display name and one address in angle brackets with nothing
- * after them. Null for anything else. The address is one run of words, quoted
- * strings and a domain literal, with no space inside and brackets only around
- * the domain.
- */
-function mailboxOf(ts: Token[], value: string, isName: (ts: Token[]) => boolean): string | null {
-  let parts = ts;
-  const open = ts.findIndex((t) => t.kind === "<");
-  if (open >= 0) {
-    const close = ts.findIndex((t) => t.kind === ">");
-    const angles = ts.filter((t) => t.kind === "<" || t.kind === ">").length;
-    if (close !== ts.length - 1 || angles !== 2 || !isName(ts.slice(0, open))) return null;
-    parts = trimSpace(ts.slice(open + 1, close));
-  }
-  if (parts.length === 0 || parts.some((t) => t.kind !== "word" && t.kind !== "quoted" && t.kind !== "literal")) return null;
-  const address = parts.map((t) => value.slice(t.start, t.end)).join("");
-  if (/[[\]]/.test(address) && !/^[^[\]]+@\[[^[\]]*\]$/.test(address)) return null;
-  return address;
+  if (!isPlainAddress(from.trim())) refuseMailFrom(from);
+  return { from: from.trim(), to: to.map((a) => a.trim()) };
 }
 
 async function resolveEnvelope(
   raw: Buffer,
   envelope: SubmissionCreate["envelope"],
 ): Promise<{ from: string; to: string[] }> {
-  if (envelope?.mailFrom?.email && envelope?.rcptTo?.length) {
+  if (envelope != null) {
+    // A client envelope is used whole (RFC 8621 §7.5): it needs both parts.
+    const invalidEnvelope = (what: string) => new JmapError("invalidProperties", what, { properties: ["envelope"] });
+    if (typeof envelope !== "object" || Array.isArray(envelope)) throw invalidEnvelope("envelope must be an object");
+    const mailFrom = envelope.mailFrom;
+    if (!mailFrom || typeof mailFrom !== "object" || typeof mailFrom.email !== "string") {
+      throw invalidEnvelope("envelope.mailFrom must be an address with an email");
+    }
+    if (!Array.isArray(envelope.rcptTo)) throw invalidEnvelope("envelope.rcptTo must be a list of addresses");
+    if (envelope.rcptTo.length === 0) throw new JmapError("noRecipients", "envelope.rcptTo is empty");
     return checkedEnvelope(
-      String(envelope.mailFrom.email).trim(),
-      envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email.trim() : "")),
+      mailFrom.email,
+      envelope.rcptTo.map((r) => (typeof r?.email === "string" ? r.email : "")),
     );
   }
-  // Spec §7: if no envelope is given, derive from headers - From for
-  // mailFrom, To+Cc+Bcc for rcptTo. Each member of a group is a recipient.
-  // The headers are read here, not by a mail library, so every address is
-  // taken as the message wrote it whatever library version is installed.
+  // RFC 8621 §7.5: without an envelope, mailFrom is the address in the Sender
+  // header field when there is one, otherwise the one in From; rcptTo is the
+  // addresses in To, Cc and Bcc, each member of a group being a recipient.
+  // More than one such field, or more than one address in it, is refused, as
+  // the RFC advises. The headers are read here, not by a mail library, so
+  // every address is taken as the message wrote it whatever library version
+  // is installed.
   const entries = (name: string) => headerValues(raw, name).flatMap(parseAddressList);
-  const fromEntry = entries("from")[0];
-  if (fromEntry && fromEntry.address === null) {
-    throw new JmapError("forbiddenMailFrom", "the sender must be a plain email address");
+  const source = headerValues(raw, "sender").some((v) => v.trim() !== "") ? "sender" : "from";
+  const senders = entries(source);
+  if (headerValues(raw, source).length > 1 || senders.length > 1) {
+    throw new JmapError("invalidEmail", `the message names more than one ${source === "sender" ? "Sender" : "From"} address`);
   }
-  const fromAddr = fromEntry ? fromEntry.address : asEmail(envelope?.mailFrom?.email);
+  const fromEntry = senders[0];
+  if (fromEntry && fromEntry.address === null) refuseMailFrom(fromEntry.written);
+  const fromAddr = fromEntry ? fromEntry.address : null;
   const recipients = ["to", "cc", "bcc"].flatMap(entries);
   // An entry that isn't one plain mailbox is refused, named as the message wrote it.
   const invalid = recipients.filter((e) => e.address === null || !isPlainAddress(e.address));
@@ -431,6 +271,15 @@ export async function emailSubmissionSet(
     try {
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
+      // Whatever envelope is used, the message goes out as stored: a header
+      // block that readers could split differently (and so a Bcc that stays
+      // in it) is refused.
+      if (!readHeaderBlock(raw)) {
+        throw new JmapError(
+          "invalidEmail",
+          "the message's header lines must all end in CRLF, or all in LF, with no other CR and no blank-looking line",
+        );
+      }
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
       const outgoing = gmail ? withFreshMessageId(stripBccHeader(raw)) : stripBccHeader(raw);
       const result = await submit({

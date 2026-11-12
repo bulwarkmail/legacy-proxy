@@ -12,6 +12,7 @@ import { JmapError } from "../../src/jmap/errors.js";
 import { dispatch } from "../../src/jmap/router.js";
 import { registerGmailBackend } from "../../src/gmail/backend.js";
 import { CORE_CAPABILITY, MAIL_CAPABILITY, SUBMISSION_CAPABILITY } from "../../src/jmap/capabilities.js";
+import { headerValues, parseAddressList } from "../../src/mapping/buildMime.js";
 const email = "writer@example.test";
 const caps = [CORE_CAPABILITY, MAIL_CAPABILITY, SUBMISSION_CAPABILITY];
 const profile = { emailAddress: email, historyId: "1", messagesTotal: 0, threadsTotal: 0 };
@@ -555,4 +556,18 @@ it("refuses imports into read-only mailboxes, unknown mailboxes and drafts outsi
   expect(notCreated.draft.description).toMatch(/Drafts mailbox/);
   expect(notCreated.mixed.description).toBe("New mail must be a draft");
   expect(mutate.mock.calls.some((c) => c[0] === "messages/import")).toBe(false);
+});
+it("refuses a draft address that isn't one plain address, and writes names as the same mailbox", async () => {
+  const { mail, save, drafts } = await setup();
+  for (const address of ["team:recipient@example.test", "recipient(x)@example.test", '"r"@example.test']) {
+    const r = (await mail.methods()["Email/set"]!({
+      accountId: mail.accountId,
+      create: { d: { ...draftInput(), to: [{ email: address }] } },
+    })) as any;
+    expect(r.notCreated?.d, address).toMatchObject({ type: "invalidProperties", properties: ["to"] });
+  }
+  expect(drafts.size).toBe(0);
+  await save({ to: [{ name: "Doe, Jörg 🚀", email: "recipient@example.test" }] });
+  const raw = Buffer.from([...drafts.values()][0].message.raw, "base64url");
+  expect(headerValues(raw, "to").flatMap(parseAddressList).map((e) => e.address)).toEqual(["recipient@example.test"]);
 });

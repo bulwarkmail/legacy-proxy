@@ -253,3 +253,36 @@ describe("isPrivateAddress", () => {
     expect(isPrivateAddress(a)).toBe(false),
   );
 });
+
+describe("tunnelled IPv6 forms that embed an IPv4 address", () => {
+  it.each([
+    "2002:a00:5::1", // 6to4 of 10.0.0.5
+    "2002:7f00:1::1", // 6to4 of 127.0.0.1
+    "2002:a9fe:a9fe::", // 6to4 of 169.254.169.254
+    "2001:0:4136:e378:8000:63bf:f5ff:fffa", // Teredo, client 10.0.0.5
+    "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo, client 127.0.0.1
+    "2001:0:a00:5:8000:63bf:a247:27dd", // Teredo, server 10.0.0.5
+    "64:ff9b::7f00:1", // NAT64 of 127.0.0.1
+    "64:ff9b::192.168.1.1", // NAT64, dotted tail
+  ])("treats %s as not public", (a) => {
+    expect(isPrivateAddress(a)).toBe(true);
+  });
+
+  it.each([
+    "2002:5db8:d822::1", // 6to4 of 93.184.216.34
+    "2001:0:4136:e378:8000:63bf:a247:27dd", // Teredo, client 93.184.216.34
+    "64:ff9b::93.184.216.34",
+  ])("treats %s as public", (a) => {
+    expect(isPrivateAddress(a)).toBe(false);
+  });
+
+  it("refuses a push URL whose name resolves to a 6to4 form of a private address", async () => {
+    resolveTo("2002:a00:5::1", "2002:a00:5::1");
+    const res = await pushSubscriptionSet(
+      { create: { c: { deviceClientId: "d", url: "https://tunnel.example.test/x" } } },
+      { account, store, dispatcher: { sendVerification: async () => {}, notifySubscriberChange: () => {} } as never },
+    );
+    expect(res.created).toBeNull();
+    expect(res.notCreated?.c?.type).toBe("invalidProperties");
+  });
+});

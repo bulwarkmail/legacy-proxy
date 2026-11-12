@@ -1,6 +1,13 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { generateScript, writeVacation } from "../../src/sieve/vacation.js";
 import type { SieveClient } from "../../src/sieve/client.js";
+import { vacationSet } from "../../src/jmap/methods/vacation.js";
+import { Store } from "../../src/state/store.js";
+import type { ProviderConfig } from "../../src/util/config.js";
 
 type Token = { t: "id" | "tag" | "str" | "num" | "punct"; v: string };
 
@@ -274,5 +281,97 @@ describe("vacation start and end date", () => {
       type: "invalidProperties",
     });
     expect(written).toHaveLength(3);
+  });
+});
+
+describe("VacationResponse/set", () => {
+  let server: net.Server | null = null;
+  let dir: string | null = null;
+  afterEach(() => {
+    server?.close();
+    server = null;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  /** A ManageSieve server announcing date and relational; it counts sessions and keeps each PUTSCRIPT body. */
+  async function setup() {
+    const seen = { sessions: 0, scripts: [] as string[] };
+    server = net.createServer((sock) => {
+      seen.sessions += 1;
+      sock.on("error", () => {});
+      sock.write(`"IMPLEMENTATION" "test"\r\n"SASL" "PLAIN"\r\n"SIEVE" "fileinto vacation date relational"\r\nOK "ready"\r\n`);
+      let buf = Buffer.alloc(0);
+      let literal = 0;
+      sock.on("data", (d: Buffer) => {
+        buf = Buffer.concat([buf, d]);
+        for (;;) {
+          if (literal > 0) {
+            if (buf.length < literal + 2) return;
+            seen.scripts.push(buf.subarray(0, literal).toString("utf8"));
+            buf = buf.subarray(literal + 2);
+            literal = 0;
+            sock.write("OK\r\n");
+            continue;
+          }
+          const i = buf.indexOf("\r\n");
+          if (i < 0) return;
+          const line = buf.subarray(0, i).toString("utf8");
+          buf = buf.subarray(i + 2);
+          const lit = /^PUTSCRIPT "[^"]*" \{(\d+)\+\}$/.exec(line);
+          if (lit) {
+            literal = Number(lit[1]);
+            continue;
+          }
+          if (line.startsWith("AUTHENTICATE")) continue; // the blob follows on the next line
+          if (line.startsWith("LOGOUT")) {
+            sock.end('OK "bye"\r\n');
+            return;
+          }
+          sock.write("OK\r\n");
+        }
+      });
+    });
+    const port = await new Promise<number>((r) => server!.listen(0, "127.0.0.1", () => r((server!.address() as net.AddressInfo).port)));
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "lproxy-vacation-"));
+    const store = new Store(dir);
+    const account = store.upsertAccount({ slug: "generic:u", kind: "generic", host: "h", username: "u", vault: Buffer.from("x") });
+    const ctx = {
+      account,
+      provider: { imap: { host: "h", port: 993 }, smtp: { host: "h", port: 587 }, sieve: { host: "127.0.0.1", port }, carddav: null, auth: { mech: ["PLAIN"] } } as unknown as ProviderConfig,
+      creds: { mech: "PLAIN" as const, username: "u", password: "fake-password" },
+      store,
+    };
+    const set = (singleton: Record<string, unknown>) => vacationSet({ accountId: String(account.id), update: { singleton } }, ctx);
+    return { seen, set, close: () => store.close() };
+  }
+
+  it.each([
+    ["a start after the end", { fromDate: "2027-01-06T00:00:00Z", toDate: "2026-12-24T00:00:00Z" }, ["fromDate", "toDate"]],
+    ["a start that isn't a date", { fromDate: "next week" }, ["fromDate"]],
+    ["an end past the year 9999", { toDate: "+275760-09-13T00:00:00Z" }, ["toDate"]],
+  ])("answers %s with a SetError for the singleton, before any ManageSieve session", async (_label, dates, properties) => {
+    const { seen, set, close } = await setup();
+    try {
+      const res = (await set({ isEnabled: true, textBody: "Away", ...dates })) as Record<string, unknown>;
+      expect(res.updated).toBeNull();
+      expect(res.notUpdated).toEqual({ singleton: expect.objectContaining({ type: "invalidProperties", properties }) });
+      expect(res.newState).toBe(res.oldState);
+      expect(seen.sessions).toBe(0);
+    } finally {
+      close();
+    }
+  });
+
+  it("still saves good dates, with the date window", async () => {
+    const { seen, set, close } = await setup();
+    try {
+      const res = (await set({ isEnabled: true, textBody: "Away", fromDate: "2026-12-24T00:00:00Z", toDate: "2027-01-06T00:00:00Z" })) as Record<string, unknown>;
+      expect(res.updated).toEqual({ singleton: null });
+      expect(res.newState).not.toBe(res.oldState);
+      expect(seen.scripts[0]).toContain('currentdate :zone "+0000" :value "lt" "date" "2027-01-06"');
+    } finally {
+      close();
+    }
   });
 });

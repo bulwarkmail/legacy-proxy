@@ -36,34 +36,48 @@ for (const [addr, prefix] of [
   ["ff00::", 8],
 ] as const) blocked.addSubnet(addr, prefix, "ipv6");
 
-// NAT64 (RFC 6052): the last 32 bits are an IPv4 address the gateway connects to.
+// IPv6 ranges that carry an IPv4 address the packets end up at:
+// NAT64 (RFC 6052) in the last 32 bits, 6to4 (RFC 3056) in bits 16 to 47,
+// Teredo (RFC 4380) as the server address in bits 32 to 63 and the client
+// address, inverted, in the last 32 bits.
 const nat64 = new net.BlockList();
 nat64.addSubnet("64:ff9b::", 96, "ipv6");
+const sixToFour = new net.BlockList();
+sixToFour.addSubnet("2002::", 16, "ipv6");
+const teredo = new net.BlockList();
+teredo.addSubnet("2001::", 32, "ipv6");
 
 /**
- * True for any address that is not a public unicast one. BlockList also
- * matches the IPv4 rules against IPv4-mapped IPv6 addresses (::ffff:a00:5).
+ * True for any address that is not a public unicast one, including an IPv6
+ * address whose embedded IPv4 address (NAT64, 6to4, Teredo) is not public.
+ * BlockList also matches the IPv4 rules against IPv4-mapped IPv6 addresses
+ * (::ffff:a00:5).
  */
 export function isPrivateAddress(address: string): boolean {
   if (!net.isIP(address)) return true;
   if (net.isIPv6(address)) {
-    if (nat64.check(address, "ipv6")) return isPrivateAddress(ipv4FromNat64(address));
-    return blocked.check(address, "ipv6");
+    const g = ipv6Groups(address);
+    const v4 = (hi: number, lo: number) => [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".");
+    const embedded: string[] = [];
+    if (nat64.check(address, "ipv6")) embedded.push(v4(g[6]!, g[7]!));
+    if (sixToFour.check(address, "ipv6")) embedded.push(v4(g[1]!, g[2]!));
+    if (teredo.check(address, "ipv6")) embedded.push(v4(g[2]!, g[3]!), v4(g[6]! ^ 0xffff, g[7]! ^ 0xffff));
+    return embedded.some(isPrivateAddress) || blocked.check(address, "ipv6");
   }
   return blocked.check(address, "ipv4");
 }
 
-function ipv4FromNat64(address: string): string {
-  // Expand to eight groups and read the last two as four octets; a mixed
-  // form (64:ff9b::10.0.0.5) already ends in the IPv4 address.
+/** The eight 16-bit groups of an IPv6 address, `::` and a dotted IPv4 tail expanded. */
+function ipv6Groups(address: string): number[] {
   const [head = "", tail = ""] = address.toLowerCase().split("::");
   const h = head ? head.split(":") : [];
   const t = tail ? tail.split(":") : [];
-  if (t.length > 0 && t[t.length - 1]!.includes(".")) return t[t.length - 1]!;
-  const groups = [...h, ...Array(8 - h.length - t.length).fill("0"), ...t].map((g) => parseInt(g || "0", 16));
-  const hi = groups[6] ?? 0;
-  const lo = groups[7] ?? 0;
-  return [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".");
+  const last = [h, t].find((part) => part.length > 0 && part[part.length - 1]!.includes("."));
+  if (last) {
+    const octets = last.pop()!.split(".").map(Number);
+    last.push(((octets[0]! << 8) | octets[1]!).toString(16), ((octets[2]! << 8) | octets[3]!).toString(16));
+  }
+  return [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t].map((x) => parseInt(x || "0", 16));
 }
 
 /** Why a push URL was refused. The message is fixed text: it never carries the URL. */
