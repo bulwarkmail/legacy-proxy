@@ -1,10 +1,10 @@
 import type { AccountRow, Store } from "../../state/store.js";
 import type { ProviderConfig } from "../../util/config.js";
 import { encodeCounterState } from "../../state/states.js";
-import { accountNotFound, forbidden } from "../errors.js";
+import { JmapError, accountNotFound, forbidden } from "../errors.js";
 import { SieveClient } from "../../sieve/client.js";
 import type { Credentials } from "../../auth/credentials.js";
-import { readVacation, writeVacation, type VacationProps } from "../../sieve/vacation.js";
+import { generateScript, readVacation, writeVacation, type VacationProps } from "../../sieve/vacation.js";
 import { changesOrCannotCalculate, type ChangesResponse } from "./_shared.js";
 
 function vacationState(store: Store, accountId: number): string {
@@ -90,10 +90,29 @@ export async function vacationSet(
     textBody: next.textBody ?? null,
     htmlBody: next.htmlBody ?? null,
   };
+  // A value the script can't carry (a date that isn't one, a start after the
+  // end) is a SetError for the singleton, found before any ManageSieve session.
+  const refused = (e: unknown) =>
+    e instanceof JmapError && e.type === "invalidProperties"
+      ? { accountId: args.accountId, oldState, newState: oldState, updated: null, notUpdated: { singleton: e.toMethodError() } }
+      : null;
+  try {
+    generateScript(v);
+  } catch (e) {
+    const answer = refused(e);
+    if (answer) return answer;
+    throw e;
+  }
   const c = new SieveClient({ ...ctx.provider.sieve, creds: ctx.creds });
   await c.connect();
   try {
-    await writeVacation(c, v);
+    try {
+      await writeVacation(c, v);
+    } catch (e) {
+      const answer = refused(e);
+      if (answer) return answer;
+      throw e;
+    }
     ctx.store.bumpState(ctx.account.id, "vacation");
     // Write through: we just wrote `v`, so the next read is free. Cache after
     // the bump so the entry carries the new counter.
