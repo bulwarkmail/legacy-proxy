@@ -410,7 +410,9 @@ The counters live in memory, are bounded in size and start from zero when the
 proxy restarts. IPv6 clients are counted per /64. The limits count by client
 address, so behind a reverse proxy set `TRUST_PROXY` (see
 [Configuration](#configuration)): without it every caller has the reverse
-proxy's address and all of them share one budget.
+proxy's address and all of them share one budget. The same goes for a webmail in
+front of the proxy, which checks every user's sign-in from its own server: put
+the webmail server's address in `TRUST_PROXY` too.
 
 ### Provider selection
 
@@ -936,6 +938,20 @@ TRUST_PROXY=172.18.0.0/16
 A reverse proxy on another host: put that host's address in `TRUST_PROXY`, and
 publish port 8080 on the address that host reaches, not on all interfaces (for
 example `"10.0.0.5:8080:8080"` in the compose file, with `TRUST_PROXY=10.0.0.4`).
+
+A webmail in front of the proxy: Bulwark checks every sign-in from its own
+server and names the user's address in `X-Forwarded-For`, so all its users reach
+the proxy from the webmail server's address. Put that address in `TRUST_PROXY`
+as well, next to any reverse proxy, and run the webmail itself behind a reverse
+proxy it trusts, so the address it passes on is the user's. For a webmail on
+10.0.0.7 and a reverse proxy on the proxy's own host:
+
+```bash
+TRUST_PROXY=127.0.0.1,::1,10.0.0.7
+```
+
+Without it, 50 wrong passwords through the webmail within 15 minutes hold every
+sign-in that goes through it, for every user.
 
 Private, loopback and link-local ranges may be given whole (`10.0.0.0/8`,
 `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `127.0.0.0/8`,
