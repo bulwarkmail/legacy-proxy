@@ -1,10 +1,198 @@
 // Build an RFC 5322 / MIME message from a JMAP Email/set create payload.
-// Used by Email/set create (drafts) which APPENDs the result via IMAP.
+// Used by Email/set create (drafts) which APPENDs the result via IMAP, and by
+// the Gmail backend for its drafts.
 //
 // We use nodemailer's MimeNode (already a transitive dep) to handle
 // quoted-printable encoding, header folding, and message id generation.
+//
+// The address headers are written from checked parts and read back with the
+// strict address-list parser below (also used to derive a submission's
+// envelope), so the message names exactly the mailboxes the client gave.
 
+import { domainToASCII } from "node:url";
 import MimeNode from "nodemailer/lib/mime-node/index.js";
+import { JmapError } from "../jmap/errors.js";
+
+// Whitespace, control characters and everything an address parser reads as
+// syntax: list separators, angle brackets, quotes, escapes, comments and the
+// colon of a group. U+FFFD stands for header bytes that weren't UTF-8.
+const NOT_PLAIN = /[\s,;:<>"\\()\u0000-\u001f\u007f-\u009f\ufffd]/u;
+
+/**
+ * A plain address: one "@" between a non-empty local part and a non-empty
+ * domain, and none of the characters in NOT_PLAIN. nodemailer parses every
+ * envelope string again before it writes MAIL FROM and RCPT TO; for a plain
+ * address every parser agrees on the mailbox, so what reaches the SMTP server
+ * is the address the user was shown, one entry being one recipient.
+ */
+export function isPlainAddress(s: string): boolean {
+  const at = s.indexOf("@");
+  return at > 0 && at === s.lastIndexOf("@") && at < s.length - 1 && !NOT_PLAIN.test(s);
+}
+
+/** Every value of a header field (name in lower case), unfolded, from the message's header block. */
+export function headerValues(raw: Buffer, name: string): string[] {
+  const crlf = raw.indexOf("\r\n\r\n");
+  const lf = raw.indexOf("\n\n");
+  const ends = [crlf, lf].filter((i) => i >= 0);
+  const head = raw.subarray(0, ends.length ? Math.min(...ends) : raw.length).toString("utf8");
+  const out: string[] = [];
+  for (const m of head.matchAll(/^([!-9;-~]+)[ \t]*:([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/gm)) {
+    if (m[1]!.toLowerCase() === name) out.push(m[2]!.replace(/\r?\n(?=[ \t])/g, ""));
+  }
+  return out;
+}
+
+/** One entry of an address list: the mailbox's address as written, or null when the entry isn't one mailbox. */
+export interface AddressEntry {
+  address: string | null;
+  /** The entry as the header wrote it, trimmed: what an error names when there is no address. */
+  written: string;
+}
+
+type Token = { kind: "word" | "quoted" | "literal" | "space" | "bad" | "<" | ">" | "," | ";" | ":"; start: number; end: number };
+
+function tokenize(s: string): Token[] {
+  const out: Token[] = [];
+  let i = 0;
+  // Skips a quoted string, comment or domain literal; returns the index after it, or -1 if it never closes.
+  const skip = (open: number, close: string, nests: boolean): number => {
+    let depth = 0;
+    for (let j = open; j < s.length; j++) {
+      const c = s[j]!;
+      if (c === "\\") j++;
+      else if (j > open && c === close && depth === 0) return j + 1;
+      else if (nests && j > open && c === "(") depth++;
+      else if (nests && c === ")") depth--;
+    }
+    return -1;
+  };
+  while (i < s.length) {
+    const c = s[i]!;
+    const start = i;
+    if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === "(") {
+      // Whitespace and comments separate words; neither is part of an address.
+      while (i < s.length) {
+        const d = s[i]!;
+        if (d === " " || d === "\t" || d === "\r" || d === "\n") i++;
+        else if (d === "(") {
+          const end = skip(i, ")", true);
+          if (end < 0) {
+            out.push({ kind: "bad", start, end: s.length });
+            return out;
+          }
+          i = end;
+        } else break;
+      }
+      out.push({ kind: "space", start, end: i });
+    } else if (c === '"' || c === "[") {
+      const end = skip(i, c === '"' ? '"' : "]", false);
+      if (end < 0) {
+        out.push({ kind: "bad", start, end: s.length });
+        return out;
+      }
+      out.push({ kind: c === '"' ? "quoted" : "literal", start, end });
+      i = end;
+    } else if (c === "<" || c === ">" || c === "," || c === ";" || c === ":") {
+      out.push({ kind: c, start, end: i + 1 });
+      i++;
+    } else {
+      while (i < s.length && !/[ \t\r\n("[<>,;:]/.test(s[i]!)) i++;
+      out.push({ kind: "word", start, end: i });
+    }
+  }
+  return out;
+}
+
+/**
+ * An RFC 5322 address list (To, Cc, Bcc, From), read strictly. An entry is
+ * an address, or a display name followed by an address in angle brackets,
+ * with comments and whitespace only around them; a group's members are
+ * entries of their own. The address is kept as written. Anything else (two
+ * addresses without a comma, text after the angle brackets, an unquoted "@"
+ * or ";" in the wrong place, an unclosed quote, bracket or group) is an entry
+ * without an address, named as written, so the envelope check refuses it
+ * instead of guessing a mailbox.
+ */
+export function parseAddressList(value: string): AddressEntry[] {
+  const tokens = tokenize(value);
+  const entries: AddressEntry[] = [];
+  const text = (ts: Token[]) => (ts.length ? value.slice(ts[0]!.start, ts[ts.length - 1]!.end) : "");
+  // A display name (of a mailbox or a group): words and quoted strings, no unquoted "@".
+  const isName = (ts: Token[]) =>
+    ts.every((t) => t.kind === "space" || t.kind === "quoted" || (t.kind === "word" && !value.slice(t.start, t.end).includes("@")));
+
+  let current: Token[] = [];
+  let valid = true;
+  let depth = 0;
+  let group: { start: number } | null = null;
+  const finish = () => {
+    const ts = trimSpace(current);
+    if (ts.length > 0) entries.push({ address: valid ? mailboxOf(ts, value, isName) : null, written: text(ts).trim() });
+    current = [];
+    valid = true;
+    depth = 0;
+  };
+
+  for (const t of tokens) {
+    if (t.kind === "bad") valid = false;
+    if (t.kind === "<") depth++;
+    if (t.kind === ">") depth--;
+    if (t.kind === "," && depth === 0) {
+      finish();
+    } else if (t.kind === ":" && depth === 0 && !group && isName(current)) {
+      // The display name of a group; its members follow, up to the ";".
+      const name = trimSpace(current);
+      group = { start: name.length ? name[0]!.start : t.start };
+      current = [];
+      valid = true;
+    } else if (t.kind === ";" && depth === 0 && group) {
+      finish();
+      group = null;
+    } else {
+      // A ":" or ";" anywhere else makes the entry something other than a mailbox.
+      if (t.kind === ":" || t.kind === ";") valid = false;
+      current.push(t);
+    }
+  }
+  if (group) {
+    // A group that never closes: none of it counts as an address.
+    entries.push({ address: null, written: value.slice(group.start).trim() });
+    current = [];
+  }
+  finish();
+  return entries;
+}
+
+function trimSpace(ts: Token[]): Token[] {
+  let a = 0;
+  let b = ts.length;
+  while (a < b && ts[a]!.kind === "space") a++;
+  while (b > a && ts[b - 1]!.kind === "space") b--;
+  return ts.slice(a, b);
+}
+
+/**
+ * The address of one entry (tokens without leading or trailing space): a bare
+ * address, or a display name and one address in angle brackets with nothing
+ * after them. Null for anything else. The address is one run of words, quoted
+ * strings and a domain literal, with no space inside and brackets only around
+ * the domain.
+ */
+function mailboxOf(ts: Token[], value: string, isName: (ts: Token[]) => boolean): string | null {
+  let parts = ts;
+  const open = ts.findIndex((t) => t.kind === "<");
+  if (open >= 0) {
+    const close = ts.findIndex((t) => t.kind === ">");
+    const angles = ts.filter((t) => t.kind === "<" || t.kind === ">").length;
+    if (close !== ts.length - 1 || angles !== 2 || !isName(ts.slice(0, open))) return null;
+    parts = trimSpace(ts.slice(open + 1, close));
+  }
+  if (parts.length === 0 || parts.some((t) => t.kind !== "word" && t.kind !== "quoted" && t.kind !== "literal")) return null;
+  const address = parts.map((t) => value.slice(t.start, t.end)).join("");
+  if (/[[\]]/.test(address) && !/^[^[\]]+@\[[^[\]]*\]$/.test(address)) return null;
+  return address;
+}
 
 interface JmapAddress {
   name?: string | null;
@@ -59,19 +247,80 @@ export interface JmapEmailCreate {
   headers?: { name: string; value: string }[] | null;
 }
 
-function jmapAddrToHeader(list: JmapAddress[] | null | undefined): string | null {
-  if (!list || list.length === 0) return null;
-  return list
-    .filter((a) => a.email)
-    .map((a) => {
-      const name = a.name?.trim();
-      const email = a.email!;
-      if (!name) return email;
-      // Quote names that contain RFC 5322 specials
-      const escaped = /[",;:<>@()\[\]\\]/.test(name) ? `"${name.replace(/(["\\])/g, "\\$1")}"` : name;
-      return `${escaped} <${email}>`;
-    })
-    .join(", ");
+// The JMAP address properties and the header each one is written to.
+const ADDRESS_FIELDS = [
+  ["from", "From"],
+  ["sender", "Sender"],
+  ["to", "To"],
+  ["cc", "Cc"],
+  ["bcc", "Bcc"],
+  ["replyTo", "Reply-To"],
+] as const;
+
+interface CheckedAddress {
+  name: string;
+  address: string;
+}
+
+function refusedAddress(property: string, address: string): JmapError {
+  return new JmapError("invalidProperties", `${property}: ${JSON.stringify(address)} is not one plain email address`, {
+    properties: [property],
+  });
+}
+
+/**
+ * One address property, checked before anything reaches MimeNode: every
+ * entry with an email must be one plain address (isPlainAddress); an entry
+ * without an email names no mailbox and is left out. Anything else refuses
+ * the create with invalidProperties naming the property and the address as
+ * given.
+ */
+function checkedAddresses(property: string, list: unknown): CheckedAddress[] {
+  if (list == null) return [];
+  if (!Array.isArray(list)) throw new JmapError("invalidProperties", `${property} must be a list of addresses`, { properties: [property] });
+  const out: CheckedAddress[] = [];
+  for (const entry of list as (JmapAddress | null)[]) {
+    const email = entry?.email;
+    if (email == null || email === "") continue;
+    if (typeof email !== "string") throw refusedAddress(property, String(email));
+    const address = email.trim();
+    if (!address) continue;
+    if (!isPlainAddress(address)) throw refusedAddress(property, email);
+    out.push({ name: typeof entry?.name === "string" ? entry.name.trim() : "", address });
+  }
+  return out;
+}
+
+/** The same mailbox: the local part exactly, the domain without regard to case or IDN form. */
+function sameMailbox(a: string, b: string): boolean {
+  const split = (s: string): [string, string] => {
+    const at = s.lastIndexOf("@");
+    return [s.slice(0, at), s.slice(at + 1)];
+  };
+  const domain = (d: string) => domainToASCII(d.toLowerCase()) || d.toLowerCase();
+  const [la, da] = split(a);
+  const [lb, db] = split(b);
+  return la === lb && domain(da) === domain(db);
+}
+
+/**
+ * Reads each address header of the built message back with the strict parser
+ * and refuses the create unless it names exactly the mailboxes it was given,
+ * in order, and no others. MimeNode lower-cases and punycodes the domain; any
+ * other difference, whatever the nodemailer version does, is refused.
+ */
+function verifyAddressHeaders(message: Buffer, given: Map<string, CheckedAddress[]>): void {
+  for (const [property, header] of ADDRESS_FIELDS) {
+    const expected = given.get(property) ?? [];
+    const read = headerValues(message, header.toLowerCase()).flatMap(parseAddressList);
+    for (let i = 0; i < Math.max(expected.length, read.length); i++) {
+      const want = expected[i];
+      const got = read[i];
+      if (!want || !got || got.address === null || !sameMailbox(got.address, want.address)) {
+        throw refusedAddress(property, want?.address ?? got?.written ?? "");
+      }
+    }
+  }
 }
 
 // Walk a bodyStructure tree into a nodemailer MimeNode. Multipart parts
@@ -177,6 +426,10 @@ export async function buildRfc822(
   getBlob: BlobLookup = () => null,
   keepBcc = false,
 ): Promise<Buffer> {
+  // Every address is checked before MimeNode sees any of it.
+  const addresses = new Map<string, CheckedAddress[]>();
+  for (const [property] of ADDRESS_FIELDS) addresses.set(property, checkedAddresses(property, create[property]));
+
   // Choose a root structure based on the inputs we got. Prefer `bodyStructure`
   // (RFC 8621 §4.5.1 form 1) when present — it's the canonical source of
   // truth and drives multipart/alternative + attachments. Otherwise fall back
@@ -203,15 +456,14 @@ export async function buildRfc822(
 
   root.keepBcc = keepBcc;
 
-  const setIfPresent = (header: string, value: string | null): void => {
-    if (value) root.setHeader(header, value);
-  };
-  setIfPresent("From", jmapAddrToHeader(create.from));
-  setIfPresent("Sender", jmapAddrToHeader(create.sender));
-  setIfPresent("To", jmapAddrToHeader(create.to));
-  setIfPresent("Cc", jmapAddrToHeader(create.cc));
-  setIfPresent("Bcc", jmapAddrToHeader(create.bcc));
-  setIfPresent("Reply-To", jmapAddrToHeader(create.replyTo));
+  // Address objects, not "name <address>" strings: MimeNode then writes the
+  // checked address (domain lower-cased and punycoded) and encodes the name,
+  // without parsing anything again. (The type package declares strings only;
+  // MimeNode takes {name, address} objects for address headers.)
+  for (const [property, header] of ADDRESS_FIELDS) {
+    const list = addresses.get(property)!;
+    if (list.length) root.setHeader(header, list.map((a) => ({ name: a.name, address: a.address })) as unknown as string[]);
+  }
   if (create.subject) root.setHeader("Subject", create.subject);
 
   const date = create.sentAt ? new Date(create.sentAt) : new Date();
@@ -257,10 +509,12 @@ export async function buildRfc822(
   // sent to. Submission strips it again before handing the message to SMTP.
   root.keepBcc = true;
 
-  return await new Promise<Buffer>((resolve, reject) => {
+  const message = await new Promise<Buffer>((resolve, reject) => {
     root.build((err: Error | null, message: Buffer) => {
       if (err) reject(err);
       else resolve(message);
     });
   });
+  verifyAddressHeaders(message, addresses);
+  return message;
 }

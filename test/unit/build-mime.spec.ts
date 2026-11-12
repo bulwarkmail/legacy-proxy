@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { buildRfc822, MissingBlobError } from "../../src/mapping/buildMime.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import MimeNode from "nodemailer/lib/mime-node/index.js";
+import { buildRfc822, headerValues, MissingBlobError, parseAddressList } from "../../src/mapping/buildMime.js";
+import type { JmapError } from "../../src/jmap/errors.js";
 
 const PNG = Buffer.from("89504e470d0a1a0a", "hex");
 const blobs: Record<string, { body: Buffer; ctype: string }> = {
@@ -51,5 +53,83 @@ describe("buildRfc822 attachments (RFC 8621 §4.6)", () => {
       ...base,
       attachments: [{ blobId: "Ugone", type: "image/png", disposition: "inline", cid: "x" }],
     }, "example.org", getBlob)).rejects.toBeInstanceOf(MissingBlobError);
+  });
+});
+
+describe("buildRfc822 addresses", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const build = (extra: Record<string, unknown>) =>
+    buildRfc822({ from: [{ name: "Alice", email: "alice@corp.example" }], subject: "s", textBody: [{ partId: "1" }], bodyValues: { "1": { value: "hi" } }, ...extra }, "corp.example");
+  const addresses = (raw: Buffer, header: string) =>
+    headerValues(raw, header).flatMap(parseAddressList).map((e) => e.address);
+
+  it.each([
+    ["to", '"attacker@evil.example x"@corp.example'],
+    ["to", "<attacker@evil.example>@corp.example"],
+    ["to", "john smith@corp.example"],
+    ["to", "a@corp.example <b@evil.example>"],
+    ["cc", "a@corp.example, b@evil.example"],
+    ["bcc", "team:a@corp.example"],
+    ["replyTo", "a(b)@corp.example"],
+    ["sender", '"x"@corp.example'],
+    ["from", "alice@corp.example\r\nBcc: b@evil.example"],
+    ["to", "bob"],
+  ])("refuses %s %j, naming the property and the address", async (property, email) => {
+    const err = await build({ [property]: [{ name: "N", email }] }).catch((e: unknown) => e);
+    // What the client gets as the SetError.
+    const setError = (err as JmapError).toMethodError();
+    expect(setError).toMatchObject({ type: "invalidProperties", properties: [property] });
+    expect(setError.description).toContain(JSON.stringify(email));
+  });
+
+  it("refuses an address property that isn't a list, and an email that isn't text", async () => {
+    const setError = (p: Promise<unknown>) => p.catch((e: unknown) => (e as JmapError).toMethodError());
+    expect(await setError(build({ to: "a@corp.example" }))).toMatchObject({ type: "invalidProperties", properties: ["to"] });
+    expect(await setError(build({ cc: [{ email: 42 }] }))).toMatchObject({ type: "invalidProperties", properties: ["cc"] });
+  });
+
+  it.each([
+    ["a comma", "Doe, Jane"],
+    ["quotes and a backslash", 'a "b" \\ c'],
+    ["non-ASCII and an @", "Jörg Müller @ Work"],
+    ["what looks like an encoded word", "=?utf-8?Q?a=40evil.example?="],
+    ["an emoji and a comma", "Team 🚀, Ops"],
+    ["a line break", "a\r\nBcc: b@evil.example"],
+    ["80 non-ASCII letters", "Ä".repeat(80)],
+  ])("writes a display name with %s and keeps the mailbox", async (_label, name) => {
+    const raw = await build({ to: [{ name, email: "jane@corp.example" }] });
+    expect(addresses(raw, "to")).toEqual(["jane@corp.example"]);
+    expect(addresses(raw, "bcc")).toEqual([]);
+  });
+
+  it("writes every address field, in order, as given", async () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({ name: `Person ${i}`, email: `p${i}@corp.example` }));
+    const raw = await build({
+      sender: [{ email: "alice@corp.example" }],
+      to: many,
+      cc: [{ email: "c@corp.example" }],
+      bcc: [{ email: "h@corp.example" }],
+      replyTo: [{ name: "R", email: "r@corp.example" }],
+    });
+    expect(addresses(raw, "from")).toEqual(["alice@corp.example"]);
+    expect(addresses(raw, "sender")).toEqual(["alice@corp.example"]);
+    expect(addresses(raw, "to")).toEqual(many.map((m) => m.email));
+    expect(addresses(raw, "cc")).toEqual(["c@corp.example"]);
+    expect(addresses(raw, "bcc")).toEqual(["h@corp.example"]);
+    expect(addresses(raw, "reply-to")).toEqual(["r@corp.example"]);
+  });
+
+  it("takes the domain in any case or IDN form as the same mailbox", async () => {
+    const raw = await build({ to: [{ email: "Bob@Bücher.Example" }, { email: "a@[192.0.2.1]" }] });
+    expect(addresses(raw, "to")).toEqual(["Bob@xn--bcher-kva.example", "a@[192.0.2.1]"]);
+  });
+
+  it("refuses a message whose address header doesn't read back as what it was given", async () => {
+    // Stands for any MimeNode version that writes an address differently.
+    vi.spyOn(MimeNode.prototype as unknown as { _convertAddresses: (a: unknown) => string }, "_convertAddresses").mockReturnValue(
+      "other@evil.example",
+    );
+    await expect(build({ to: [{ email: "jane@corp.example" }] })).rejects.toMatchObject({ type: "invalidProperties" });
   });
 });

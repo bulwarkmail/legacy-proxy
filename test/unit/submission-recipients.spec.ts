@@ -15,6 +15,7 @@ import { Store, type AccountRow } from "../../src/state/store.js";
 import { sealCredentials } from "../../src/auth/credentials.js";
 import { emailSubmissionGet, emailSubmissionSet, isPlainAddress } from "../../src/jmap/methods/submission.js";
 import { encodeEmailId } from "../../src/mapping/ids.js";
+import { buildRfc822 } from "../../src/mapping/buildMime.js";
 import type { AppConfig } from "../../src/util/config.js";
 
 const smtpLines: string[] = [];
@@ -286,6 +287,51 @@ describe("the envelope derived from the headers", () => {
       expect(res.notCreated?.s?.type, from).toBe("forbiddenMailFrom");
     }
     expect(smtpLines).toEqual([]);
+  });
+});
+
+describe("a message built from JSON addresses and sent without an envelope", () => {
+  type Addr = { name?: string; email: string };
+  // The draft Email/set create makes from the client's JSON addresses.
+  const jsonDraft = (to: Addr[]) =>
+    buildRfc822(
+      {
+        from: [{ name: "Alice", email: "alice@corp.example" }],
+        to,
+        subject: "s",
+        bodyValues: { "1": { value: "hi" } },
+        textBody: [{ partId: "1" }],
+      },
+      "corp.example",
+    );
+  const sent = () => rcpts().map((l) => l.replace(/^RCPT TO:<(.*?)>.*$/i, "$1"));
+
+  it.each<[string, Addr, string]>([
+    ["quoted local part holding an address", { email: '"attacker@evil.example x"@corp.example' }, "attacker@evil.example"],
+    ["angle brackets in the local part", { email: "<attacker@evil.example>@corp.example" }, "attacker@evil.example"],
+    ["space in the local part", { email: "john smith@corp.example" }, "smith@corp.example"],
+    ["a name and an address in the email field", { email: "a@corp.example <b@evil.example>" }, "b@evil.example"],
+  ])("%s: is sent to that address or refused, never to another mailbox", async (_label, addr, elsewhere) => {
+    try {
+      draft = await jsonDraft([addr]);
+    } catch {
+      return; // refused at Email/set: fine
+    }
+    const res = await send();
+    expect(sent(), `To header written: ${String(draft).split(/\r?\n/).find((l) => /^To:/i.test(l))}`).not.toContain(elsewhere);
+    if (!res.notCreated) expect(sent()).toEqual([addr.email]);
+  });
+
+  it.each<[string, Addr[], string[]]>([
+    ["a name with a comma", [{ name: "Doe, Jane", email: "jane@corp.example" }], ["jane@corp.example"]],
+    ["non-ASCII names with an @ and an emoji", [{ name: "Jörg @ Work", email: "joerg@corp.example" }, { name: "Team 🚀", email: "ops@corp.example" }], ["joerg@corp.example", "ops@corp.example"]],
+    ["a name that looks like an encoded address", [{ name: "=?utf-8?Q?a=40evil.example?=", email: "b@corp.example" }], ["b@corp.example"]],
+    ["an internationalised domain", [{ email: "bob@bücher.example" }], ["bob@xn--bcher-kva.example"]],
+  ])("%s: is sent to exactly the addresses given", async (_label, to, expected) => {
+    draft = await jsonDraft(to);
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(sent()).toEqual(expected);
   });
 });
 
