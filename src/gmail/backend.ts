@@ -29,9 +29,12 @@ import { GmailPush } from "./push.js";
 const GMAIL_MAX_OBJECTS_IN_GET = 100;
 const GMAIL_MAX_OBJECTS_IN_SET = 20;
 
-/** Bridge passwords (`gmap_`), sign-in tokens (`gmat_`) and refresh tokens (`gmrt_`). */
+/**
+ * Bridge passwords (`gmap_`), sign-in tokens (`gmat_`) and refresh tokens
+ * (`gmrt_`), also with white space in front, as a pasted one may have.
+ */
 export function isBridgeSecret(secret: string | undefined): boolean {
-  return typeof secret === "string" && /^gm(?:ap|at|rt)_/.test(secret);
+  return typeof secret === "string" && /^gm(?:ap|at|rt)_/.test(secret.trimStart());
 }
 
 /**
