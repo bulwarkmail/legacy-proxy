@@ -525,9 +525,14 @@ account whose Gmail access is already stored signs in without a consent screen. 
 other account is sent to Google's consent once, and its grant is stored as by
 **Connect Gmail**. The client then gets a single-use code, valid for a minute, and
 exchanges it at `/oauth/token` for a bridge access token (`gmat_…`, one hour, Bearer
-only) and a refresh token (`gmrt_…`). The refresh token lasts while it keeps being
-used, up to 180 days between uses. `/oauth/revoke` ends a refresh token and the
-access tokens under it. Only hashes of these tokens are stored. They are separate
+only) and a refresh token (`gmrt_…`). Every refresh answers with a new refresh token,
+which the client stores in place of the old one. The token that was used still answers
+for 60 seconds after its first use, so two tabs refreshing together both carry on.
+Presented again after that, it is refused and every token of that sign-in stops
+working (a copy of it is in use); the account's other sign-ins carry on. A refresh
+token unused for 180 days lapses, and a sign-in ends 365 days after it was made,
+however often it was refreshed: the user then signs in again. `/oauth/revoke` with a
+refresh token ends its sign-in. Only hashes of these tokens are stored. They are separate
 from the bridge password: every signed-in client has its own and signing in again
 revokes nothing. Issuing a new bridge password and disconnecting the account delete
 them all. Google tokens never

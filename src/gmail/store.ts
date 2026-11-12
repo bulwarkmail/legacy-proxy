@@ -74,7 +74,7 @@ export class GmailStore {
       CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, issued_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS gmail_token (
         hash TEXT PRIMARY KEY, email TEXT NOT NULL, client TEXT NOT NULL, kind TEXT NOT NULL,
-        parent TEXT, expires INTEGER NOT NULL
+        parent TEXT, expires INTEGER NOT NULL, family TEXT, family_since INTEGER, used_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS gmail_token_email ON gmail_token(email);
       CREATE INDEX IF NOT EXISTS gmail_token_parent ON gmail_token(parent);
@@ -108,6 +108,22 @@ export class GmailStore {
       .all() as { name: string }[];
     if (!passwordColumns.some((c) => c.name === "issued_at"))
       this.db.exec("ALTER TABLE gmail_password ADD COLUMN issued_at INTEGER NOT NULL DEFAULT 0");
+    // Every token belongs to a sign-in (its family: the hash of the sign-in's
+    // first refresh token) made at family_since. A refresh token issued before
+    // sign-ins were recorded is a sign-in of its own, dated now, with the
+    // access tokens under it.
+    const tokenColumns = this.db
+      .prepare("PRAGMA table_info(gmail_token)")
+      .all() as { name: string }[];
+    for (const [column, type] of [["family", "TEXT"], ["family_since", "INTEGER"], ["used_at", "INTEGER"]] as const)
+      if (!tokenColumns.some((c) => c.name === column))
+        this.db.exec(`ALTER TABLE gmail_token ADD COLUMN ${column} ${type}`);
+    this.db
+      .prepare(
+        "UPDATE gmail_token SET family=CASE WHEN kind='refresh' THEN hash ELSE COALESCE(parent,hash) END, family_since=? WHERE family IS NULL",
+      )
+      .run(Date.now());
+    this.db.exec("CREATE INDEX IF NOT EXISTS gmail_token_family ON gmail_token(family)");
     const columns = this.db
       .prepare("PRAGMA table_info(gmail_cache)")
       .all() as { name: string; type: string }[];
@@ -224,37 +240,58 @@ export class GmailStore {
       : null;
   }
   /**
-   * Signs a client in for an account: a refresh token that lives as long as it keeps being used, and a
-   * short-lived access token under it. Only hashes are stored, so a copy of the database signs nobody in.
+   * Signs a client in for an account: a refresh token and a short-lived access token under it, the first
+   * tokens of a new sign-in. Only hashes are stored, so a copy of the database signs nobody in.
    */
   issueTokens(email: string, client: string, now = Date.now()): IssuedTokens {
     if (!this.hasConnection(email)) throw new Error("Account is not connected");
-    const refresh = TOKEN_PREFIX.refresh + crypto.randomBytes(32).toString("base64url");
-    this.db
-      .prepare("INSERT INTO gmail_token(hash,email,client,kind,parent,expires) VALUES (?,?,?,'refresh',NULL,?)")
-      .run(tokenHash(refresh), email, client, now + REFRESH_TOKEN_TTL);
-    return { ...this.accessUnder(tokenHash(refresh), email, client, now), refreshToken: refresh };
+    return this.db.transaction(() => this.tokensFor({ email, client, family: null, since: now }, now))();
   }
-  /** A new access token for a refresh token of this client; the refresh token's lifetime starts over. */
+  /**
+   * Exchanges a refresh token of this client for a new refresh token and a new access token of the same
+   * sign-in. The token that was used stays good for {@link REFRESH_REUSE_GRACE} after its first use, so two
+   * tabs that refresh at the same moment both get an answer. Presented again later, it was copied: it is
+   * refused and every token of its sign-in stops working. A sign-in ends {@link SIGN_IN_TTL} after it was
+   * made, however often it was refreshed.
+   */
   refreshTokens(refreshToken: string, client: string, now = Date.now()): IssuedTokens | null {
     if (!TOKEN_RE.refresh.test(refreshToken)) return null;
     const hash = tokenHash(refreshToken);
-    const row = this.db
-      .prepare("SELECT email,client,expires FROM gmail_token WHERE hash=? AND kind='refresh'")
-      .get(hash) as { email: string; client: string; expires: number } | undefined;
-    if (!row || row.client !== client || row.expires <= now || !this.hasConnection(row.email)) return null;
-    this.db.prepare("UPDATE gmail_token SET expires=? WHERE hash=?").run(now + REFRESH_TOKEN_TTL, hash);
-    return { ...this.accessUnder(hash, row.email, client, now), refreshToken };
-  }
-  private accessUnder(parent: string, email: string, client: string, now: number) {
-    const access = TOKEN_PREFIX.access + crypto.randomBytes(32).toString("base64url");
-    this.db.transaction(() => {
-      this.db.prepare("DELETE FROM gmail_token WHERE expires<=?").run(now);
-      this.db
-        .prepare("INSERT INTO gmail_token(hash,email,client,kind,parent,expires) VALUES (?,?,?,'access',?,?)")
-        .run(tokenHash(access), email, client, parent, now + ACCESS_TOKEN_TTL);
+    return this.db.transaction((): IssuedTokens | null => {
+      const row = this.db
+        .prepare("SELECT email,client,expires,family,family_since,used_at FROM gmail_token WHERE hash=? AND kind='refresh'")
+        .get(hash) as
+        | { email: string; client: string; expires: number; family: string | null; family_since: number | null; used_at: number | null }
+        | undefined;
+      if (!row || row.client !== client || row.expires <= now) return null;
+      const family = row.family ?? hash;
+      if (row.used_at !== null && now - row.used_at > REFRESH_REUSE_GRACE) {
+        this.db.prepare("DELETE FROM gmail_token WHERE family=?").run(family);
+        return null;
+      }
+      const since = row.family_since ?? now;
+      if (now >= since + SIGN_IN_TTL || !this.hasConnection(row.email)) return null;
+      if (row.used_at === null) this.db.prepare("UPDATE gmail_token SET used_at=? WHERE hash=?").run(now, hash);
+      return this.tokensFor({ email: row.email, client, family, since }, now);
     })();
-    return { email, accessToken: access, expiresIn: ACCESS_TOKEN_TTL / 1000 };
+  }
+  /** A new refresh token and an access token under it, in sign-in `family` (a new one when null) made at `since`. Callers hold a transaction. */
+  private tokensFor(
+    s: { email: string; client: string; family: string | null; since: number },
+    now: number,
+  ): IssuedTokens {
+    const end = s.since + SIGN_IN_TTL;
+    const refresh = TOKEN_PREFIX.refresh + crypto.randomBytes(32).toString("base64url");
+    const access = TOKEN_PREFIX.access + crypto.randomBytes(32).toString("base64url");
+    const refreshHash = tokenHash(refresh);
+    const family = s.family ?? refreshHash;
+    const insert = this.db.prepare(
+      "INSERT INTO gmail_token(hash,email,client,kind,parent,expires,family,family_since) VALUES (?,?,?,?,?,?,?,?)",
+    );
+    this.db.prepare("DELETE FROM gmail_token WHERE expires<=?").run(now);
+    insert.run(refreshHash, s.email, s.client, "refresh", null, Math.min(now + REFRESH_TOKEN_TTL, end), family, s.since);
+    insert.run(tokenHash(access), s.email, s.client, "access", refreshHash, Math.min(now + ACCESS_TOKEN_TTL, end), family, s.since);
+    return { email: s.email, accessToken: access, expiresIn: ACCESS_TOKEN_TTL / 1000, refreshToken: refresh };
   }
   /** The account an access token signs in, while it is valid. */
   authenticateToken(accessToken: string, now = Date.now()): string | null {
@@ -264,15 +301,17 @@ export class GmailStore {
       .get(tokenHash(accessToken)) as { email: string; expires: number } | undefined;
     return row && row.expires > now ? row.email : null;
   }
-  /** Revokes a token issued to this client; revoking a refresh token also ends the access tokens under it. */
+  /** Revokes a token issued to this client; revoking a refresh token ends its whole sign-in. */
   revokeToken(token: string, client: string): void {
     const hash = tokenHash(token);
     this.db.transaction(() => {
-      const row = this.db.prepare("SELECT client FROM gmail_token WHERE hash=?").get(hash) as
-        | { client: string }
+      const row = this.db.prepare("SELECT client,kind,family FROM gmail_token WHERE hash=?").get(hash) as
+        | { client: string; kind: string; family: string | null }
         | undefined;
       if (!row || row.client !== client) return;
-      this.db.prepare("DELETE FROM gmail_token WHERE hash=? OR parent=?").run(hash, hash);
+      if (row.kind === "refresh")
+        this.db.prepare("DELETE FROM gmail_token WHERE hash=? OR parent=? OR family=?").run(hash, hash, row.family ?? hash);
+      else this.db.prepare("DELETE FROM gmail_token WHERE hash=?").run(hash);
     })();
   }
   async updateCredentials(
@@ -988,9 +1027,14 @@ export class GmailStore {
     this.db.close();
   }
 }
-/** Access tokens are short-lived; a refresh token lasts while it keeps being used. */
+/** Access tokens are short-lived; a refresh token is exchanged for a new one on every use. */
 const ACCESS_TOKEN_TTL = 3600_000;
+/** How long a refresh token stays good when it is not used. */
 const REFRESH_TOKEN_TTL = 180 * 86400_000;
+/** How long a refresh token still answers after its first use, for a second tab that was a moment late. */
+export const REFRESH_REUSE_GRACE = 60_000;
+/** A sign-in ends this long after it was made, however often it was refreshed. */
+export const SIGN_IN_TTL = 365 * 86400_000;
 const TOKEN_PREFIX = { access: "gmat_", refresh: "gmrt_" } as const;
 const TOKEN_RE = { access: /^gmat_[A-Za-z0-9_-]{43}$/, refresh: /^gmrt_[A-Za-z0-9_-]{43}$/ };
 const tokenHash = (token: string) => crypto.createHash("sha256").update(token).digest("hex");
