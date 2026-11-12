@@ -22,7 +22,9 @@ try {
     } finally {
       fs.closeSync(fd);
     }
-    console.log("Bridge credentials saved to the requested private file. Previous bridge password revoked.");
+    console.log(
+      "Bridge credentials saved to the requested private file. Previous bridge password revoked; every device signed in through the bridge was signed out and its push subscriptions deleted.",
+    );
   } finally {
     store.close();
   }

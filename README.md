@@ -499,7 +499,11 @@ Self-service onboarding: the first successful consent for an account issues a br
 password, and the result page shows server, username and password exactly once,
 bound to that browser and expiring after two minutes. Reconnecting later (for example
 after a revoked grant or Testing's seven-day expiry) keeps the existing password
-unless "Issue a new bridge password" is ticked, which replaces it. A pending consent
+unless "Issue a new bridge password" is ticked, which replaces it and signs every
+device out: the previous password stops working, and in the same step every sign-in
+token and every push subscription of the account are deleted and its open event
+streams end. That is what to do after losing a device; each device then signs in again
+and sets push up again. A pending consent
 lives in an encrypted, browser-bound cookie rather than in server memory, so abandoned
 or scripted starts cannot block other users. `npm run gmail:password` remains
 available for operators.
@@ -524,8 +528,9 @@ exchanges it at `/oauth/token` for a bridge access token (`gmat_…`, one hour, 
 only) and a refresh token (`gmrt_…`). The refresh token lasts while it keeps being
 used, up to 180 days between uses. `/oauth/revoke` ends a refresh token and the
 access tokens under it. Only hashes of these tokens are stored. They are separate
-from the bridge password: every signed-in client has its own, signing in again
-revokes nothing, and disconnecting the account deletes them all. Google tokens never
+from the bridge password: every signed-in client has its own and signing in again
+revokes nothing. Issuing a new bridge password and disconnecting the account delete
+them all. Google tokens never
 leave the bridge.
 
 In Bulwark, give the bridge's server entry an OAuth client ID equal to the
@@ -569,7 +574,10 @@ npm run gmail:password -- tester@gmail.com /private/path/jmap-login.json
 
 The file contains `serverUrl`, `username` and `password` for the client's custom
 JMAP account. Only a SHA-256 hash of this randomly generated password is stored.
-Reissuing it immediately revokes the previous bridge password. Basic auth with
+Reissuing it immediately revokes the previous bridge password and signs every device
+out the same way as the page does: sign-in tokens and push subscriptions of the account
+are deleted. Event streams the running server holds open for the account end within
+five minutes. Basic auth with
 that username/password or Bearer auth with the bridge password is supported;
 Google tokens stay on the server. Only passwords starting with `gmap_` select the
 Gmail API backend; any other password for the same address, such as an IMAP App

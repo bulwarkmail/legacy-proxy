@@ -71,7 +71,7 @@ export class GmailStore {
         created_at INTEGER NOT NULL, failures INTEGER NOT NULL DEFAULT 0, email_push TEXT
       );
       CREATE INDEX IF NOT EXISTS gmail_push_sub_email ON gmail_push_sub(email);
-      CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE);
+      CREATE TABLE IF NOT EXISTS gmail_password (email TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, issued_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS gmail_token (
         hash TEXT PRIMARY KEY, email TEXT NOT NULL, client TEXT NOT NULL, kind TEXT NOT NULL,
         parent TEXT, expires INTEGER NOT NULL
@@ -102,6 +102,12 @@ export class GmailStore {
       .all() as { name: string }[];
     if (!subColumns.some((c) => c.name === "email_push"))
       this.db.exec("ALTER TABLE gmail_push_sub ADD COLUMN email_push TEXT");
+    // A password issued before issued_at existed counts as issued at 0.
+    const passwordColumns = this.db
+      .prepare("PRAGMA table_info(gmail_password)")
+      .all() as { name: string }[];
+    if (!passwordColumns.some((c) => c.name === "issued_at"))
+      this.db.exec("ALTER TABLE gmail_password ADD COLUMN issued_at INTEGER NOT NULL DEFAULT 0");
     const columns = this.db
       .prepare("PRAGMA table_info(gmail_cache)")
       .all() as { name: string; type: string }[];
@@ -156,15 +162,51 @@ export class GmailStore {
       .prepare("SELECT 1 FROM gmail_connection WHERE email=?")
       .get(email);
   }
-  issuePassword(email: string): string {
+  /**
+   * Issues a new bridge password for the account and signs every device out:
+   * in the same transaction the previous password stops working and the
+   * account's sign-in tokens and push subscriptions are deleted. Sign-out
+   * listeners are told afterwards, so open event streams of the account end.
+   */
+  issuePassword(email: string, now = Date.now()): string {
     if (!this.hasConnection(email)) throw new Error("Account is not connected");
     const password = "gmap_" + crypto.randomBytes(32).toString("base64url");
-    this.db
-      .prepare(
-        "INSERT INTO gmail_password(email,hash) VALUES (?,?) ON CONFLICT(email) DO UPDATE SET hash=excluded.hash",
-      )
-      .run(email, crypto.createHash("sha256").update(password).digest("hex"));
+    // Never the same issue time twice, so a stream opened under the previous
+    // password always counts as older.
+    const issuedAt = Math.max(now, this.passwordIssuedAt(email) + 1);
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          "INSERT INTO gmail_password(email,hash,issued_at) VALUES (?,?,?) ON CONFLICT(email) DO UPDATE SET hash=excluded.hash,issued_at=excluded.issued_at",
+        )
+        .run(email, crypto.createHash("sha256").update(password).digest("hex"), issuedAt);
+      this.db.prepare("DELETE FROM gmail_token WHERE email=?").run(email);
+      this.db.prepare("DELETE FROM gmail_push_sub WHERE email=?").run(email);
+    })();
+    for (const listener of this.signOutListeners) listener(email);
     return password;
+  }
+  /**
+   * When the account's current bridge password was issued (epoch ms): 0 for a
+   * password issued before this was recorded, or when it has none. Anything
+   * opened before it belongs to devices that were signed out.
+   */
+  passwordIssuedAt(email: string): number {
+    return (
+      (
+        this.db
+          .prepare("SELECT issued_at FROM gmail_password WHERE email=?")
+          .get(email) as { issued_at: number } | undefined
+      )?.issued_at ?? 0
+    );
+  }
+  private readonly signOutListeners = new Set<(email: string) => void>();
+  /** Told after a new bridge password signed every device of an account out. Returns a function that stops telling it. */
+  onSignOut(listener: (email: string) => void): () => void {
+    this.signOutListeners.add(listener);
+    return () => {
+      this.signOutListeners.delete(listener);
+    };
   }
   hasPassword(email: string): boolean {
     return !!this.db

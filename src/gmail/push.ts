@@ -47,7 +47,20 @@ export class GmailPush {
     },
     private readonly log: FastifyBaseLogger,
     private readonly verifier: IdTokenVerifier = new OAuth2Client(),
-  ) {}
+  ) {
+    this.stopSignOut = store.onSignOut((email) => this.endSignedOutStreams(email));
+  }
+  private readonly stopSignOut: () => void;
+
+  /**
+   * Ends the account's streams opened before its current bridge password was
+   * issued: a new password signs every device out. One issued by another
+   * process (the gmail:password command) is caught by the recovery poll.
+   */
+  private endSignedOutStreams(email: string): void {
+    const issuedAt = this.store.hasConnection(email) ? this.store.passwordIssuedAt(email) : Infinity;
+    this.hub.closeWhere(this.row(email).id, (s) => s.gen < issuedAt);
+  }
 
   /** SSE stream for one Gmail account. Wire format identical to the legacy hub (RFC 8620 §7.3). */
   addStream(
@@ -62,7 +75,8 @@ export class GmailPush {
       if (n <= 0) this.streams.delete(email);
       else this.streams.set(email, n);
     });
-    this.hub.add(this.row(email), reply, origin, opts);
+    // The stream belongs to the password issued last and ends when another is.
+    this.hub.add(this.row(email), reply, origin, { ...opts, session: { gen: this.store.passwordIssuedAt(email) } });
   }
 
   /** Pub/Sub push endpoint. Requests are authenticated before anything is read; the hint is persisted before the 204 acknowledgement. */
@@ -226,7 +240,10 @@ export class GmailPush {
       }
     };
     const recover = async () => {
-      for (const email of this.streams.keys()) await this.sync(email);
+      for (const email of [...this.streams.keys()]) {
+        this.endSignedOutStreams(email);
+        await this.sync(email);
+      }
     };
     void renew();
     this.timers.push(
@@ -240,6 +257,7 @@ export class GmailPush {
     for (const t of this.timers) t.unref();
   }
   stop(): void {
+    this.stopSignOut();
     for (const t of this.timers) clearInterval(t);
     for (const t of this.pending.values()) clearTimeout(t);
     this.pending.clear();
