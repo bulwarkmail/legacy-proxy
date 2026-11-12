@@ -81,9 +81,10 @@ const app = Fastify({
   loggerInstance: log,
   bodyLimit: cfg.limits.maxSizeRequest,
   disableRequestLogging: false,
-  // Behind a reverse proxy the socket address is the proxy's; TRUST_PROXY lets
-  // `req.ip` be the client's, which the login limits count by.
-  trustProxy: cfg.trustProxy,
+  // Behind a reverse proxy the socket address is the proxy's; TRUST_PROXY names
+  // the proxy by address or range, so `req.ip` is the client it forwarded,
+  // which the login limits count by.
+  trustProxy: cfg.trustProxy.length > 0 ? cfg.trustProxy : false,
   // The download URL carries the attachment's file name as a path segment.
   // Fastify's default cap of 100 characters answers longer ones with a 404,
   // which a client shows as an empty attached message; percent-encoding

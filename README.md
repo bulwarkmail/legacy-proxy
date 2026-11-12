@@ -203,7 +203,9 @@ docker compose -f compose.prod.yml up -d
 ```
 
 `curl http://localhost:8080/healthz` returns `{"ok":true}` once the server is
-up. Clients connect via `http://localhost:8080/.well-known/jmap`.
+up. Clients connect via `http://localhost:8080/.well-known/jmap`. The compose
+files publish port 8080 on `127.0.0.1` only; other machines reach the proxy
+through a reverse proxy (see [TLS](#tls)).
 
 ### Build from source
 
@@ -771,8 +773,16 @@ The proxy only speaks plain HTTP. Put Caddy, Traefik, or nginx in front of it
 and set `PUBLIC_URL` to whatever URL clients see. The Session resource bakes
 URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 `eventSourceUrl`, so a wrong value silently breaks every client. Set
-`TRUST_PROXY` too (usually `1`), so the [login limits](#login-limits) count by
+`TRUST_PROXY` to the reverse proxy's address or network too (see
+[Configuration](#configuration)), so the [login limits](#login-limits) count by
 the client's address and not the reverse proxy's.
+
+With a reverse proxy in front, port 8080 should not be reachable from anywhere
+else: a caller that bypasses the reverse proxy skips its TLS. The compose files
+publish it on `127.0.0.1` only, which is enough for a reverse proxy on the same
+host; one in another container reaches the proxy over their shared Docker
+network and needs no published port at all. Publish it on all interfaces
+(`"8080:8080"`) only when nothing is in front.
 
 ## Configuration
 
@@ -796,7 +806,7 @@ the client's address and not the reverse proxy's.
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks and plain `http` (IMAP backend) |
-| `TRUST_PROXY`              | unset                              | client address from `X-Forwarded-For`; see below     |
+| `TRUST_PROXY`              | unset                              | reverse proxy addresses or ranges; see below         |
 
 The limits the Session resource advertises are the ones the proxy enforces:
 
@@ -819,24 +829,48 @@ The limits the Session resource advertises are the ones the proxy enforces:
 The Gmail backend advertises and enforces its own object limits (100 per get,
 20 per set).
 
-`TRUST_PROXY` decides which reverse proxies may name the client's address in
-`X-Forwarded-For`, which the [login limits](#login-limits) count by:
+`TRUST_PROXY` names the reverse proxies whose `X-Forwarded-For` entries the
+proxy believes, as a comma-separated list of IP addresses and CIDR ranges. The
+[login limits](#login-limits) count by the client address this gives:
 
-- Unset (or `false`): the socket's address is the client's. Behind a reverse
+- Unset (or empty): the socket's address is the client's. Behind a reverse
   proxy that is the proxy's address, so everyone behind it shares one budget:
   ten wrong passwords from anyone hold that user name for everyone, and 50 hold
   every login. Docker's userland proxy (Docker Desktop, published IPv6 ports)
   hides client addresses the same way.
-- A number: trust that many proxy hops in front of the proxy. Caddy, Traefik
-  and nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
-  append the address they saw to whatever the client sent; `TRUST_PROXY=1`
-  takes that last entry, the one your proxy wrote. This is the right value for
-  one reverse proxy; use `2` for two in a row (a CDN in front of nginx, say).
-- A comma-separated list of addresses or CIDR ranges: trust those proxies.
-- `true`: trust every entry and take the leftmost. The leftmost entry is the one
-  the client wrote itself when the reverse proxy appends, so every request could
-  name its own address and the limits would count nothing. Do not use `true`
-  behind an appending reverse proxy.
+- The reverse proxy's own address or network: a request that arrives from one
+  of them is counted by the address that proxy appended to `X-Forwarded-For`
+  (Caddy and Traefik do this by default, nginx with
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`). A request
+  from any other address is counted by its own address, whatever header it
+  sends.
+
+A reverse proxy on the same host, with the proxy listening on loopback
+(`LISTEN_HOST=127.0.0.1`, or the compose files' `127.0.0.1` port):
+
+```bash
+TRUST_PROXY=127.0.0.1,::1
+```
+
+A reverse proxy in front of the container: requests reach the container from
+its Docker network, whether the reverse proxy is another container on that
+network or runs on the host and uses the published port (Docker forwards those
+from the network's gateway). Trust that network's range, which
+`docker network inspect <network> --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'`
+prints (compose names the network after the folder: `legacy-proxy_default` in
+the quickstart):
+
+```bash
+TRUST_PROXY=172.18.0.0/16
+```
+
+Anything else stops the proxy at start with a message that says what to write
+instead: a hop count such as `1` (the proxy couldn't tell the reverse proxy
+from a caller that reaches port 8080 directly and writes its own header),
+`true` or a `/0` range (they trust every address), `false` (leave the setting
+unset instead), a host name, or an empty entry. If you set `TRUST_PROXY=1` or
+`TRUST_PROXY=true` before, replace it with the reverse proxy's address or
+network when you upgrade.
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.

@@ -1,6 +1,7 @@
 // Behind a reverse proxy every caller arrives from the proxy's address. With
-// TRUST_PROXY set, the login limits count by the address the reverse proxy
-// names in X-Forwarded-For instead.
+// TRUST_PROXY naming that proxy by address, the login limits count by the
+// address it puts in X-Forwarded-For instead; a caller that reaches the port
+// directly is counted by its own address, whatever it writes in the header.
 
 import fs from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -12,7 +13,8 @@ let app: FastifyInstance;
 let dir: string;
 beforeAll(async () => {
   imap = await startFakeImap({ "carol@test.local": "right-password" });
-  process.env.TRUST_PROXY = "1";
+  // The reverse proxy on the same host, and one on a container network.
+  process.env.TRUST_PROXY = "127.0.0.1, 10.4.0.0/16";
   ({ app, dir } = await bootProxy(imap));
 }, 60_000);
 afterAll(async () => {
@@ -60,5 +62,21 @@ describe("TRUST_PROXY", () => {
     const before = imap.failedLogins;
     expect((await login("203.0.113.2", "wrong")).statusCode).toBe(401);
     expect(imap.failedLogins - before).toBe(1);
+  });
+
+  it("counts a caller that reaches the port directly by its own address, whatever it forwards", async () => {
+    imap.users["eve@test.local"] = "right-password";
+    const direct = (forwarded: string, password: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/login",
+        remoteAddress: "198.51.100.9",
+        headers: { "x-forwarded-for": forwarded },
+        payload: { username: "eve@test.local", password },
+      });
+    for (let i = 0; i < 10; i++) expect((await direct(`203.0.113.${50 + i}`, `wrong-${i}`)).statusCode).toBe(401);
+    const before = imap.failedLogins;
+    expect((await direct("203.0.113.99", "wrong")).statusCode).toBe(429);
+    expect(imap.failedLogins).toBe(before);
   });
 });
