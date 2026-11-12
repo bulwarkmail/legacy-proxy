@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
+import type { LoginLimiter } from "../auth/loginLimit.js";
 import { redirectAllowed, type GmailConfig } from "./config.js";
 
 interface Connection {
@@ -80,6 +81,12 @@ export async function registerGmailRoutes(
     store?: { issuePassword(email: string): string; hasPassword?(email: string): boolean };
     /** With registered clients (config.oauthClients), the bridge signs users in to them: see /oauth/authorize. */
     tokens?: Tokens;
+    /**
+     * Counts refused /oauth/token requests per client address, in the budget
+     * for failed lookups of bridge secrets; past it they get 429. The address
+     * is `req.ip`: the socket's, or with TRUST_PROXY the forwarded client's.
+     */
+    logins?: Pick<LoginLimiter, "noteFailedLookup">;
   },
 ): Promise<void> {
   const { config, connection, store, tokens } = options;
@@ -306,8 +313,18 @@ export async function registerGmailRoutes(
       const body = (req.body ?? {}) as Record<string, unknown>;
       const param = (name: string) => (typeof body[name] === "string" ? (body[name] as string) : "");
       reply.header("Pragma", "no-cache");
+      // A code or token that is looked up and not found counts for the
+      // client's address, like a failed bridge login; a valid one is served
+      // whatever the count.
+      const refuse = (status: 400 | 401, error: string) => {
+        const held = options.logins?.noteFailedLookup(req.ip);
+        if (held && !held.ok) {
+          return reply.header("Retry-After", String(held.retryAfterSec)).code(429).send({ error: "too many failed logins" });
+        }
+        return reply.code(status).send({ error });
+      };
       const client = clients.get(param("client_id"));
-      if (!client) return reply.code(401).send({ error: "invalid_client" });
+      if (!client) return refuse(401, "invalid_client");
       let result: IssuedTokens | null = null;
       if (param("grant_type") === "authorization_code") {
         const code = param("code");
@@ -332,7 +349,7 @@ export async function registerGmailRoutes(
       } else {
         return reply.code(400).send({ error: "unsupported_grant_type" });
       }
-      if (!result) return reply.code(400).send({ error: "invalid_grant" });
+      if (!result) return refuse(400, "invalid_grant");
       return reply.send({
         access_token: result.accessToken,
         token_type: "Bearer",

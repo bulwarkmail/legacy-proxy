@@ -124,7 +124,7 @@ app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.sche
 if (gmailConfig && gmailStore) {
   const connection = new GmailConnection(gmailConfig, gmailStore);
   registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection, gmailHooks, undefined, logins);
-  await app.register(registerGmailRoutes, { config: gmailConfig, connection, store: gmailStore, tokens: gmailStore });
+  await app.register(registerGmailRoutes, { config: gmailConfig, connection, store: gmailStore, tokens: gmailStore, logins });
   app.addHook("onClose", async () => gmailStore.close());
 }
 

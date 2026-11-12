@@ -398,7 +398,10 @@ Every login the proxy makes at the mail server for a caller without a session
   have a budget of their own: the first 50 from one address within 15 minutes
   are answered `401`, further ones `429` with `Retry-After` until the oldest is
   15 minutes old. They never hold mail logins from that address, and a valid
-  bridge login is never held.
+  bridge login is never held. Requests the bridge's `/oauth/token` refuses (an
+  unknown client id, or a code or refresh token that doesn't work) count in the
+  same budget: past it they are answered `429` with `Retry-After` instead of
+  `400` or `401`. A valid code or refresh token is still served.
 
 The counters live in memory, are bounded in size and start from zero when the
 proxy restarts. IPv6 clients are counted per /64. The limits count by client
