@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileFilter, UnsupportedFilter } from "../../src/imap/search.js";
+import { compileFilter } from "../../src/imap/search.js";
 
 describe("Email/query filter compiler", () => {
   it("compiles a leaf condition", () => {
@@ -32,7 +32,7 @@ describe("Email/query filter compiler", () => {
         operator: "AND",
         conditions: [{ from: "alice@example.com" }, { hasKeyword: "$flagged" }],
       }),
-    ).toEqual({ from: "alice@example.com", keyword: "\\Flagged" });
+    ).toEqual({ from: "alice@example.com", flagged: true });
   });
   it("compiles OR", () => {
     const r = compileFilter({
@@ -41,8 +41,10 @@ describe("Email/query filter compiler", () => {
     }) as { or: unknown[] };
     expect(r.or).toHaveLength(2);
   });
-  it("rejects hasAttachment when backend lacks support", () => {
-    expect(() => compileFilter({ hasAttachment: true })).toThrow(UnsupportedFilter);
+  it("leaves hasAttachment to Email/query's post-filter on plain IMAP", () => {
+    // IMAP SEARCH has no attachment criterion; emailQuery checks bodyStructure instead.
+    expect(compileFilter({ subject: "a", hasAttachment: true })).toEqual({ subject: "a" });
+    expect(compileFilter({ hasAttachment: true }, { dialect: "gmail" })).toEqual({ gmraw: "has:attachment" });
   });
   it("routes Gmail text through X-GM-RAW", () => {
     expect(compileFilter({ text: "tax 2024" }, { dialect: "gmail" })).toEqual({
