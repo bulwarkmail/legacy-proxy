@@ -27,6 +27,7 @@ import { EventSourceHub } from "./jmap/eventsource.js";
 import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
 import { LoginLimiter } from "./auth/loginLimit.js";
 import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
+import { BasicLoginCache } from "./auth/basicCache.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -780,14 +781,20 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
   },
 );
 
-// Cache of validated Basic-auth credentials → account. Keyed by sha256 of the
-// raw header so we never log or persist plaintext. TTL keeps memory bounded.
-const basicAuthCache = new Map<string, { accountId: number; gen: number; tag: string; expires: number }>();
-const BASIC_TTL_MS = 5 * 60_000;
-// Basic logins in progress, by header and client address: requests that
-// arrive together from one address with one header share one login at the
-// mail server.
+// Validated Basic logins, by the credential tag of the decoded user name and
+// password (see auth/basicCache.ts): five minutes valid, then kept a day as a
+// sign that a client re-validating them signed in before. Bounded in size.
+const basicCache = new BasicLoginCache();
+// Basic logins in progress. A re-validation (credentials with a lapsed entry)
+// is shared by every request with the same credentials, from any address: the
+// hold on each address is checked before joining. A first login is shared
+// only by requests from the same address.
 const basicLogins = new Map<string, Promise<AuthOutcome>>();
+// Re-validations running per account. A few at once cover the devices of one
+// account; more are answered 503 with Retry-After, so one account can't fill
+// the login slots kept for re-validations.
+const revalidations = new Map<number, number>();
+const MAX_REVALIDATIONS_PER_ACCOUNT = 3;
 
 type AccountRow = import("./state/store.js").AccountRow;
 type AuthOutcome =
@@ -838,26 +845,40 @@ async function authn(req: {
     const held = logins.check(req.ip, username);
     if (held && !held.ok) return held;
 
-    const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
-    const cached = basicAuthCache.get(cacheKey);
-    if (cached && cached.expires > Date.now()) {
+    // The same credentials give the same key however the header spells them.
+    const tag = credentialTag(cfg.vaultKey, { mech: "PLAIN", username, password });
+    const cached = basicCache.valid(tag);
+    if (cached) {
       const before = store.getAccountById(cached.accountId);
       const held = before ? await holdForCheck(before, cached.tag) : null;
       if (held) return held;
       const account = store.getAccountById(cached.accountId);
-      // A header validated under an older credential generation is asked again.
+      // A login validated under an older credential generation is asked again.
       if (account && generationValid(cached.gen, cached.tag, account.cred_gen, account.cred_rotated_by)) {
         return { ok: true, account };
       }
-      basicAuthCache.delete(cacheKey);
+      basicCache.delete(tag);
     }
     // An entry left over from a validation that lapsed: this login re-validates
     // a signed-in client and takes a slot of the queue for those.
-    const known = basicAuthCache.has(cacheKey);
-    const runningKey = `${cacheKey}\n${req.ip}`;
+    const known = basicCache.lapsed(tag);
+    const runningKey = known ? tag : `${tag}\n${req.ip}`;
     let running = basicLogins.get(runningKey);
     if (!running) {
-      running = basicLogin(username, password, cacheKey, req.ip, known).finally(() => basicLogins.delete(runningKey));
+      if (known) {
+        const inFlight = revalidations.get(known.accountId) ?? 0;
+        if (inFlight >= MAX_REVALIDATIONS_PER_ACCOUNT) {
+          return { ok: false, status: 503, retryAfterSec: 1, error: "too many logins in progress" };
+        }
+        revalidations.set(known.accountId, inFlight + 1);
+      }
+      running = basicLogin(username, password, tag, req.ip, !!known).finally(() => {
+        basicLogins.delete(runningKey);
+        if (!known) return;
+        const left = (revalidations.get(known.accountId) ?? 1) - 1;
+        if (left > 0) revalidations.set(known.accountId, left);
+        else revalidations.delete(known.accountId);
+      });
       basicLogins.set(runningKey, running);
     }
     return running;
@@ -866,10 +887,11 @@ async function authn(req: {
   return UNAUTHORIZED;
 }
 
+/** A Basic login at the mail server; `tag` is the credentials' tag, which is also their cache key. */
 async function basicLogin(
   username: string,
   password: string,
-  cacheKey: string,
+  tag: string,
   ip: string,
   known: boolean,
 ): Promise<AuthOutcome> {
@@ -893,14 +915,13 @@ async function basicLogin(
   } catch (e) {
     const refused = isCredentialRefusal(e);
     gate.finish(refused ? "refused" : "error");
-    // A header the server refused is no longer one the proxy knows.
-    if (refused) basicAuthCache.delete(cacheKey);
+    // Credentials the server refused are no longer ones the proxy knows.
+    if (refused) basicCache.delete(tag);
     log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
     return UNAUTHORIZED;
   }
   gate.finish("accepted");
   const slug = `${providerName}:${username}`;
-  const tag = credentialTag(cfg.vaultKey, creds);
   const signedIn = await recordSignIn({ slug, providerName, provider, creds, ip, tag });
   if (!signedIn.ok) {
     probe.logout().catch(() => {});
@@ -910,7 +931,7 @@ async function basicLogin(
   // Keep the validated connection: the JMAP request this auth is for will
   // need one immediately.
   pool.adopt(account, probe);
-  basicAuthCache.set(cacheKey, { accountId: account.id, gen: account.cred_gen, tag, expires: Date.now() + BASIC_TTL_MS });
+  basicCache.set(tag, { accountId: account.id, gen: account.cred_gen, tag });
   return { ok: true, account };
 }
 

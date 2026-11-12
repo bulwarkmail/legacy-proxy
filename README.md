@@ -323,6 +323,12 @@ The first request in a 5 minute window costs one IMAP probe; subsequent
 requests reuse the cached account. Useful for compliance suite runs and
 servers that already terminate auth at a reverse proxy.
 
+The cache is kept in memory and keyed by the decoded user name and password,
+so every spelling of one header shares an entry. A lapsed entry is kept for a
+day as a sign that a client re-validating it signed in before (see
+[Login limits](#login-limits)), then forgotten; the cache holds at most 10,000
+entries and drops the ones validated longest ago first.
+
 A `401` offers Basic (`WWW-Authenticate: Basic realm="legacy-proxy", Bearer`)
 only to callers that are not browsers. A request that carries an `Origin`
 header or any `Sec-Fetch-*` header (a page's fetch, or a browser opening the
@@ -353,7 +359,10 @@ Every login the proxy makes at the mail server for a caller without a session
   answered `503`. A Basic client re-validating a login the proxy validated
   before (every 5 minutes, when its cache entry lapses) uses 20 slots of its
   own, so first logins from unknown callers cannot keep signed-in clients
-  waiting.
+  waiting. One re-validation runs per user name and password at a time, and
+  requests with the same credentials from any address wait for it; one account
+  re-validates at most 3 logins at once, and a fourth is answered `503` with
+  `Retry-After`.
 - A held pair gets `429` for HTTP Basic even when the header is in the 5-minute
   cache or a login for it is still running; the same header from another
   address is a different pair and keeps working. A Basic client that shares an
