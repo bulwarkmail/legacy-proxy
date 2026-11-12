@@ -7,7 +7,7 @@ import { withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
-import { headerValues, isPlainAddress, parseAddressList } from "../../mapping/buildMime.js";
+import { headerValues, isPlainAddress, parseAddressList, readHeaderBlock } from "../../mapping/buildMime.js";
 import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, notFound } from "../errors.js";
 import { applyEmailUpdate } from "./email.js";
 import { SIDE_RESPONSES, type MethodCall } from "../router.js";
@@ -126,27 +126,23 @@ export function messageIdOf(raw: Buffer): string | null {
   return m ? m[1]!.replace(/\s+/g, " ").trim() : null;
 }
 
-// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop it (and
-// its folded continuation lines) from the header block, leaving the body
-// byte-for-byte untouched.
+// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop every Bcc
+// field (with its folded continuation lines) from the header block, read by
+// the same reader that derives the envelope, leaving everything else
+// byte-for-byte untouched. A message whose header block can't be read is
+// refused before this (see emailSubmissionSet) and is returned unchanged.
 export function stripBccHeader(raw: Buffer): Buffer {
-  const text = raw.toString("binary");
-  const m = /\r?\n\r?\n/.exec(text);
-  // Include the last header line's own line break so every line we keep is
-  // terminated and the blank separator line follows untouched.
-  const headerEnd = m ? m.index + (text[m.index] === "\r" ? 2 : 1) : text.length;
-  const lines = text.slice(0, headerEnd).split(/(?<=\n)/);
-  const kept: string[] = [];
-  let dropping = false;
-  for (const line of lines) {
-    if (/^[ \t]/.test(line)) {
-      if (!dropping) kept.push(line);
-      continue;
-    }
-    dropping = /^bcc[ \t]*:/i.test(line);
-    if (!dropping) kept.push(line);
+  const fields = readHeaderBlock(raw);
+  const bcc = (fields ?? []).filter((f) => f.name === "bcc");
+  if (bcc.length === 0) return raw;
+  const kept: Buffer[] = [];
+  let pos = 0;
+  for (const f of bcc) {
+    kept.push(raw.subarray(pos, f.start));
+    pos = f.end;
   }
-  return Buffer.from(kept.join("") + text.slice(headerEnd), "binary");
+  kept.push(raw.subarray(pos));
+  return Buffer.concat(kept);
 }
 
 // Gmail keeps one message per Message-ID, and the copy its SMTP server files in
@@ -253,6 +249,15 @@ export async function emailSubmissionSet(
     try {
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
+      // Whatever envelope is used, the message goes out as stored: a header
+      // block that readers could split differently (and so a Bcc that stays
+      // in it) is refused.
+      if (!readHeaderBlock(raw)) {
+        throw new JmapError(
+          "invalidEmail",
+          "the message's header lines must all end in CRLF, or all in LF, with no other CR and no blank-looking line",
+        );
+      }
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
       const outgoing = gmail ? withFreshMessageId(stripBccHeader(raw)) : stripBccHeader(raw);
       const result = await submit({

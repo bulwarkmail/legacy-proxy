@@ -30,17 +30,65 @@ export function isPlainAddress(s: string): boolean {
   return at > 0 && at === s.lastIndexOf("@") && at < s.length - 1 && !NOT_PLAIN.test(s);
 }
 
-/** Every value of a header field (name in lower case), unfolded, from the message's header block. */
-export function headerValues(raw: Buffer, name: string): string[] {
-  const crlf = raw.indexOf("\r\n\r\n");
-  const lf = raw.indexOf("\n\n");
-  const ends = [crlf, lf].filter((i) => i >= 0);
-  const head = raw.subarray(0, ends.length ? Math.min(...ends) : raw.length).toString("utf8");
-  const out: string[] = [];
-  for (const m of head.matchAll(/^([!-9;-~]+)[ \t]*:([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/gm)) {
-    if (m[1]!.toLowerCase() === name) out.push(m[2]!.replace(/\r?\n(?=[ \t])/g, ""));
+/** One header field: its name in lower case, its value unfolded, and the bytes its lines take in the message. */
+export interface HeaderField {
+  name: string;
+  value: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * The header block of a raw message, read one way for everything that looks
+ * at it (deriving a submission's envelope, stripping Bcc, checking a built
+ * message). Lines end in CRLF, or all of them in LF (a message saved on a
+ * Unix system). Null when readers could disagree about where a line or the
+ * block ends: a bare CR, CRLF and LF mixed, a line of only whitespace, or a
+ * line that is neither a field nor the continuation of one.
+ */
+export function readHeaderBlock(raw: Buffer): HeaderField[] | null {
+  // latin1 keeps one character per byte, so string offsets are byte offsets.
+  const text = raw.toString("latin1");
+  const fields: HeaderField[] = [];
+  let current: { name: string; parts: string[]; start: number; end: number } | null = null;
+  let crlf = false;
+  let lf = false;
+  const close = () => {
+    if (current) fields.push({ name: current.name, value: Buffer.from(current.parts.join(""), "latin1").toString("utf8"), start: current.start, end: current.end });
+    current = null;
+  };
+  let pos = 0;
+  while (pos < text.length) {
+    const nl = text.indexOf("\n", pos);
+    const next = nl < 0 ? text.length : nl + 1;
+    let line = text.slice(pos, nl < 0 ? text.length : nl);
+    if (nl >= 0) {
+      if (line.endsWith("\r")) {
+        line = line.slice(0, -1);
+        crlf = true;
+      } else lf = true;
+    }
+    if (line.includes("\r")) return null;
+    if (line === "") break; // the empty line before the body
+    if (line[0] === " " || line[0] === "\t") {
+      if (!current || line.trim() === "") return null;
+      current.parts.push(line);
+      current.end = next;
+    } else {
+      const m = /^([!-9;-~]+)[ \t]*:/.exec(line);
+      if (!m) return null;
+      close();
+      current = { name: m[1]!.toLowerCase(), parts: [line.slice(m[0].length)], start: pos, end: next };
+    }
+    pos = next;
   }
-  return out;
+  close();
+  return crlf && lf ? null : fields;
+}
+
+/** Every value of a header field (name in lower case), unfolded; none when the header block can't be read. */
+export function headerValues(raw: Buffer, name: string): string[] {
+  return (readHeaderBlock(raw) ?? []).filter((f) => f.name === name).map((f) => f.value);
 }
 
 /** One entry of an address list: the mailbox's address as written, or null when the entry isn't one mailbox. */
@@ -310,9 +358,11 @@ function sameMailbox(a: string, b: string): boolean {
  * other difference, whatever the nodemailer version does, is refused.
  */
 function verifyAddressHeaders(message: Buffer, given: Map<string, CheckedAddress[]>): void {
+  const block = readHeaderBlock(message);
+  if (!block) throw new JmapError("invalidProperties", "the message built from these properties has an unreadable header block");
   for (const [property, header] of ADDRESS_FIELDS) {
     const expected = given.get(property) ?? [];
-    const read = headerValues(message, header.toLowerCase()).flatMap(parseAddressList);
+    const read = block.filter((f) => f.name === header.toLowerCase()).flatMap((f) => parseAddressList(f.value));
     for (let i = 0; i < Math.max(expected.length, read.length); i++) {
       const want = expected[i];
       const got = read[i];

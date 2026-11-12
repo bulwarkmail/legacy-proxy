@@ -11,6 +11,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
 import { Store, type AccountRow } from "../../src/state/store.js";
 import { sealCredentials } from "../../src/auth/credentials.js";
 import { emailSubmissionGet, emailSubmissionSet, isPlainAddress } from "../../src/jmap/methods/submission.js";
@@ -19,6 +20,8 @@ import { buildRfc822 } from "../../src/mapping/buildMime.js";
 import type { AppConfig } from "../../src/util/config.js";
 
 const smtpLines: string[] = [];
+/** The message each DATA command carried, as it reached the server. */
+const smtpData: string[] = [];
 let smtp: net.Server;
 let dir: string;
 let store: Store;
@@ -39,6 +42,7 @@ beforeAll(async () => {
         if (data) {
           const end = buf.indexOf("\r\n.\r\n");
           if (end < 0) return;
+          smtpData.push(buf.slice(0, end));
           buf = buf.slice(end + 5);
           data = false;
           sock.write("250 queued\r\n");
@@ -95,6 +99,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   smtpLines.length = 0;
+  smtpData.length = 0;
 });
 afterAll(async () => {
   await new Promise<void>((r) => smtp.close(() => r()));
@@ -332,6 +337,72 @@ describe("a message built from JSON addresses and sent without an envelope", () 
     const res = await send();
     expect(res.notCreated).toBeNull();
     expect(sent()).toEqual(expected);
+  });
+});
+
+describe("a header the envelope reads is one a reader and the Bcc stripping read too", () => {
+  /** What a reader shows as recipients: mailparser over the stored message. */
+  async function readerRecipients(raw: Buffer): Promise<string[]> {
+    const m = await simpleParser(raw, { skipHtmlToText: true, skipTextToHtml: true, skipImageLinks: true });
+    const out: string[] = [];
+    type A = { address?: string; group?: A[] };
+    const walk = (v: A[]) => {
+      for (const a of v) {
+        if (a.address) out.push(a.address.toLowerCase());
+        if (Array.isArray(a.group)) walk(a.group);
+      }
+    };
+    for (const f of [m.to, m.cc, m.bcc]) {
+      if (!f) continue;
+      for (const x of Array.isArray(f) ? f : [f]) walk(x.value as A[]);
+    }
+    return out;
+  }
+  const sent = () => rcpts().map((l) => l.replace(/^RCPT TO:<(.*?)>.*$/i, "$1").toLowerCase());
+
+  it.each<[string, string]>([
+    ["bare CR before a Bcc line", "From: alice@corp.example\r\nTo: bob@corp.example\r\nSubject: hi\rBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+    ["LF CR LF ends the header block", "From: alice@corp.example\r\nTo: bob@corp.example\n\r\nBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+  ])("%s", async (_label, raw) => {
+    draft = Buffer.from(raw);
+    const res = await send();
+    if (res.notCreated) return; // refusing such a header block is fine
+    const shown = await readerRecipients(draft);
+    for (const s of sent()) expect(shown, `sent ${s}, reader shows ${JSON.stringify(shown)}`).toContain(s);
+    if (sent().includes("hidden@evil.example")) expect(smtpData.join("\n")).not.toContain("hidden@evil.example");
+  });
+
+  it.each<[string, string]>([
+    ["a bare CR in the Subject", "From: alice@corp.example\r\nTo: bob@corp.example\r\nSubject: a\rb\r\n\r\nbody\r\n"],
+    ["CRLF and LF lines mixed", "From: alice@corp.example\r\nTo: bob@corp.example\nSubject: x\r\n\r\nbody\r\n"],
+    ["a line of only spaces before a Bcc", "From: alice@corp.example\r\nTo: bob@corp.example\r\n   \r\nBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+    ["a line that is neither a field nor a continuation", "From: alice@corp.example\r\nTo: bob@corp.example\r\nnot a header\r\nBcc: hidden@evil.example\r\n\r\nbody\r\n"],
+  ])("refuses a header block with %s, also with a client envelope, and sends nothing", async (_label, raw) => {
+    draft = Buffer.from(raw);
+    expect((await send()).notCreated?.s?.type).toBe("invalidEmail");
+    const withEnvelope = await send({ mailFrom: { email: "alice@corp.example" }, rcptTo: [{ email: "bob@corp.example" }] });
+    expect(withEnvelope.notCreated?.s?.type).toBe("invalidEmail");
+    expect(smtpLines).toEqual([]);
+  });
+
+  it("sends a message whose lines all end in LF to the same recipients, without its Bcc on the wire", async () => {
+    draft = Buffer.from("From: alice@corp.example\nTo: bob@corp.example\nBcc: carol@corp.example,\n dave@corp.example\nSubject: unix\n\nbody\nBcc: not-a-header@corp.example\n");
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(sent()).toEqual(["bob@corp.example", "carol@corp.example", "dave@corp.example"]);
+    const wire = smtpData.join("\n");
+    const head = wire.slice(0, wire.indexOf("\r\n\r\n"));
+    expect(head).not.toMatch(/^Bcc:/im);
+    expect(wire).not.toContain("dave@corp.example");
+    expect(head).toMatch(/^To: bob@corp\.example$/m);
+    expect(wire.slice(head.length)).toContain("Bcc: not-a-header@corp.example");
+  });
+
+  it("leaves a bare CR in the body alone", async () => {
+    draft = Buffer.from("From: alice@corp.example\r\nTo: bob@corp.example\r\nSubject: x\r\n\r\nline\rwith CR\r\n");
+    const res = await send();
+    expect(res.notCreated).toBeNull();
+    expect(sent()).toEqual(["bob@corp.example"]);
   });
 });
 

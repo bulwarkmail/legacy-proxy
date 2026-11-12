@@ -32,6 +32,11 @@ describe("Bcc handling", () => {
     expect(stripBccHeader(raw).toString()).toBe("From: a@example.org\r\n\r\nbody");
   });
 
+  it("strips every Bcc field of a message whose lines end in LF, and leaves the body alone", () => {
+    const raw = Buffer.from("Bcc: a@example.org\nFrom: a@example.org\nBCC : b@example.org,\n\tc@example.org\nTo: d@example.org\n\nBcc: body\n");
+    expect(stripBccHeader(raw).toString()).toBe("From: a@example.org\nTo: d@example.org\n\nBcc: body\n");
+  });
+
   it("leaves a message without Bcc unchanged", () => {
     const raw = Buffer.from("From: a@example.org\r\nTo: b@example.org\r\n\r\nbody");
     expect(stripBccHeader(raw).equals(raw)).toBe(true);
