@@ -7,6 +7,7 @@ import type {
 } from "fastify";
 import type { AppConfig } from "../util/config.js";
 import type { LoginLimiter } from "../auth/loginLimit.js";
+import { fromBrowser } from "../util/cors.js";
 import {
   CORE_CAPABILITY,
   EMAIL_PUSH_CAPABILITY,
@@ -173,10 +174,10 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       !google.allowedEmails.has(email) ||
       !store.hasConnection(email)
     ) {
-      // Basic only for callers that are not web pages, so a browser never puts
+      // Basic only for callers that are not browsers, so a browser never puts
       // up its own password prompt for the bridge.
       return reply
-        .header("WWW-Authenticate", req.headers.origin ? 'Bearer realm="gmail-bridge"' : 'Basic realm="gmail-bridge"')
+        .header("WWW-Authenticate", fromBrowser(req.headers) ? 'Bearer realm="gmail-bridge"' : 'Basic realm="gmail-bridge"')
         .code(401)
         .send({ error: "unauthorized" });
     }

@@ -136,10 +136,17 @@ describe("bridge secrets on the JMAP routes", () => {
       url: "/jmap/session",
       headers: { authorization: basic(EMAIL, "gmap_wrong"), origin: "https://other.example" },
     });
+    const navigation = await app.inject({
+      method: "GET",
+      url: "/jmap/session",
+      headers: { authorization: basic(EMAIL, "gmap_wrong"), "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" },
+    });
     const fromClient = await app.inject({ method: "GET", url: "/jmap/session", headers: { authorization: basic(EMAIL, "gmap_wrong") } });
     await app.close();
     expect(fromPage.statusCode).toBe(401);
     expect(String(fromPage.headers["www-authenticate"])).not.toMatch(/basic/i);
+    expect(navigation.statusCode).toBe(401);
+    expect(String(navigation.headers["www-authenticate"])).not.toMatch(/basic/i);
     expect(String(fromClient.headers["www-authenticate"])).toMatch(/basic/i);
   });
 
