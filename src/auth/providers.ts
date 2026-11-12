@@ -101,6 +101,11 @@ export function validateProviders(providers: Record<string, ProviderConfig>): vo
         problems.push((e as Error).message);
       }
     }
+    const dav = p.carddav;
+    if (dav && (dav.username || dav.password || dav.forUser) && !(dav.username && dav.password && dav.forUser)) {
+      // An unset $DAV_PASSWORD interpolates to "" and lands here too.
+      problems.push(`provider "${name}", carddav: username, password and forUser must be set together`);
+    }
   }
   if (problems.length) throw new Error(`providers file: ${problems.join("; ")}`);
 }

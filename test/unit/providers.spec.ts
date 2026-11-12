@@ -202,4 +202,12 @@ describe("DAV credentials", () => {
     const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
     expect(() => davOptions(resolveProvider(c).carddav!, mail)).toThrow(/set together/);
   });
+
+  it("stops the start when a DAV login is only partly set", () => {
+    delete process.env.TEST_DAV_UNSET;
+    const half = { ...provider(), carddav: { ...dav, secure: true, username: "dav-user", password: "$TEST_DAV_UNSET", forUser: "me@example.org" } };
+    expect(() => validateProviders({ dav: half })).toThrow(/provider "dav", carddav: username, password and forUser/);
+    const full = { ...provider(), carddav: { ...dav, secure: true, username: "dav-user", password: "pw", forUser: "me@example.org" } };
+    expect(() => validateProviders({ dav: full })).not.toThrow();
+  });
 });
