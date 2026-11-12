@@ -235,6 +235,7 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_refusals", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_rotated_by", definition: "TEXT" },
   { table: "account", column: "cred_first_refusal", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "push_subscription", column: "cred_gen", definition: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
 export class Store {
@@ -279,7 +280,8 @@ export class Store {
    * Store the credentials a successful login proved, which clears a refused
    * mark. `rotate` says they replaced what the row held: the credential
    * generation then moves, which ends every session issued under the previous
-   * one except those made with the new credentials (tag `rotatedBy`).
+   * one except those made with the new credentials (tag `rotatedBy`), and the
+   * push subscriptions made under it except those made since `keepSince`.
    */
   upsertAccount(p: {
     slug: string;
@@ -289,6 +291,7 @@ export class Store {
     vault: Buffer;
     rotate?: boolean;
     rotatedBy?: string | null;
+    keepSince?: number;
   }): AccountRow {
     const now = Date.now();
     const before = this.getAccount(p.slug);
@@ -303,6 +306,7 @@ export class Store {
     const rotate = p.rotate ? 1 : 0;
     stmt.run(p.slug, p.kind, p.host, p.username, p.vault, now, rotate, rotate, p.rotatedBy ?? null);
     const row = this.prep(`SELECT * FROM account WHERE slug = ?`).get(p.slug) as AccountRow;
+    if (before && before.cred_gen !== row.cred_gen) this.endOldSubscriptions(row.id, row.cred_gen, p.keepSince);
     if (before && (before.cred_gen !== row.cred_gen || before.cred_refused)) this.credentialListener?.(row.id);
     return row;
   }
@@ -330,6 +334,7 @@ export class Store {
          cred_gen = cred_gen + 1, cred_rotated_by = NULL
        WHERE id = ?`,
     ).run(accountId);
+    this.endOldSubscriptions(accountId, row.cred_gen + 1);
     this.credentialListener?.(accountId);
     return true;
   }
@@ -588,12 +593,14 @@ export class Store {
     return new Map(rows.map((r) => [r.mailbox_id, r.sort_order]));
   }
 
+  // A subscription belongs to the account's credential generation when it is
+  // made, and ends when that generation moves (see endOldSubscriptions).
   insertPushSubscription(row: PushSubscriptionRow): void {
     this.prep(
         `INSERT INTO push_subscription(
            id, account_id, device_client_id, url, types,
-           expires, verification_code, verified, created_at, last_push_at
-         ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+           expires, verification_code, verified, created_at, last_push_at, cred_gen
+         ) VALUES(?,?,?,?,?,?,?,?,?,?, COALESCE((SELECT cred_gen FROM account WHERE id = ?), 0))`,
       )
       .run(
         row.id,
@@ -606,7 +613,22 @@ export class Store {
         row.verified ? 1 : 0,
         row.createdAt,
         row.lastPushAt ?? null,
+        row.accountId,
       );
+  }
+
+  /**
+   * The account's credential generation moved to `gen`: its push
+   * subscriptions made under an older one end. Those made since `keepSince`
+   * (epoch ms) belong to the sign-in that moved it and move along.
+   */
+  private endOldSubscriptions(accountId: number, gen: number, keepSince?: number): void {
+    if (keepSince !== undefined) {
+      this.prep(
+        `UPDATE push_subscription SET cred_gen = ? WHERE account_id = ? AND cred_gen = ? AND created_at >= ?`,
+      ).run(gen, accountId, gen - 1, keepSince);
+    }
+    this.prep(`DELETE FROM push_subscription WHERE account_id = ? AND cred_gen < ?`).run(accountId, gen);
   }
 
   getPushSubscription(id: string, accountId: number): PushSubscriptionRow | null {

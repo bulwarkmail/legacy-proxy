@@ -225,9 +225,10 @@ stored password once at the mail server:
 
 - If the server refuses the stored password, the new one replaced it: the proxy
   stores the new password and moves the account's credential generation. From
-  then on every session made with the old password is answered `401`, and the
+  then on every session made with the old password is answered `401`, the
   IMAP connections that logged in with it, the push IDLE connection included,
-  are closed. Sessions made with the new password keep working.
+  are closed, and the push subscriptions made before the change end. Sessions
+  made with the new password, and the subscriptions they made, keep working.
 - If the server still accepts the stored password, both are valid (one app
   password per device, for example): nothing changes, and each device's Basic
   header is cached as usual. The stored password is not checked again for that
@@ -244,12 +245,14 @@ The proxy also notices a password that was changed at the mail server. When the
 server refuses the stored password three times in a row (when the push IDLE
 worker reconnects, or the pool opens a new connection), the stored credentials
 are marked refused: the proxy stops logging in with them, every token issued
-before is answered `401`, and the push IDLE worker stops. After a refusal the
+before is answered `401`, and the account's push subscriptions end, so its
+push IDLE worker stops. After a refusal the
 stored password is tried again only two and a half minutes later, so the three
 refusals span at least five minutes and a server that refuses logins for a
 moment marks nobody; requests that need a new connection in between fail
 without a login. The mark is kept in the database across restarts and cleared
-by the next successful sign-in, which also starts the push worker again. A
+by the next successful sign-in; the push worker starts again once the client
+subscribes again. A
 server that cannot be reached, or answers "try again later" (`UNAVAILABLE`,
 `SERVERBUG`, `INUSE`, `LIMIT`, or `CONTACTADMIN`, which Stalwart sends for a
 store error), is not a refusal and is retried with backoff, at most once a

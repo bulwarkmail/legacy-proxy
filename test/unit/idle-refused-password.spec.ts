@@ -197,6 +197,9 @@ describe("what the refused mark keeps and what clears it", () => {
     vi.mocked(openImap).mockClear();
     store.close();
     store = new Store(dir);
+    expect(store.getAccountById(accountId())!.cred_refused).toBe(1);
+    // Even a subscription of the account gets no worker while the mark stands.
+    subscribeAgain("s4");
     expect(await attemptsOver(6)).toBe(0);
   });
 
@@ -209,7 +212,11 @@ describe("what the refused mark keeps and what clears it", () => {
     await vi.advanceTimersByTimeAsync(3600_000);
     expect(vi.mocked(openImap).mock.calls.length).toBe(3);
 
-    // The user signs in with the password the server accepts now.
+    // The mark moved the credential generation, which ended the subscription.
+    expect(store.listPushSubscriptions(accountId())).toEqual([]);
+
+    // The user signs in with the password the server accepts now, and the
+    // client subscribes again.
     vi.mocked(openImap).mockImplementation(async () => connected());
     store.upsertAccount({
       slug: "generic:u@test.local",
@@ -219,9 +226,51 @@ describe("what the refused mark keeps and what clears it", () => {
       vault: await sealCredentials(vaultKey, { mech: "PLAIN", username: "u@test.local", password: "the-new-one" }),
       rotate: true,
     });
+    subscribeAgain("s3");
+    idle.onSubscriberChange(accountId());
     await vi.advanceTimersByTimeAsync(1_000);
     expect(vi.mocked(openImap).mock.calls.length).toBe(4);
     expect(vi.mocked(openImap).mock.calls[3]![0].creds.password).toBe("the-new-one");
     await idle.closeAll();
   });
+
+  it("stops the worker of a subscription made before the password was replaced", async () => {
+    vi.mocked(openImap).mockImplementation(async () => connected());
+    vi.useFakeTimers();
+    const idle = new PushIdleManager(cfg, store);
+    store.setCredentialListener((id) => idle.onCredentialsChanged(id));
+    await idle.sync();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(vi.mocked(openImap).mock.calls.length).toBe(1);
+
+    // A sign-in replaces the stored password.
+    store.upsertAccount({
+      slug: "generic:u@test.local",
+      kind: "generic",
+      host: "imap.test",
+      username: "u@test.local",
+      vault: await sealCredentials(vaultKey, { mech: "PLAIN", username: "u@test.local", password: "the-new-one" }),
+      rotate: true,
+    });
+    await vi.advanceTimersByTimeAsync(3600_000);
+    expect(store.listPushSubscriptions(accountId())).toEqual([]);
+    expect(store.accountsWithActivePushSubs()).toEqual([]);
+    expect(vi.mocked(openImap).mock.calls.length).toBe(1);
+    await idle.closeAll();
+  });
 });
+
+function subscribeAgain(id: string) {
+  store.insertPushSubscription({
+    id,
+    accountId: accountId(),
+    deviceClientId: null,
+    url: "https://relay.example/" + id,
+    types: null,
+    expires: Date.now() + 365 * 86400_000,
+    verificationCode: null,
+    verified: true,
+    createdAt: Date.now(),
+    lastPushAt: null,
+  });
+}

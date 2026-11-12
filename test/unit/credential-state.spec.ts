@@ -135,6 +135,53 @@ describe("refused mark", () => {
   });
 });
 
+describe("push subscriptions and the credential generation", () => {
+  const subscribe = (store: Store, accountId: number, id: string, createdAt = Date.now()) =>
+    store.insertPushSubscription({
+      id,
+      accountId,
+      deviceClientId: null,
+      url: "https://relay.example/" + id,
+      types: null,
+      expires: Date.now() + 86400_000,
+      verificationCode: null,
+      verified: true,
+      createdAt,
+      lastPushAt: null,
+    });
+
+  it("end when a sign-in replaces the password they were made under", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    subscribe(store, id, "s1");
+    expect(store.accountsWithActivePushSubs()).toEqual([id]);
+    store.upsertAccount(account(true));
+    expect(store.listPushSubscriptions(id)).toEqual([]);
+    expect(store.accountsWithActivePushSubs()).toEqual([]);
+    expect(store.activePushSubscriptions(id)).toEqual([]);
+  });
+
+  it("end when the stored password is marked refused", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    subscribe(store, id, "s1");
+    for (const at of spread) store.noteCredentialRefusal(id, 0, at);
+    expect(store.listPushSubscriptions(id)).toEqual([]);
+  });
+
+  it("stay when nothing moves, and those made since the replacing sign-in move along", () => {
+    const store = storeIn(tempDir());
+    const { id } = store.upsertAccount(account());
+    subscribe(store, id, "old", t0 - 1);
+    store.upsertAccount(account(false));
+    expect(store.listPushSubscriptions(id).map((s) => s.id)).toEqual(["old"]);
+    subscribe(store, id, "new", t0 + 1);
+    store.upsertAccount({ ...account(true), keepSince: t0 });
+    expect(store.listPushSubscriptions(id).map((s) => s.id)).toEqual(["new"]);
+    expect(store.accountsWithActivePushSubs()).toEqual([id]);
+  });
+});
+
 describe("ended session tokens", () => {
   it("stay ended after a restart and are dropped once they would have expired", () => {
     const dir = tempDir();

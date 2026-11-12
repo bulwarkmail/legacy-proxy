@@ -268,7 +268,7 @@ interface SignIn {
 async function recordSignIn(s: SignIn): Promise<AccountRow> {
   const existing = store.getAccount(s.slug);
   const vault = await sealCredentials(cfg.vaultKey, s.creds);
-  const save = (rotate: boolean) =>
+  const save = (rotate: boolean, keepSince?: number) =>
     store.upsertAccount({
       slug: s.slug,
       kind: s.providerName,
@@ -277,6 +277,7 @@ async function recordSignIn(s: SignIn): Promise<AccountRow> {
       vault,
       rotate,
       rotatedBy: rotate ? s.tag : null,
+      keepSince,
     });
   if (!existing) return save(false);
   const changed = await credentialsChanged(existing, s.creds);
@@ -285,8 +286,13 @@ async function recordSignIn(s: SignIn): Promise<AccountRow> {
   // Confirmed valid next to the stored one not long ago: no check again.
   if (bothValid(existing, s.tag)) return existing;
   // One check at a time; the sessions of a sign-in that did not start it are
-  // decided by the one running.
-  if (!storedChecks.has(existing.id)) checkStoredPassword(existing, s, () => save(true));
+  // decided by the one running. While it runs only the sessions of the new
+  // password are served, so the push subscriptions made meanwhile are theirs
+  // and stay when the check moves the generation.
+  if (!storedChecks.has(existing.id)) {
+    const started = Date.now();
+    checkStoredPassword(existing, s, () => save(true, started));
+  }
   return existing;
 }
 
