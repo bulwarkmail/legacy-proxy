@@ -702,3 +702,52 @@ it("answers unread-in-folder queries from the label counters instead of scanning
     expect(call[2].q).toBeUndefined();
   }
 });
+
+it("pages read-in-folder queries through the label instead of enumerating every read message", async () => {
+  const f = await setup();
+  const before = f.get.mock.calls.length;
+  const r = (await f.mail.methods()["Email/query"]!({
+    accountId: f.mail.accountId,
+    filter: {
+      operator: "AND",
+      conditions: [{ inMailbox: "l_INBOX" }, { hasKeyword: "$seen" }],
+    },
+    sort: [{ property: "receivedAt", isAscending: false }],
+    limit: 1,
+    calculateTotal: true,
+  })) as { ids: string[]; total: number };
+  const inbox = (await f.mail.labelDetail("INBOX"))!;
+  // Total minus unread, off the Inbox label's own counters.
+  expect(r.total).toBe(inbox.messagesTotal! - inbox.messagesUnread!);
+  expect(r.ids.length).toBeLessThanOrEqual(1);
+  const listed = f.get.mock.calls
+    .slice(before)
+    .filter((c) => c[0] === "messages");
+  expect(listed.length).toBe(r.total > 0 ? 1 : 0);
+  // One page of the label narrowed to read mail, sized to what was asked.
+  for (const call of listed) {
+    expect(call[2].labelIds).toBe("INBOX");
+    expect(call[2].q).toBe("is:read");
+    expect(call[2].maxResults).toBe("1");
+  }
+});
+
+it("lists what arrived in a folder since a date by label, without reading the account's labels", async () => {
+  const f = await setup();
+  await f.mail.state();
+  const before = f.get.mock.calls.length;
+  await f.mail.methods()["Email/query"]!({
+    accountId: f.mail.accountId,
+    filter: { inMailbox: "l_INBOX", after: "2026-11-12T00:00:00Z" },
+    limit: 100,
+  });
+  const calls = f.get.mock.calls.slice(before);
+  const listed = calls.filter((c) => c[0] === "messages");
+  // The folder by its label id, the date as the only search term.
+  expect(listed.length).toBeGreaterThan(0);
+  for (const call of listed)
+    expect(call[2]).toMatchObject({ labelIds: "INBOX", q: "after:1794441600" });
+  // No label was read to translate the filter: a push preview asks this on
+  // every notification.
+  expect(calls.filter((c) => String(c[0]).startsWith("labels"))).toEqual([]);
+});
