@@ -419,14 +419,21 @@ the webmail server's address in `TRUST_PROXY` too.
 
 ### Provider selection
 
-Every login resolves to exactly one provider key from `providers.json`, in this
-order:
+Every login resolves to exactly one provider, in this order:
 
 1. an explicit `provider` in the `/api/login` body, if present;
-2. the provider whose `domains` list contains the username's email domain
-   (case-insensitive). This mirrors RFC 8620 §2.2, which uses the email domain
-   as the routing key for service autodiscovery;
-3. `DEFAULT_PROVIDER` otherwise.
+2. the provider in `providers.json` whose `domains` list contains the
+   username's email domain (case-insensitive). This mirrors RFC 8620 §2.2,
+   which uses the email domain as the routing key for service autodiscovery;
+3. with [discovery](#discovery) turned on, the mail servers the domain
+   publishes itself;
+4. `DEFAULT_PROVIDER` otherwise.
+
+If none of these gives a provider (the domain is not listed, discovery is off
+or finds nothing, and `DEFAULT_PROVIDER` names no entry in `providers.json`),
+the login is answered `401` and counts as a failed login. The log says
+`login refused: the email domain is not in providers.json ...` with the
+domain.
 
 Give each provider a `domains` array to enable step 2:
 
@@ -440,6 +447,77 @@ Give each provider a `domains` array to enable step 2:
 See `providers.two-servers.example.json` for a full two-provider catalogue.
 If two backends share one email domain, that domain can only map to a single
 provider. Use the explicit `/api/login` `provider` field for the exception.
+
+### Discovery
+
+Discovery finds the IMAP and SMTP servers of an email domain that
+`providers.json` does not list, so users on their own domain at a regular
+hoster can sign in without the operator adding every domain. It is off by
+default. Turn it on with `DISCOVERY`:
+
+```bash
+DISCOVERY=autoconfig,srv
+# optional: only use mail servers under these domains
+DISCOVERY_ALLOWED_HOSTS=hoster.net,mail.example.org
+```
+
+The sources are tried in this order, whatever order `DISCOVERY` lists them in.
+The first one that gives both an IMAP and an SMTP server wins:
+
+1. `autoconfig`: the Mozilla autoconfig file at
+   `https://autoconfig.<domain>/mail/config-v1.1.xml`, then at
+   `https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml`. The
+   proxy does not ask the Thunderbird ISP database.
+2. `srv`: the RFC 6186 SRV records `_imaps._tcp` and `_imap._tcp` for IMAP,
+   and `_submissions._tcp` and `_submission._tcp` for SMTP, by priority and
+   weight.
+
+Discovery runs before `DEFAULT_PROVIDER`, because `DEFAULT_PROVIDER` is
+`generic` unless set, so a default nearly always exists. A domain that is
+listed in `providers.json` never runs discovery. If the server behind
+`DEFAULT_PROVIDER` hosts domains of its own, list them in its `domains` when
+you turn discovery on, or their users may be sent to the servers their domain
+publishes. Users who type a name without `@` always get `DEFAULT_PROVIDER`.
+
+A discovered provider is used like an entry in `providers.json`, with IMAP and
+SMTP only: no ManageSieve (vacation replies) and no CardDAV. Accounts on it are
+stored under the key `discovered:<domain>`. Once the mail server accepts a
+login, the provider is kept in the database, so the domain's accounts keep
+working after a restart and while discovery has no answer. A later discovery
+that finds other servers replaces it after the next successful login. With
+`DISCOVERY` unset, kept providers are not used. If you later add the domain to
+`providers.json`, its users get new accounts under that provider's key, as
+with any provider change.
+
+The proxy is public, so what a domain publishes is not trusted:
+
+- Only encrypted servers are taken: IMAP with implicit TLS or STARTTLS on any
+  port, and SMTP submission with implicit TLS on port 465 or STARTTLS on port
+  587. Certificates must be valid for the host name.
+- Every host must be a plain host name. In autoconfig files `%EMAILDOMAIN%`
+  in a host name is filled in; other placeholders, IP addresses and ports are
+  refused. The login name may be `%EMAILADDRESS%` (the default) or
+  `%EMAILLOCALPART%`; servers that ask for any other login name are skipped.
+- Every host, the autoconfig web servers included, must resolve to public
+  addresses only. A host with any private, loopback, link-local, multicast or
+  reserved address is refused. The same check as for push URLs is used.
+- Each IMAP and SMTP connection to a discovered server resolves the host
+  again, checks the address, and connects to that address with the host name
+  kept for the certificate check. A name that changes its address between the
+  check and the connect reaches nothing else.
+- `DISCOVERY_ALLOWED_HOSTS`, when set, limits the IMAP and SMTP hosts to the
+  listed names and the names below them (`hoster.net` allows
+  `imap.hoster.net`). It does not limit where the autoconfig file is fetched
+  from. Kept providers that no longer match are not used.
+- The autoconfig fetch has a 5 second timeout and reads at most 64 KB. It
+  follows redirects only to https on the same host and port. DNS lookups time
+  out after 3 seconds, and one domain's whole discovery after 10 seconds.
+- Answers are cached in memory per domain: found servers for an hour, nothing
+  found for 5 minutes, at most 1,000 domains. Logins for one domain at the same
+  time share one discovery.
+- Discovery runs only after a login took a login slot, and a login that finds
+  no provider counts as a failed login (see [Login limits](#login-limits)), so
+  a caller can't make the proxy look up domains without limit.
 
 ### Gmail
 
@@ -869,6 +947,8 @@ network and needs no published port at all. Publish it on all interfaces
 | `SESSION_HMAC_KEY`         | required                           | base64 of 32 bytes; HMAC-SHA-256 over session tokens |
 | `DEFAULT_PROVIDER`         | `generic`                          | provider key when `/api/login` omits one             |
 | `PROVIDERS_FILE`           | `/etc/legacy-proxy/providers.json` | provider catalogue                                   |
+| `DISCOVERY`                | unset (off)                        | `autoconfig`, `srv` or both; see [Discovery](#discovery) |
+| `DISCOVERY_ALLOWED_HOSTS`  | unset (every public host)          | host names discovered mail servers must be under     |
 | `LOG_LEVEL`                | `info`                             | pino level                                           |
 | `MAX_CONCURRENT_REQUESTS`  | `10`                               | per account, advertised and enforced (see below)     |
 | `MAX_OBJECTS_IN_GET`       | `500`                              | advertised and enforced (see below)                  |
