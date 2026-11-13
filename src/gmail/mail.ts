@@ -947,7 +947,9 @@ export class GmailMail {
     // only if something really asks for it.
     let search: string | undefined;
     const q = async () =>
-      // Names only: the counters `labels()` adds cost a call per label.
+      // Names only: the counters `labels()` adds cost a call per label, and
+      // a push preview asks "what arrived in this folder since then" on
+      // every notification.
       (search ??= gmailFilter(args.filter, await this.labelList()));
     const sort = args.sort ?? [{ property: "receivedAt", isAscending: false }];
     if (
@@ -1119,7 +1121,10 @@ export class GmailMail {
           : (await this.profile()).messagesTotal;
       if (total !== undefined) {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
-        // dependence on search syntax, label names or search-index lag.
+        // dependence on search syntax, label names or search-index lag. The
+        // one exception is the read half of a folder: Gmail has no label for
+        // read mail, so that listing is the label narrowed by `is:read`, and
+        // its total (counters) can run a moment ahead of its rows (search).
         const listing: Listing = label
           ? labelListing(label.id)
           : { q: await q() };
@@ -1174,27 +1179,9 @@ export class GmailMail {
     }
     // Enumerate IDs only: exact totals and reverse/anchor pagination without
     // fetching metadata for the entire mailbox. Never expose resultSizeEstimate as total.
-    // "What arrived in this folder since then" is what a push preview asks
-    // on every notification. The folder is a label id and the dates need no
-    // label names, so it is listed without reading the account's labels first.
-    const dated = ((): Record<string, string> | undefined => {
-      if (!f || typeof f.inMailbox !== "string" || !/^l_[A-Za-z0-9_-]+$/.test(f.inMailbox))
-        return undefined;
-      const rest = Object.keys(f).filter((key) => key !== "inMailbox");
-      if (!rest.length || rest.some((key) => key !== "after" && key !== "before"))
-        return undefined;
-      const terms: string[] = [];
-      for (const key of rest) {
-        const value = f[key];
-        if (typeof value !== "string" || !Number.isFinite(Date.parse(value)))
-          throw invalidArguments("Invalid date filter");
-        terms.push(`${key}:${Math.floor(Date.parse(value) / 1000)}`);
-      }
-      return { labelIds: f.inMailbox.slice(2), q: terms.join(" ") };
-    })();
-    const listing = dated ?? { q: await q() };
+    const gmailQuery = await q();
     const references = await this.cached<{ id: string; threadId: string }[]>(
-      `query:${state}:${hash(listing)}`,
+      `query:${state}:${hash(gmailQuery)}`,
       MESSAGE_TTL,
       async () => {
         const result = new Map<string, { id: string; threadId: string }>();
@@ -1205,7 +1192,7 @@ export class GmailMail {
             messages?: { id: string; threadId: string }[];
             nextPageToken?: string;
           }>("messages", 5, {
-            ...listing,
+            q: gmailQuery,
             includeSpamTrash: "true",
             maxResults: "500",
             ...(pageToken ? { pageToken } : {}),

@@ -732,22 +732,23 @@ it("pages read-in-folder queries through the label instead of enumerating every 
   }
 });
 
-it("lists what arrived in a folder since a date by label, without reading the account's labels", async () => {
+it("lists what arrived in a folder since a date without reading a counter per label, and still refuses a mailbox the account does not have", async () => {
   const f = await setup();
   await f.mail.state();
+  const query = (inMailbox: string) =>
+    f.mail.methods()["Email/query"]!({
+      accountId: f.mail.accountId,
+      filter: { inMailbox, after: "2026-11-12T00:00:00Z" },
+      limit: 100,
+    });
   const before = f.get.mock.calls.length;
-  await f.mail.methods()["Email/query"]!({
-    accountId: f.mail.accountId,
-    filter: { inMailbox: "l_INBOX", after: "2026-11-12T00:00:00Z" },
-    limit: 100,
-  });
+  await query("l_INBOX");
   const calls = f.get.mock.calls.slice(before);
   const listed = calls.filter((c) => c[0] === "messages");
-  // The folder by its label id, the date as the only search term.
   expect(listed.length).toBeGreaterThan(0);
-  for (const call of listed)
-    expect(call[2]).toMatchObject({ labelIds: "INBOX", q: "after:1794441600" });
-  // No label was read to translate the filter: a push preview asks this on
-  // every notification.
-  expect(calls.filter((c) => String(c[0]).startsWith("labels"))).toEqual([]);
+  for (const call of listed) expect(call[2].q).toBe("in:inbox after:1794441600");
+  // The label names come from the one listing call; no label is read for
+  // its counters. A push preview asks this on every notification.
+  expect(calls.filter((c) => String(c[0]).startsWith("labels/"))).toEqual([]);
+  await expect(query("l_Label_gone")).rejects.toMatchObject({ type: "invalidArguments" });
 });
