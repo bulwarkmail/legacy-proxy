@@ -105,24 +105,32 @@ export interface Relabel {
  *   that does not say how).
  * - `relabel`: label moves to apply, in order, to messages not in `drop`.
  * - `threads`: conversations whose membership changed.
+ * - `membership`: the same, as the ordered additions and removals a
+ *   message-to-thread index replays.
  */
 export interface HistoryChange {
   drop: string[];
   relabel: Map<string, Relabel[]>;
   threads: string[];
+  membership: ({ add: string; thread: string } | { remove: string })[];
 }
 export function classify(records: HistoryRecord[]): HistoryChange {
   const drop = new Set<string>(),
     threads = new Set<string>();
   const relabel = new Map<string, Relabel[]>();
+  const membership: HistoryChange["membership"] = [];
   for (const h of records) {
     for (const { message: m } of h.messagesDeleted ?? []) {
       drop.add(m.id);
       if (m.threadId) threads.add(m.threadId);
+      membership.push({ remove: m.id });
     }
     for (const { message: m } of h.messagesAdded ?? []) {
       drop.add(m.id);
-      if (m.threadId) threads.add(m.threadId);
+      if (m.threadId) {
+        threads.add(m.threadId);
+        membership.push({ add: m.id, thread: m.threadId });
+      }
     }
     for (const [group, adding] of [
       [h.labelsRemoved, false],
@@ -140,7 +148,7 @@ export function classify(records: HistoryRecord[]): HistoryChange {
       }
   }
   for (const id of drop) relabel.delete(id);
-  return { drop: [...drop], relabel, threads: [...threads] };
+  return { drop: [...drop], relabel, threads: [...threads], membership };
 }
 /** Messages Gmail added to this account, with the labels the history record carried (if any). */
 export function addedMessages(

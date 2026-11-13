@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { afterEach, vi } from "vitest";
+import { afterEach, expect, vi } from "vitest";
 import { GmailStore } from "../../src/gmail/store.js";
 import { GmailMail } from "../../src/gmail/mail.js";
 import { GMAIL_MODIFY } from "../../src/gmail/config.js";
@@ -20,7 +20,7 @@ interface Fake {
   labelIds: string[];
 }
 /** A small Gmail: messages newest first, a history log, and a count of what each call cost in round trips. */
-export async function fakeGmail(opts: { pageSize?: number; older?: number } = {}) {
+export async function fakeGmail(opts: { index?: boolean; pageSize?: number; older?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-index-"));
   const store = new GmailStore(dir, crypto.randomBytes(32));
   cleanup.push(() => {
@@ -131,6 +131,7 @@ export async function fakeGmail(opts: { pageSize?: number; older?: number } = {}
     undefined,
     false,
     true,
+    opts.index ?? false,
   );
   const methods = mail.methods();
   /** Lets the next read see the account as Gmail has it now. */
@@ -158,5 +159,11 @@ export async function fakeGmail(opts: { pageSize?: number; older?: number } = {}
         list: { id: string; emailIds: string[] }[];
         notFound: string[];
       },
+    /** Waits for the background index build to finish. */
+    indexed: async () => {
+      for (let i = 0; i < 200 && store.threadIndexBuiltAt(email) === null; i++)
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(store.threadIndexBuiltAt(email)).not.toBeNull();
+    },
   };
 }

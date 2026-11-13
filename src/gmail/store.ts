@@ -78,6 +78,12 @@ export class GmailStore {
       CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
       CREATE TABLE IF NOT EXISTS gmail_submission (email TEXT NOT NULL,original TEXT NOT NULL,id TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT,PRIMARY KEY(email,original));
       CREATE TABLE IF NOT EXISTS gmail_revision (email TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS gmail_thread_index (
+        email TEXT NOT NULL, message TEXT NOT NULL, thread TEXT NOT NULL, ord INTEGER NOT NULL,
+        PRIMARY KEY(email, message)
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS gmail_thread_index_thread ON gmail_thread_index(email, thread, ord);
+      CREATE TABLE IF NOT EXISTS gmail_thread_index_state (email TEXT PRIMARY KEY, complete INTEGER NOT NULL, built_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_schedule (
         id TEXT PRIMARY KEY, email TEXT NOT NULL, original TEXT NOT NULL, identity TEXT NOT NULL, thread TEXT NOT NULL,
         envelope TEXT NOT NULL, raw_hash TEXT NOT NULL, send_at INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT,
@@ -596,8 +602,11 @@ export class GmailStore {
     this.db.transaction(() => {
       const previous = this.cursor(email);
       if (previous && BigInt(previous) >= BigInt(history)) return;
-      if (reset) this.invalidate(email);
-      else if (messages.length || threads.length)
+      if (reset) {
+        this.invalidate(email);
+        // History that cannot be replayed leaves the index with a hole.
+        this.threadIndexReset(email);
+      } else if (messages.length || threads.length)
         this.drop(email, messages, threads);
       this.db
         .prepare(
@@ -608,9 +617,9 @@ export class GmailStore {
   }
   /**
    * Moves the cursor to `history` and brings the local copy along: forgets
-   * what the run created or deleted and moves labels on what it only
-   * relabelled. One transaction, so the cursor never claims more than the
-   * copy holds.
+   * what the run created or deleted, moves labels on what it only relabelled,
+   * and replays who joined or left which conversation. One transaction, so the
+   * cursor never claims more than the copy holds.
    */
   applyHistory(email: string, history: string, change: HistoryChange): void {
     this.db.transaction(() => {
@@ -625,6 +634,17 @@ export class GmailStore {
             for (const label of move.remove) labels.delete(label);
           }
         });
+      const add = this.db.prepare(
+        "INSERT OR IGNORE INTO gmail_thread_index VALUES(?,?,?,?)",
+      );
+      const remove = this.db.prepare(
+        "DELETE FROM gmail_thread_index WHERE email=? AND message=?",
+      );
+      // Newer than anything listed: a listing numbers downwards from zero.
+      let ord = Date.now() * 1000;
+      for (const step of change.membership)
+        if ("add" in step) add.run(email, step.add, step.thread, ord++);
+        else remove.run(email, step.remove);
       this.db
         .prepare(
           "INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history",
@@ -675,6 +695,81 @@ export class GmailStore {
           .run(email, key);
       }
     }
+  }
+  /**
+   * The message-to-thread index: every message of the account and the
+   * conversation it belongs to.
+   *
+   * Gmail charges 40 quota units to say who is in one conversation, and a
+   * client asks that of every row it lists: 2,000 of the 6,000 units a minute
+   * for a page of fifty. Listing ids is the cheap call - 5 units for 500
+   * messages, each with its thread - so the whole account is listed once (800
+   * units for 80,000 messages) and kept current from the history every sync
+   * already reads. From then on a conversation's members cost nothing.
+   *
+   * `ord` puts a conversation's messages in order: a listing runs newest
+   * first and numbers downwards from zero, arrivals count up from the clock.
+   */
+  threadIndexBegin(email: string): void {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM gmail_thread_index WHERE email=?").run(email);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_thread_index_state VALUES(?,0,0) ON CONFLICT(email) DO UPDATE SET complete=0, built_at=0",
+        )
+        .run(email);
+    })();
+  }
+  /** One listed page, `firstOrd` for its first (newest) message and downwards. Never replaces a row history has already written. */
+  threadIndexInsert(
+    email: string,
+    rows: { id: string; threadId: string }[],
+    firstOrd: number,
+  ): void {
+    const insert = this.db.prepare(
+      "INSERT OR IGNORE INTO gmail_thread_index VALUES(?,?,?,?)",
+    );
+    this.db.transaction(() => {
+      rows.forEach((row, i) => insert.run(email, row.id, row.threadId, firstOrd - i));
+    })();
+  }
+  threadIndexComplete(email: string): void {
+    this.db
+      .prepare(
+        "UPDATE gmail_thread_index_state SET complete=1, built_at=? WHERE email=?",
+      )
+      .run(Date.now(), email);
+  }
+  /** When the index was last built whole, or null while it is missing or being built. */
+  threadIndexBuiltAt(email: string): number | null {
+    const row = this.db
+      .prepare(
+        "SELECT built_at FROM gmail_thread_index_state WHERE email=? AND complete=1",
+      )
+      .get(email) as { built_at: number } | undefined;
+    return row ? row.built_at : null;
+  }
+  threadIndexReset(email: string): void {
+    this.db
+      .prepare("DELETE FROM gmail_thread_index_state WHERE email=?")
+      .run(email);
+  }
+  /** The messages of a conversation, oldest first. */
+  threadIndexMembers(email: string, thread: string): string[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT message FROM gmail_thread_index WHERE email=? AND thread=? ORDER BY ord",
+        )
+        .all(email, thread) as { message: string }[]
+    ).map((row) => row.message);
+  }
+  threadIndexSize(email: string): number {
+    return (
+      this.db
+        .prepare("SELECT COUNT(*) AS n FROM gmail_thread_index WHERE email=?")
+        .get(email) as { n: number }
+    ).n;
   }
   mailboxSnapshot(
     email: string,
@@ -914,6 +1009,8 @@ export class GmailStore {
       "gmail_watch",
       "gmail_push",
       "gmail_push_sub",
+      "gmail_thread_index",
+      "gmail_thread_index_state",
     ];
     this.db.transaction(() => {
       for (const table of tables)

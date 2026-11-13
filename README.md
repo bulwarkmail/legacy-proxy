@@ -845,6 +845,17 @@ twenty seconds for it, answers `serverUnavailable` with the time to retry instea
 If your project has a different per-user limit (an earlier project, or a raised
 quota), set `GMAIL_QUOTA_PER_MINUTE` to it.
 
+### Thread index
+
+Gmail charges 40 quota units to say which messages are in a conversation, and a
+client asks that of every row it lists. The bridge therefore keeps its own index of
+every message and its thread: it lists the account once in the background (5 units
+per 500 messages, about 45 seconds for 100,000 messages), keeps it current from the
+history each sync already reads, and lists it again once a week or when Gmail's
+history can no longer be replayed. Until the index is complete, and for any thread it
+does not know, conversations are read from Gmail as before. `GMAIL_THREAD_INDEX=false`
+turns it off.
+
 ### Push notifications (Cloud Pub/Sub)
 
 Set `GMAIL_PUSH_TOPIC=projects/<project>/topics/<topic>` to replace polling with Gmail

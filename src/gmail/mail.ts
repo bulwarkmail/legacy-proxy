@@ -33,6 +33,7 @@ import {
   unsupportedSort,
 } from "../jmap/errors.js";
 import type { MethodTable } from "../jmap/router.js";
+import { log } from "../util/log.js";
 
 const hash = (value: unknown) =>
   crypto
@@ -67,6 +68,10 @@ const LABELS_TTL = 10 * 60_000;
 const SEND_AS_TTL = 60 * 60_000;
 /** The smallest page worth starting early: below it the query is a count or a probe, not a list. */
 const LIST_FROM = 5;
+/** A thread index older than this is listed again: cheap insurance against a history record that never came. */
+const THREAD_INDEX_MAX_AGE = 7 * 24 * 60 * 60_000;
+/** How long a failed index build waits before the next attempt. */
+const THREAD_INDEX_RETRY_MS = 5 * 60_000;
 /** Label changes sent to Gmail side by side in one `Email/set`. */
 const WRITES_AT_ONCE = 6;
 /**
@@ -187,6 +192,10 @@ export class GmailMail {
   private writeTail: Promise<unknown> = Promise.resolve();
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
+  /** The thread index build in flight, and the messages deleted since it began. */
+  private indexing?: Promise<void>;
+  private indexDeleted?: Set<string>;
+  private indexRetryAt = 0;
   private flights = new Map<string, Promise<unknown>>();
   /** Labels {@link labelDetail} was asked for in the current account state. */
   private labelsAsked?: { state: string; ids: Set<string> };
@@ -211,6 +220,8 @@ export class GmailMail {
     private schedule?: { maxDelayedSend: number; lateTolerance: number },
     private pushEnabled = false,
     private labelTags = true,
+    /** Keep a message-to-thread index of the account (see `GmailStore.threadIndexBegin`). */
+    private threadIndex = false,
   ) {
     this.accountId = gmailAccountId(email);
     this.subscriptions = new GmailSubscriptions(
@@ -421,9 +432,75 @@ export class GmailMail {
       historyId: this.store.cursor(this.email) ?? profile.historyId,
     };
   }
-  /** Brings the cache up to `historyId`. */
+  /** Brings the cache and the thread index up to `historyId`. */
   private applyHistory(historyId: string, change: ReturnType<typeof classify>): void {
+    // A message deleted while the index is being listed must not be put back
+    // by a page that was read before it went.
+    if (this.indexDeleted)
+      for (const step of change.membership)
+        if ("remove" in step) this.indexDeleted.add(step.remove);
     this.store.applyHistory(this.email, historyId, change);
+  }
+  /**
+   * Whether conversations can be answered from the thread index. Starts
+   * building it, in the background, when it is missing or old.
+   */
+  private threadIndexReady(): boolean {
+    if (!this.threadIndex) return false;
+    const built = this.store.threadIndexBuiltAt(this.email);
+    if (built !== null && Date.now() - built < THREAD_INDEX_MAX_AGE) return true;
+    if (!this.indexing && Date.now() >= this.indexRetryAt)
+      this.indexing = this.buildThreadIndex()
+        .catch((error: unknown) => {
+          this.indexRetryAt = Date.now() + THREAD_INDEX_RETRY_MS;
+          log.warn(
+            { err: error instanceof Error ? error.message : String(error) },
+            "gmail thread index build failed",
+          );
+        })
+        .finally(() => {
+          this.indexing = undefined;
+          this.indexDeleted = undefined;
+        });
+    return false;
+  }
+  /** Lists every message of the account with its thread: 5 quota units per 500 messages. */
+  private async buildThreadIndex(): Promise<void> {
+    const began = Date.now();
+    // The cursor must exist before the listing starts, so that everything
+    // that happens from here on reaches the index through history.
+    await this.state();
+    this.indexDeleted = new Set();
+    this.store.threadIndexBegin(this.email);
+    let token = "";
+    let listed = 0;
+    const tokens = new Set<string>();
+    do {
+      const page = await this.api.get<{
+        messages?: { id: string; threadId: string }[];
+        nextPageToken?: string;
+      }>("messages", 5, {
+        includeSpamTrash: "true",
+        maxResults: "500",
+        ...(token ? { pageToken: token } : {}),
+      });
+      const rows = (page.messages ?? []).filter(
+        (m) => m.threadId && !this.indexDeleted!.has(m.id),
+      );
+      this.store.threadIndexInsert(this.email, rows, -listed);
+      listed += (page.messages ?? []).length;
+      token = page.nextPageToken ?? "";
+      if (token && tokens.has(token))
+        throw new JmapError("serverUnavailable", "Gmail repeated a pagination cursor");
+      if (token) tokens.add(token);
+      if (tokens.size > 10_000)
+        throw new JmapError("serverUnavailable", "Mailbox too large to index");
+    } while (token);
+    this.store.threadIndexComplete(this.email);
+    log.info(
+      { messages: listed, calls: tokens.size + 1, ms: Date.now() - began },
+      "gmail thread index built",
+    );
   }
   async writable(): Promise<boolean> {
     return (
@@ -1846,10 +1923,31 @@ export class GmailMail {
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
         const state = await this.state();
-        await this.prefetchThreads(ids);
+        // From the index when there is one: no call to Gmail at all. A
+        // conversation it does not know is asked of Gmail as before, which
+        // also covers a thread that does not exist.
+        const known = new Map<string, string[]>();
+        if (this.threadIndexReady())
+          for (const id of ids) {
+            if (!/^t_[A-Za-z0-9_-]{1,128}$/.test(id)) continue;
+            const members = this.store.threadIndexMembers(this.email, id.slice(2));
+            if (members.length) known.set(id, members);
+          }
+        await this.prefetchThreads(ids.filter((id) => !known.has(id)));
         const read = async (
           id: string,
         ): Promise<Record<string, unknown> | null> => {
+          const members = known.get(id);
+          if (members)
+            return this.project(
+              {
+                id,
+                emailIds: members.map(
+                  (m) => "m_" + this.store.originalId(this.email, m),
+                ),
+              },
+              properties,
+            );
           try {
             const thread = await this.cached<ThreadMembers>(
               `thread:v3:${id}`,
