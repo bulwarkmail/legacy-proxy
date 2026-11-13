@@ -835,6 +835,16 @@ user to check Sent and leave the durable submission intent in place across resta
 Reply composition resolves the parent Message-ID in the same account and supplies
 Gmail's native thread ID only when the parent header and normalized subject match.
 
+### Gmail API quota
+
+Google gives one user of a Cloud project 6,000 quota units a minute (projects created
+from 1 May 2026) and prices each call: reading a message costs 20 units, 60 with its
+body; a thread 40; a listing of 500 ids 5. The bridge spends at most nine tenths of
+the minute's allowance per account and, when a request would have to wait more than
+twenty seconds for it, answers `serverUnavailable` with the time to retry instead.
+If your project has a different per-user limit (an earlier project, or a raised
+quota), set `GMAIL_QUOTA_PER_MINUTE` to it.
+
 ### Push notifications (Cloud Pub/Sub)
 
 Set `GMAIL_PUSH_TOPIC=projects/<project>/topics/<topic>` to replace polling with Gmail
