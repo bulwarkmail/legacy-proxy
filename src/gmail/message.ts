@@ -178,6 +178,31 @@ export async function mapMessage(
   const headers = (message.payload?.headers ?? []).map((h) => ({ name: h.name, rawValue: h.value }));
   const { root, parts } = partTree(message);
   const bodies = selectBodies(root);
+  // Read as `metadata`, a message arrives without its MIME tree: no parts to
+  // look for attachments in. Its own Content-Type still says what kind of
+  // message it is - `multipart/mixed` is how a mail carries files, and a mail
+  // that is itself a PDF or an image is one. Wrong now and then (a list
+  // footer makes a plain mail "mixed"; a file tucked inside a
+  // `multipart/related` goes unseen), exact once the message is opened and
+  // read whole, and a third of the quota for every row until then.
+  if (
+    message.payload &&
+    message.payload.parts === undefined &&
+    message.payload.body?.data === undefined &&
+    message.payload.body?.attachmentId === undefined
+  ) {
+    const type = (
+      message.payload.headers?.find((h) => h.name.toLowerCase() === "content-type")?.value ??
+      message.payload.mimeType ??
+      ""
+    )
+      .split(";")[0]!
+      .trim()
+      .toLowerCase();
+    bodies.hasAttachment =
+      type === "multipart/mixed" ||
+      (type !== "" && !type.startsWith("multipart/") && !type.startsWith("text/"));
+  }
   const keywords: Record<string, true> = {};
   const labels = message.labelIds ?? [];
   if (!labels.includes("UNREAD")) keywords.$seen = true;
