@@ -341,3 +341,94 @@ it("spends nine tenths of whatever the project's per-user quota is", async () =>
   await raised.get("messages/a", 0, { format: "full" });
   expect(raised.spare()).toBe(13440);
 });
+
+it("keeps a write Google refused for crowding 'not sent' if it then gives up before sending again", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const store = await open();
+  await store.save(
+    email,
+    {
+      mech: "XOAUTH2",
+      username: email,
+      accessToken: "token",
+      refreshToken: "refresh",
+      expiresAt: Date.now() + 3600_000,
+      scopes: ["https://www.googleapis.com/auth/gmail.modify"],
+    },
+    { profile: { emailAddress: email, historyId: "1", messagesTotal: 1, threadsTotal: 1 }, labels: [] },
+  );
+  const client = google(async (options) => {
+    if (options.url.endsWith("/drafts/send"))
+      throw {
+        response: {
+          status: 429,
+          data: { error: { message: "Too many concurrent requests for user.", errors: [{ reason: "rateLimitExceeded" }] } },
+        },
+      };
+    // A sibling read that Google holds off for a minute.
+    throw { response: { status: 429, headers: new Headers({ "retry-after": "60" }) } };
+  });
+  const api = new GmailApi(
+    email,
+    new GmailConnection({ ...config, writeEnabled: true, composeEnabled: true } as GmailConfig, store, () => client),
+    store,
+  );
+  const send = api.mutate("drafts/send", 100, "POST", { id: "d" }).catch((error: unknown) => error);
+  const read = api.get("labels/INBOX", 1).catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(2_000);
+  await read;
+  // Google never ran the send: the caller may safely try again.
+  expect(await send).toBeInstanceOf(GmailNotSent);
+});
+
+it("keeps the reads a batch already answered when the minute has no room to ask again for the rest", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const store = await open();
+  let calls = 0;
+  const client = google(async (options: any) => {
+    calls++;
+    const ids = [...String(options.data).matchAll(/threads\/(\w+)/g)].map((m) => m[1]!);
+    const boundary = "--batch_x";
+    const parts = ids.map((id, index) => {
+      const refused = Number(id) >= 40;
+      const payload = refused
+        ? JSON.stringify({ error: { code: 403, message: "Quota exceeded for quota metric 'Total Query Cost'" } })
+        : JSON.stringify({ id });
+      return (
+        `${boundary}\r\nContent-Type: application/http\r\nContent-ID: <response-item-${index}>\r\n\r\n` +
+        `HTTP/1.1 ${refused ? "403 Forbidden" : "200 OK"}\r\nContent-Type: application/json\r\n\r\n${payload}\r\n`
+      );
+    });
+    return { data: parts.join("") + boundary + "--\r\n" };
+  });
+  const api = new GmailApi(email, new GmailConnection(config, store, () => client), store);
+  const threads = (from: number) =>
+    api.batch<{ id: string }>(
+      Array.from({ length: 50 }, (_, i) => ({ resource: `threads/${from + i}`, params: { format: "metadata" } })),
+      0,
+    );
+  // Two pages, 4,000 units, of which Google refuses the last ten reads of the
+  // first. Asking again for those ten (400 units, after the tenth of a minute
+  // the refusal wrote off) no longer fits in what is left of the 5,400.
+  const second = threads(100).catch((error: unknown) => error);
+  const first = threads(0);
+  await vi.advanceTimersByTimeAsync(5_000);
+  await second;
+  const answers = await first;
+  // The forty that arrived are kept; the ten are reported refused.
+  expect(answers.filter((a) => a.data).map((a) => Number(a.data!.id))).toEqual(Array.from({ length: 40 }, (_, i) => i));
+  expect(answers.slice(40).every((a) => a.status === 403)).toBe(true);
+  expect(calls).toBeLessThanOrEqual(3);
+});
+
+it("sends a large account's label reads fifty at a time", async () => {
+  const store = await open();
+  const sizes: number[] = [];
+  const client = google(async (options: any) => {
+    sizes.push((String(options.data).match(/^GET /gm) ?? []).length);
+    return { data: "" };
+  });
+  const api = new GmailApi(email, new GmailConnection(config, store, () => client), store);
+  await api.batch(Array.from({ length: 100 }, (_, i) => ({ resource: `labels/Label_${i}` })), 1);
+  expect(sizes).toEqual([50, 50]);
+});

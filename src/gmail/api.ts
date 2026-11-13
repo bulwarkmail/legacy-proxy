@@ -129,8 +129,8 @@ export const MAX_QUEUE_WAIT_MS = 10_000;
 export const MAX_BATCH = 100;
 
 /**
- * Message and thread reads sent to Google in one go; a larger batch is sent in
- * turns of this many.
+ * Reads sent to Google in one go; a larger batch is sent in turns of this
+ * many.
  *
  * Google answers a batch in about a second whether it holds 25 reads or 50,
  * so a page's fifty rows go together: in two turns they took 2.2 s instead of
@@ -262,8 +262,9 @@ export class GmailApi {
       // turned away between two and eighteen ("Too many concurrent requests
       // for user", 12/11/2026). A page goes at once all the same - see
       // BATCH_AT_ONCE - and the hundred reads a caller may ask for in two turns.
-      // Labels answer too fast to pile up: a hundred of them go in one request.
-      const atOnce = /^(messages|threads)\//.test(reads[0]!.resource) ? BATCH_AT_ONCE : MAX_BATCH;
+      // Label reads crowd the same way: a hundred labels in one batch had a
+      // third of them turned away, on every folder list of a large account.
+      const atOnce = BATCH_AT_ONCE;
       const answers: Awaited<ReturnType<typeof this.batchOnce<T>>> = [];
       for (let offset = 0; offset < pending.length; offset += atOnce) {
         const turn = pending.slice(offset, offset + atOnce).map((index) => reads[index]!);
@@ -272,6 +273,15 @@ export class GmailApi {
           // Paid for above; and a part Google turned away for crowding was
           // never run, so asking again is not a second purchase.
           answers.push(...(await this.batchOnce<T>(turn, cost, round === 0 || unpaid)));
+        } catch (error) {
+          // A later round that the minute has no room for (or that Google
+          // refuses whole) must not take the answers of the earlier rounds
+          // with it: they were paid for and they arrived. The parts still
+          // refused stay refused, as when the rounds run out.
+          if (round === 0 || !(error instanceof JmapError) || error.type !== "serverUnavailable")
+            throw error;
+          if (out.every((answer) => answer.status === 429 || answer.status === 403)) throw error;
+          return out;
         } finally {
           this.leave(turn.length);
         }
@@ -484,6 +494,9 @@ export class GmailApi {
     // Every time the request is sent, a retry included: each one is a call
     // Google counts and prices.
     let sends = 0;
+    // The sends that were booked against the minute: all but the ones Google
+    // turned away for crowding and never ran.
+    let paid = 0;
     if (this.waiting.length >= 200)
       throw new (method ? GmailNotSent : JmapError)(
         "serverUnavailable",
@@ -567,6 +580,7 @@ export class GmailApi {
         // Every attempt is a call Google counts, a retry included - but not
         // one it turned away for crowding, which it never ran.
         if (!(prepared?.prepaid && attempt === 0) && !unpaid) await this.reserve(cost);
+        if (!unpaid) paid++;
         unpaid = false;
         // A sibling request can extend the cooldown while this one is waiting.
         while (this.blockedUntil > Date.now()) {
@@ -659,6 +673,10 @@ export class GmailApi {
                 setTimeout(resolve, CROWD_RETRY_MS * (attempt + 1)),
               );
               unpaid = true;
+              // Not dispatched after all: if the next pass gives up before it
+              // sends (a long cooldown set by a sibling), a write must still
+              // read as never sent, not as a send of unknown outcome.
+              dispatched = false;
               continue;
             }
           }
@@ -749,7 +767,7 @@ export class GmailApi {
       if (trace) {
         trace.calls += sends;
         trace.reads += (prepared?.reads ?? 1) * sends;
-        trace.units += cost * sends;
+        trace.units += cost * paid;
         trace.netMs += net;
         trace.waitMs += performance.now() - began - net;
       }
