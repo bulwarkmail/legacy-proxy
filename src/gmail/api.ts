@@ -232,6 +232,9 @@ export class GmailApi {
     const trace = currentTrace();
     const began = performance.now();
     let net = 0;
+    // Every time the request is sent, a retry included: each one is a call
+    // Google counts and prices.
+    let sends = 0;
     if (this.waiting.length >= 200)
       throw new (method ? GmailNotSent : JmapError)(
         "serverUnavailable",
@@ -251,6 +254,9 @@ export class GmailApi {
         this.waiting.push(admit);
       });
       // Not admitted means no slot was handed over: nothing to release below.
+      // The wait is booked here, because that `finally` is never reached: a
+      // call that queued until it timed out is exactly what the log is for.
+      if (!admitted && trace) trace.waitMs += performance.now() - began;
       if (!admitted)
         throw new (method ? GmailNotSent : JmapError)(
           "serverUnavailable",
@@ -325,6 +331,7 @@ export class GmailApi {
           await new Promise((resolve) => setTimeout(resolve, wait));
         }
         const sent = performance.now();
+        sends++;
         try {
           dispatched = true;
           const { data } = await client.request<T>(
@@ -385,7 +392,8 @@ export class GmailApi {
             (error as { code?: string; cause?: { code?: string } }).code ??
             (error as { cause?: { code?: string } }).cause?.code;
           if (rateLimited) {
-            if (trace) trace.refused++;
+            // A refused batch envelope turns away every read it carried.
+            if (trace) trace.refused += prepared?.reads ?? 1;
             log.info(
               {
                 resource: resource.split("/")[0],
@@ -482,9 +490,9 @@ export class GmailApi {
       throw mapped;
     } finally {
       if (trace) {
-        trace.calls++;
-        trace.reads += prepared?.reads ?? 1;
-        trace.units += cost;
+        trace.calls += sends;
+        trace.reads += (prepared?.reads ?? 1) * sends;
+        trace.units += cost * sends;
         trace.netMs += net;
         trace.waitMs += performance.now() - began - net;
       }

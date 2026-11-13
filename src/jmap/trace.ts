@@ -13,7 +13,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
  * time with no upstream work of their own.
  */
 export interface CallTrace {
-  /** Upstream requests sent (a batch counts once). */
+  /** Upstream requests sent (a batch counts once, a retry counts again). */
   calls: number;
   /** Reads carried by those requests (a batch of 50 counts 50). */
   reads: number;
@@ -44,8 +44,39 @@ export const runTraced = <T>(trace: CallTrace, work: () => Promise<T>): Promise<
   storage.run(trace, work);
 export const currentTrace = (): CallTrace | undefined => storage.getStore();
 
-/** Filter keys whose value is something the user typed or an address. */
-const TEXT_KEYS = new Set(["text", "from", "to", "cc", "bcc", "subject", "body", "header", "name"]);
+/**
+ * Filter keys whose values say what kind of query this is and nothing about
+ * the user: mailboxes, keywords, dates, sizes, flags. Every other key - search
+ * text, addresses, a contact's uid, whatever a method this proxy does not even
+ * serve was sent - is logged as the kind and length of its value only. A list
+ * of what is safe, not of what is not: a key nobody thought of stays out.
+ */
+const SHOWN_KEYS = new Set([
+  "operator",
+  "inMailbox",
+  "inMailboxOtherThan",
+  "hasKeyword",
+  "notKeyword",
+  "allInThreadHaveKeyword",
+  "someInThreadHaveKeyword",
+  "noneInThreadHaveKeyword",
+  "before",
+  "after",
+  "minSize",
+  "maxSize",
+  "hasAttachment",
+  "role",
+  "hasAnyRole",
+  "isSubscribed",
+  "parentId",
+  // Sort comparators.
+  "property",
+  "isAscending",
+  "keyword",
+]);
+
+const hidden = (value: unknown): string =>
+  `<${Array.isArray(value) ? "array" : value === null ? "null" : typeof value} ${JSON.stringify(value)?.length ?? 0}>`;
 
 function redact(value: unknown, depth = 0): unknown {
   if (depth > 6) return "…";
@@ -57,10 +88,24 @@ function redact(value: unknown, depth = 0): unknown {
     return Object.fromEntries(
       Object.entries(value).map(([key, v]) => [
         key,
-        TEXT_KEYS.has(key) ? `<${JSON.stringify(v)?.length ?? 0} chars>` : redact(v, depth + 1),
+        key === "conditions"
+          ? redact(v, depth + 1)
+          : !SHOWN_KEYS.has(key)
+            ? hidden(v)
+            : typeof v === "object" && v !== null
+              ? // A shown key holds ids or flags, never an object to walk into.
+                Array.isArray(v) && v.every((x) => typeof x === "string")
+                ? v.length > 8
+                  ? [...v.slice(0, 8), `…+${v.length - 8}`]
+                  : v
+                : hidden(v)
+              : typeof v === "string" && v.length > 80
+                ? v.slice(0, 80) + "…"
+                : v,
       ]),
     );
-  return typeof value === "string" && value.length > 80 ? value.slice(0, 80) + "…" : value;
+  // A bare value where a condition was expected.
+  return hidden(value);
 }
 
 /**

@@ -8,7 +8,13 @@ it("describes a call by its filter and window, never by what the user typed", ()
     accountId: "g_1",
     filter: {
       operator: "AND",
-      conditions: [{ inMailbox: "l_INBOX" }, { hasKeyword: "$seen" }, { text: "segreto di stato" }, { from: "a@b.example" }],
+      conditions: [
+        { inMailbox: "l_INBOX" },
+        { hasKeyword: "$seen" },
+        { text: "segreto di stato" },
+        { from: "a@b.example" },
+        { inMailboxOtherThan: ["l_TRASH", "l_SPAM"] },
+      ],
     },
     sort: [{ property: "receivedAt", isAscending: false }],
     limit: 50,
@@ -17,18 +23,43 @@ it("describes a call by its filter and window, never by what the user typed", ()
     ids: ["m_1", "m_2", "m_3"],
     properties: ["id", "subject"],
   });
-  expect(shape).toMatchObject({
-    filter: { operator: "AND", conditions: [{ inMailbox: "l_INBOX" }, { hasKeyword: "$seen" }, {}, {}] },
+  expect(shape).toEqual({
+    filter: {
+      operator: "AND",
+      conditions: [
+        { inMailbox: "l_INBOX" },
+        { hasKeyword: "$seen" },
+        { text: "<string 18>" },
+        { from: "<string 13>" },
+        { inMailboxOtherThan: ["l_TRASH", "l_SPAM"] },
+      ],
+    },
+    sort: [{ property: "receivedAt", isAscending: false }],
     limit: 50,
     position: 0,
     calculateTotal: true,
     ids: 3,
     properties: ["id", "subject"],
   });
-  const logged = JSON.stringify(shape);
-  expect(logged).not.toContain("segreto");
-  expect(logged).not.toContain("a@b.example");
-  expect(logged).not.toContain("m_1");
+});
+
+it("shows only the filter keys known to be safe, whatever the method", () => {
+  // What the webmail sends to ContactCard/query, and keys nobody listed.
+  const logged = JSON.stringify(
+    describeArgs({
+      filter: {
+        uid: "urn:uuid:5f0c1a2e-secret",
+        email: "someone@example.com",
+        phone: "+39 333 1234567",
+        inMailbox: { nested: "l_SECRET" },
+        operator: "OR",
+        conditions: [{ anything: { deep: "private" } }, "bare-secret"],
+      },
+    }),
+  );
+  for (const secret of ["5f0c1a2e", "someone@", "333", "l_SECRET", "private", "bare-secret"])
+    expect(logged).not.toContain(secret);
+  expect(JSON.parse(logged).filter).toMatchObject({ operator: "OR", uid: "<string 26>" });
 });
 
 it("books upstream work to the call it was done for", async () => {
