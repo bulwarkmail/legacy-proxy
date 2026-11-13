@@ -136,6 +136,54 @@ it("reads a list row that asks for hasAttachment as metadata, telling the flag f
   expect(formats).toEqual(["metadata", "full"]);
 });
 
+it("reads a listed page's rows and conversation sizes together, once, ahead of the calls that ask for them", async () => {
+  const store = open();
+  const ids = Array.from({ length: 6 }, (_, i) => "m" + i);
+  const inbox = { id: "INBOX", name: "INBOX", type: "system", messagesTotal: 6, messagesUnread: 0 };
+  const get = vi.fn(async (resource: string, _cost: number, _params: any = {}) => {
+    if (resource === "profile") return { ...profile, messagesTotal: 6 };
+    if (resource === "labels") return { labels: [inbox] };
+    if (resource === "labels/INBOX") return inbox;
+    if (resource === "messages") return { messages: ids.map((id) => ({ id, threadId: "t" + id })) };
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const batches: { resource: string; format?: string; reads: number }[] = [];
+  const batch = vi.fn(async (reads: { resource: string; params?: Record<string, string> }[]) => {
+    batches.push({ resource: reads[0]!.resource.split("/")[0]!, format: reads[0]!.params?.format, reads: reads.length });
+    return reads.map((read) => {
+      const thread = read.resource.split("/")[1]!;
+      const id = thread.slice(1);
+      return { status: 200, data: { id: thread, messages: [{ ...message, id, threadId: thread }] } };
+    });
+  });
+  const mail = new GmailMail(email, { get, batch } as any, store);
+  const methods = mail.methods();
+  const listed = (await methods["Email/query"]!({
+    accountId: mail.accountId,
+    filter: { inMailbox: "l_INBOX" },
+    limit: 50,
+  })) as any;
+  const rows = (await methods["Email/get"]!({
+    accountId: mail.accountId,
+    ids: listed.ids,
+    properties: ["threadId", "subject", "hasAttachment"],
+  })) as any;
+  const threads = (await methods["Thread/get"]!({
+    accountId: mail.accountId,
+    ids: rows.list.map((r: any) => r.threadId),
+  })) as any;
+  expect(rows.list.map((r: any) => r.subject)).toEqual(Array(6).fill("Hello"));
+  expect(threads.list.map((t: any) => t.emailIds)).toEqual(ids.map((id) => ["m_" + id]));
+  // One batch, of threads read with their messages' metadata, started by the
+  // query: the two calls after it found everything there, and no message was
+  // read on its own.
+  expect(batches).toEqual([{ resource: "threads", format: "metadata", reads: 6 }]);
+  expect(get.mock.calls.filter((c) => String(c[0]).startsWith("messages/") || String(c[0]).startsWith("threads/"))).toEqual([]);
+  // A count warms nothing.
+  await methods["Email/query"]!({ accountId: mail.accountId, filter: { inMailbox: "l_INBOX" }, limit: 1, position: 3 });
+  expect(batch).toHaveBeenCalledTimes(1);
+});
+
 it("fetches threads concurrently, at most four at a time, in request order", async () => {
   const store = open();
   let active = 0;

@@ -66,14 +66,20 @@ const MAX_BLOB = 50_000_000;
 /** How long an idle account keeps its label counters; any change moves the cache key first. */
 const LABELS_TTL = 10 * 60_000;
 const SEND_AS_TTL = 60 * 60_000;
-/** The smallest page worth starting early: below it the query is a count or a probe, not a list. */
+/** The smallest page worth starting early or reading ahead: below it the query is a count or a probe, not a list. */
 const LIST_FROM = 5;
+/** Threads re-read after a change, newest last in Gmail's history. */
+const ARRIVALS_WARMED = 10;
+/** New mail read whole as it arrives. */
+const ARRIVALS_READ_WHOLE = 5;
 /** A thread index older than this is listed again: cheap insurance against a history record that never came. */
 const THREAD_INDEX_MAX_AGE = 7 * 24 * 60 * 60_000;
 /** How long a failed index build waits before the next attempt. */
 const THREAD_INDEX_RETRY_MS = 5 * 60_000;
 /** Label changes sent to Gmail side by side in one `Email/set`. */
 const WRITES_AT_ONCE = 6;
+/** Quota units the minute must still hold for the page after the one listed to be read ahead. */
+const READ_AHEAD_SPARE_UNITS = 3000;
 /**
  * Distinct labels {@link GmailMail.labelDetail} reads one by one in an account
  * state before it reads them all at once through {@link GmailMail.labels}.
@@ -197,6 +203,10 @@ export class GmailMail {
   private indexDeleted?: Set<string>;
   private indexRetryAt = 0;
   private flights = new Map<string, Promise<unknown>>();
+  /** The page reads {@link warm} has in flight, if any. */
+  private warming?: Promise<void>;
+  /** Messages a batch is reading right now, each with the (never failing) end of that read. */
+  private reading = new Map<string, Promise<void>>();
   /** Labels {@link labelDetail} was asked for in the current account state. */
   private labelsAsked?: { state: string; ids: Set<string> };
   /** Messages Gmail delivered during the last push sync, for push fan-out. */
@@ -212,7 +222,7 @@ export class GmailMail {
   constructor(
     private email: string,
     private api: Pick<GmailApi, "get"> &
-      Partial<Pick<GmailApi, "mutate" | "batch">>,
+      Partial<Pick<GmailApi, "mutate" | "batch" | "spare">>,
     private store: GmailStore,
     private writeEnabled = false,
     private composeEnabled = false,
@@ -407,15 +417,23 @@ export class GmailMail {
         if (this.store.revision(this.email) === revision) {
           const changed = classify(history.records);
           this.applyHistory(history.historyId, changed);
-          // What just arrived is what the client reads next. Fetching it here,
-          // in one batch, is the difference between a notification the user
-          // opens instantly and one that waits on Google. Detached on purpose:
-          // nothing about this request depends on it. A message that was only
-          // relabelled kept its cached copy and needs no read at all.
-          void this.prefetch(
-            changed.drop.slice(0, MAX_BATCH),
-            "metadata",
-          ).catch(() => {});
+          // What just arrived is what the user opens next. Reading it here
+          // is the difference between a notification that opens at once and
+          // one that waits on Google. Detached on purpose: nothing about
+          // this request depends on it. Only a few: a burst of mail must
+          // not spend the minute on messages nobody may open.
+          if (this.threadIndexReady()) {
+            // Whole: the body is what a tap on the notification shows, and
+            // a whole message answers its list row too.
+            const arrived = delivered.slice(-ARRIVALS_READ_WHOLE);
+            void (arrived.length === 1
+              ? this.message(arrived[0]!, "full")
+              : this.prefetch(arrived, "full")
+            ).catch(() => {});
+          } else
+            void this.prefetchThreadRows(
+              changed.threads.slice(-ARRIVALS_WARMED),
+            ).catch(() => {});
         }
       } catch (e) {
         if (!(e instanceof JmapError) || e.type !== "cannotCalculateChanges")
@@ -872,6 +890,71 @@ export class GmailMail {
     }));
   }
   /**
+   * Starts reading the rows and the conversation sizes of a page a query has
+   * just listed, and returns the page.
+   *
+   * A client that lists a folder page asks for its messages next and for their
+   * threads after that, each waiting on the one before - two round trips to
+   * Google in a row, a second apiece on a cold page. The listing already names
+   * both, so they are read together, while the answer to the query is still on
+   * its way to the client; the `Email/get` and `Thread/get` that follow wait
+   * for this instead of asking again. A count (`limit: 1`) warms nothing.
+   *
+   * Rows not read before are read through their threads (see
+   * {@link prefetchThreadRows}): one batch answers both calls.
+   */
+  private warm<R extends { id: string; threadId: string }>(
+    page: R[],
+    /** The rows after this page, when the listing happened to return them. */
+    next: R[] = [],
+  ): R[] {
+    if (!this.api.batch || page.length < LIST_FROM) return page;
+    const previous = this.warming;
+    const indexed = this.threadIndexReady();
+    const flight: Promise<void> = (async () => {
+      await previous;
+      // With the index the conversations are already known: only the rows
+      // are read, at 20 units each instead of 40 a thread.
+      if (indexed) return this.prefetch(page.map((r) => r.id), "metadata", true);
+      const cold = page.filter(
+        (r) =>
+          !messageKeys("metadata", this.store.upstreamId(this.email, r.id)).some((key) =>
+            this.store.has(this.email, key),
+          ),
+      );
+      // A row of a conversation not read yet comes with it; one of a known
+      // conversation is read on its own, at half the price.
+      await this.prefetchThreadRows(
+        cold
+          .filter((r) => !this.store.has(this.email, `thread:v3:t_${r.threadId}`))
+          .map((r) => r.threadId),
+      );
+      await Promise.all([
+        this.prefetch(page.map((r) => r.id), "metadata", true),
+        this.prefetchThreads([...new Set(page.map((r) => "t_" + r.threadId))], true),
+      ]);
+    })()
+      // Best effort: whoever needs the data asks again and reports the failure.
+      .catch(() => {})
+      .finally(() => {
+        if (this.warming === flight) this.warming = undefined;
+      });
+    this.warming = flight;
+    // The page after this one is where a scroll goes next. Its rows are read
+    // once this page's are in, so scrolling finds them there instead of
+    // waiting a second for Google - but only out of a minute that has plenty
+    // left, and only with the index, when rows are all a page costs.
+    if (indexed && next.length >= LIST_FROM)
+      void flight
+        .then(() =>
+          (this.api.spare?.() ?? 0) >= READ_AHEAD_SPARE_UNITS
+            ? this.prefetch(next.map((r) => r.id), "metadata", true)
+            : undefined,
+        )
+        .catch(() => {});
+    return page;
+  }
+  /**
    * Fills the cache for `ids` with one batch read per hundred messages.
    *
    * `Email/get` asks for a page at a time - fifty messages for a folder view -
@@ -886,45 +969,115 @@ export class GmailMail {
   private async prefetch(
     ids: string[],
     format: MessageFormat,
+    /** Set by {@link warm} for its own reads, which must not wait on themselves. */
+    warming = false,
   ): Promise<void> {
     if (!this.api.batch || ids.length < 2) return;
-    const wanted = [
+    if (!warming) await this.warming;
+    const native = [
       ...new Set(
         ids
           .map((id) => this.store.upstreamId(this.email, id))
-          .filter(
-            (id) =>
-              /^[A-Za-z0-9_-]{1,128}$/.test(id) &&
-              // Asked without decrypting: on a warm page that was fifty
-              // messages opened here only to be opened again below.
-              !messageKeys(format, id).some((key) => this.store.has(this.email, key)),
-          ),
+          .filter((id) => /^[A-Za-z0-9_-]{1,128}$/.test(id)),
       ),
     ];
+    // Some of these may be on their way already - read ahead of a scroll, or
+    // asked for by another tab: wait for that answer rather than buy it twice.
+    const underway = new Set(
+      native.flatMap((id) => this.reading.get(id) ?? []),
+    );
+    if (underway.size) await Promise.all(underway);
+    const wanted = native.filter(
+      (id) =>
+        // Asked without decrypting: on a warm page that was fifty
+        // messages opened here only to be opened again below.
+        !messageKeys(format, id).some((key) => this.store.has(this.email, key)),
+    );
+    for (let offset = 0; offset < wanted.length; offset += MAX_BATCH) {
+      const page = wanted.slice(offset, offset + MAX_BATCH);
+      const read = this.readRows(page, format);
+      const settled = read.then(
+        () => {},
+        () => {},
+      );
+      for (const id of page) this.reading.set(id, settled);
+      try {
+        if (!(await read)) return;
+      } finally {
+        for (const id of page)
+          if (this.reading.get(id) === settled) this.reading.delete(id);
+      }
+    }
+  }
+  /** One batch of {@link prefetch}. False when the rest should be left to per-message reads. */
+  private async readRows(page: string[], format: MessageFormat): Promise<boolean> {
+    const revision = this.store.revision(this.email);
+    let answers: { status: number; data?: GmailMessage }[];
+    try {
+      answers = await this.api.batch!<GmailMessage>(
+        page.map((id) => ({
+          resource: `messages/${encodeURIComponent(id)}`,
+          params: { format },
+        })),
+        5,
+      );
+    } catch (error) {
+      // A batch Google throttled is the one failure that must not fall back
+      // to per-message reads: they would spend the same exhausted budget.
+      if (error instanceof JmapError && error.type === "serverUnavailable")
+        throw error;
+      return false;
+    }
+    if (this.store.revision(this.email) !== revision) return false;
+    for (const [index, id] of page.entries()) {
+      const answer = answers[index];
+      if (answer?.data)
+        this.store.cache(this.email, messageKey(format, id), answer.data, MESSAGE_TTL);
+    }
+    return true;
+  }
+  /**
+   * Reads whole threads with their messages' metadata: who is in each
+   * conversation and every member's list row, in one batch.
+   *
+   * Google prices a thread read at 40 units whether it returns bare ids or
+   * every message's headers, and a message read at 20. A page of fifty rows
+   * read as messages and then as threads is 3,000 units and two round trips;
+   * read as threads that carry their messages it is at most 2,000 and one.
+   * With 6,000 units to the minute, that is the difference between two cold
+   * pages and three.
+   *
+   * Best effort like {@link prefetch}. `ids` are Gmail's own thread ids.
+   */
+  private async prefetchThreadRows(ids: string[]): Promise<void> {
+    if (!this.api.batch) return;
+    const wanted = [...new Set(ids)].filter((id) => /^[A-Za-z0-9_-]{1,128}$/.test(id));
+    if (wanted.length < 2) return;
     for (let offset = 0; offset < wanted.length; offset += MAX_BATCH) {
       const page = wanted.slice(offset, offset + MAX_BATCH);
       const revision = this.store.revision(this.email);
-      let answers: { status: number; data?: GmailMessage }[];
+      let answers: { status: number; data?: { messages?: GmailMessage[] } }[];
       try {
-        answers = await this.api.batch<GmailMessage>(
+        answers = await this.api.batch<{ messages?: GmailMessage[] }>(
           page.map((id) => ({
-            resource: `messages/${encodeURIComponent(id)}`,
-            params: { format },
+            resource: `threads/${encodeURIComponent(id)}`,
+            params: { format: "metadata" },
           })),
-          5,
+          40,
         );
       } catch (error) {
-        // A batch Google throttled is the one failure that must not fall back
-        // to per-message reads: they would spend the same exhausted budget.
         if (error instanceof JmapError && error.type === "serverUnavailable")
           throw error;
         return;
       }
       if (this.store.revision(this.email) !== revision) return;
       for (const [index, id] of page.entries()) {
-        const answer = answers[index];
-        if (answer?.data)
-          this.store.cache(this.email, messageKey(format, id), answer.data, MESSAGE_TTL);
+        const thread = answers[index]?.data;
+        if (!thread) continue;
+        this.store.cache(this.email, `thread:v3:t_${id}`, threadMembers(thread), MESSAGE_TTL);
+        for (const message of thread.messages ?? [])
+          if (!this.store.has(this.email, messageKey("full", message.id)))
+            this.store.cache(this.email, messageKey("metadata", message.id), message, MESSAGE_TTL);
       }
     }
   }
@@ -933,8 +1086,9 @@ export class GmailMail {
    * so a folder page's conversation sizes cost one round trip to Google
    * instead of fifty, four at a time. Best effort like {@link prefetch}.
    */
-  private async prefetchThreads(ids: string[]): Promise<void> {
+  private async prefetchThreads(ids: string[], warming = false): Promise<void> {
     if (!this.api.batch || ids.length < 2) return;
+    if (!warming) await this.warming;
     const wanted = [
       ...new Set(
         ids.filter(
@@ -1178,7 +1332,13 @@ export class GmailMail {
       const count = Math.min(limit as number, MAX_QUERY);
       // Ask Gmail for no more than the page needs: a count asks for one id,
       // and listing 500 of a large label to return one takes seconds.
-      const pageSize = String(Math.min(500, Math.max(1, (pos as number) + count)));
+      // A page that will be shown asks for the ids of the one after it in
+      // the same call: they cost nothing more and let {@link warm} read
+      // ahead of a scroll.
+      const ahead = count >= LIST_FROM ? count : 0;
+      const pageSize = String(
+        Math.min(500, Math.max(1, (pos as number) + count + ahead)),
+      );
       type Listing = Record<string, string | string[]>;
       const labelListing = (id: string): Listing => ({
         labelIds: unreadIn ? [id, "UNREAD"] : id,
@@ -1272,9 +1432,13 @@ export class GmailMail {
           ]),
           canCalculateChanges: false,
           position: pos,
-          ids: [...refs.values()]
-            .slice(pos as number, (pos as number) + count)
-            .map((r) => "m_" + this.store.originalId(this.email, r.id)),
+          ids: this.warm(
+            [...refs.values()].slice(pos as number, (pos as number) + count),
+            [...refs.values()].slice(
+              (pos as number) + count,
+              (pos as number) + count + ahead,
+            ),
+          ).map((r) => "m_" + this.store.originalId(this.email, r.id)),
           ...(args.calculateTotal === true ? { total } : {}),
           ...((limit as number) > MAX_QUERY ? { limit: MAX_QUERY } : {}),
         };
