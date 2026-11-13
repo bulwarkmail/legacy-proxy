@@ -15,6 +15,8 @@ import {
 import { ownerOnly, SEALED_AGAIN_MESSAGE } from "../state/store.js";
 import { log } from "../util/log.js";
 import type { EmailPushConfig } from "./emailpush.js";
+import { currentTrace } from "../jmap/trace.js";
+import type { HistoryChange } from "./history.js";
 
 export interface GmailProfile {
   emailAddress: string;
@@ -104,6 +106,7 @@ export class GmailStore {
       );
       CREATE INDEX IF NOT EXISTS gmail_cache_expires ON gmail_cache(expires);
       CREATE INDEX IF NOT EXISTS gmail_cache_touched ON gmail_cache(email, touched);
+      CREATE INDEX IF NOT EXISTS gmail_cache_size ON gmail_cache(email, size);
       CREATE TABLE IF NOT EXISTS gmail_connection (
         email TEXT PRIMARY KEY,
         vault BLOB NOT NULL,
@@ -155,6 +158,7 @@ export class GmailStore {
         );
         CREATE INDEX gmail_cache_expires ON gmail_cache(expires);
         CREATE INDEX gmail_cache_touched ON gmail_cache(email, touched);
+        CREATE INDEX gmail_cache_size ON gmail_cache(email, size);
       `);
     }
   }
@@ -602,6 +606,76 @@ export class GmailStore {
         .run(email, history);
     })();
   }
+  /**
+   * Moves the cursor to `history` and brings the local copy along: forgets
+   * what the run created or deleted and moves labels on what it only
+   * relabelled. One transaction, so the cursor never claims more than the
+   * copy holds.
+   */
+  applyHistory(email: string, history: string, change: HistoryChange): void {
+    this.db.transaction(() => {
+      const previous = this.cursor(email);
+      if (previous && BigInt(previous) >= BigInt(history)) return;
+      if (change.drop.length || change.threads.length || change.relabel.size)
+        this.drop(email, change.drop, change.threads);
+      for (const [id, moves] of change.relabel)
+        this.relabel(email, id, (labels) => {
+          for (const move of moves) {
+            for (const label of move.add) labels.add(label);
+            for (const label of move.remove) labels.delete(label);
+          }
+        });
+      this.db
+        .prepare(
+          "INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history",
+        )
+        .run(email, history);
+    })();
+  }
+  /** Sets the labels of a cached message to what a write just returned. */
+  setLabels(email: string, id: string, labelIds: string[]): void {
+    this.relabel(email, id, (labels) => {
+      labels.clear();
+      for (const label of labelIds) labels.add(label);
+    });
+  }
+  /** Rewrites the label set on every cached copy of a message, keeping its expiry. */
+  private relabel(
+    email: string,
+    id: string,
+    edit: (labels: Set<string>) => void,
+  ): void {
+    for (const key of ["message:v2:" + id, "meta:v2:" + id]) {
+      const row = this.db
+        .prepare("SELECT value FROM gmail_cache WHERE email=? AND key=?")
+        .get(email, key) as { value: Buffer } | undefined;
+      if (!row) continue;
+      try {
+        const place = sealPlace.gmailCache(email, key);
+        const message = JSON.parse(
+          unseal(this.vaultKey, place, row.value).toString("utf8"),
+        ) as { labelIds?: string[] };
+        const labels = new Set(message.labelIds ?? []);
+        edit(labels);
+        message.labelIds = [...labels];
+        const value = seal(
+          this.vaultKey,
+          place,
+          Buffer.from(JSON.stringify(message), "utf8"),
+        );
+        this.db
+          .prepare(
+            "UPDATE gmail_cache SET value=?, size=? WHERE email=? AND key=?",
+          )
+          .run(value, value.length, email, key);
+      } catch {
+        // Unreadable: let the next read fetch it again.
+        this.db
+          .prepare("DELETE FROM gmail_cache WHERE email=? AND key=?")
+          .run(email, key);
+      }
+    }
+  }
   mailboxSnapshot(
     email: string,
     state: string,
@@ -625,7 +699,27 @@ export class GmailStore {
     return row ? JSON.parse(row.value) : null;
   }
   private lastSweep = 0;
+  /** Whether a live entry exists, without paying to decrypt it. */
+  has(email: string, key: string): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM gmail_cache WHERE email=? AND key=? AND expires>?",
+        )
+        .get(email, key, Date.now()) !== undefined
+    );
+  }
   cached<T>(email: string, key: string): T | null {
+    const trace = currentTrace();
+    if (!trace) return this.read<T>(email, key);
+    const began = performance.now();
+    try {
+      return this.read<T>(email, key);
+    } finally {
+      trace.cacheMs += performance.now() - began;
+    }
+  }
+  private read<T>(email: string, key: string): T | null {
     const now = Date.now();
     const row = this.db
       .prepare(
@@ -661,6 +755,16 @@ export class GmailStore {
    * costs microseconds against the network round trip it saves.
    */
   cache(email: string, key: string, data: unknown, ttl: number): void {
+    const trace = currentTrace();
+    if (!trace) return this.write(email, key, data, ttl);
+    const began = performance.now();
+    try {
+      this.write(email, key, data, ttl);
+    } finally {
+      trace.cacheMs += performance.now() - began;
+    }
+  }
+  private write(email: string, key: string, data: unknown, ttl: number): void {
     const value = seal(this.vaultKey, sealPlace.gmailCache(email, key), Buffer.from(JSON.stringify(data), "utf8"));
     const size = value.length;
     if (size > 16 * 1024 * 1024) return;
@@ -677,10 +781,14 @@ export class GmailStore {
         ON CONFLICT(email,key) DO UPDATE SET value=excluded.value,expires=excluded.expires,touched=excluded.touched,size=excluded.size`,
         )
         .run(email, key, value, now + ttl, now, size);
+      // Answered from the (email, size) index. Off the table itself the sum
+      // walks every cached message of the account to reach a column stored
+      // behind its body - 0.16 s on a 175 MB cache, on every single write, a
+      // hundred of them for one folder page, with the event loop held.
       let total = (
         this.db
           .prepare(
-            "SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache WHERE email=?",
+            "SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache INDEXED BY gmail_cache_size WHERE email=?",
           )
           .get(email) as {
           n: number;
