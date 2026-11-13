@@ -15,6 +15,8 @@ import {
 import { ownerOnly, SEALED_AGAIN_MESSAGE } from "../state/store.js";
 import { log } from "../util/log.js";
 import type { EmailPushConfig } from "./emailpush.js";
+import { currentTrace } from "../jmap/trace.js";
+import type { HistoryChange } from "./history.js";
 
 export interface GmailProfile {
   emailAddress: string;
@@ -76,6 +78,16 @@ export class GmailStore {
       CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
       CREATE TABLE IF NOT EXISTS gmail_submission (email TEXT NOT NULL,original TEXT NOT NULL,id TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT,PRIMARY KEY(email,original));
       CREATE TABLE IF NOT EXISTS gmail_revision (email TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS gmail_thread_index (
+        email TEXT NOT NULL, message TEXT NOT NULL, thread TEXT NOT NULL, ord INTEGER NOT NULL,
+        PRIMARY KEY(email, message)
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS gmail_thread_index_thread ON gmail_thread_index(email, thread, ord);
+      CREATE TABLE IF NOT EXISTS gmail_thread_index_next (
+        email TEXT NOT NULL, message TEXT NOT NULL, thread TEXT NOT NULL, ord INTEGER NOT NULL,
+        PRIMARY KEY(email, message)
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS gmail_thread_index_state (email TEXT PRIMARY KEY, complete INTEGER NOT NULL, built_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_schedule (
         id TEXT PRIMARY KEY, email TEXT NOT NULL, original TEXT NOT NULL, identity TEXT NOT NULL, thread TEXT NOT NULL,
         envelope TEXT NOT NULL, raw_hash TEXT NOT NULL, send_at INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT,
@@ -104,6 +116,7 @@ export class GmailStore {
       );
       CREATE INDEX IF NOT EXISTS gmail_cache_expires ON gmail_cache(expires);
       CREATE INDEX IF NOT EXISTS gmail_cache_touched ON gmail_cache(email, touched);
+      CREATE INDEX IF NOT EXISTS gmail_cache_size ON gmail_cache(email, size);
       CREATE TABLE IF NOT EXISTS gmail_connection (
         email TEXT PRIMARY KEY,
         vault BLOB NOT NULL,
@@ -155,6 +168,7 @@ export class GmailStore {
         );
         CREATE INDEX gmail_cache_expires ON gmail_cache(expires);
         CREATE INDEX gmail_cache_touched ON gmail_cache(email, touched);
+        CREATE INDEX gmail_cache_size ON gmail_cache(email, size);
       `);
     }
   }
@@ -592,8 +606,11 @@ export class GmailStore {
     this.db.transaction(() => {
       const previous = this.cursor(email);
       if (previous && BigInt(previous) >= BigInt(history)) return;
-      if (reset) this.invalidate(email);
-      else if (messages.length || threads.length)
+      if (reset) {
+        this.invalidate(email);
+        // History that cannot be replayed leaves the index with a hole.
+        this.threadIndexReset(email);
+      } else if (messages.length || threads.length)
         this.drop(email, messages, threads);
       this.db
         .prepare(
@@ -601,6 +618,178 @@ export class GmailStore {
         )
         .run(email, history);
     })();
+  }
+  /**
+   * Moves the cursor to `history` and brings the local copy along: forgets
+   * what the run created or deleted, moves labels on what it only relabelled,
+   * and replays who joined or left which conversation. One transaction, so the
+   * cursor never claims more than the copy holds.
+   */
+  applyHistory(
+    email: string,
+    history: string,
+    change: HistoryChange,
+    /** A listing of the account is under way (see {@link threadIndexBegin}): it must hear of these changes too. */
+    listing = false,
+  ): void {
+    this.db.transaction(() => {
+      const previous = this.cursor(email);
+      if (previous && BigInt(previous) >= BigInt(history)) return;
+      if (change.drop.length || change.threads.length || change.relabel.size)
+        this.drop(email, change.drop, change.threads);
+      for (const [id, moves] of change.relabel)
+        this.relabel(email, id, (labels) => {
+          for (const move of moves) {
+            for (const label of move.add) labels.add(label);
+            for (const label of move.remove) labels.delete(label);
+          }
+        });
+      // Newer than anything listed: a listing numbers downwards from zero.
+      let ord = Date.now() * 1000;
+      for (const table of listing
+        ? ["gmail_thread_index", "gmail_thread_index_next"]
+        : ["gmail_thread_index"]) {
+        const add = this.db.prepare(
+          `INSERT OR IGNORE INTO ${table} VALUES(?,?,?,?)`,
+        );
+        const remove = this.db.prepare(
+          `DELETE FROM ${table} WHERE email=? AND message=?`,
+        );
+        let at = ord;
+        for (const step of change.membership)
+          if ("add" in step) add.run(email, step.add, step.thread, at++);
+          else remove.run(email, step.remove);
+      }
+      this.db
+        .prepare(
+          "INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history",
+        )
+        .run(email, history);
+    })();
+  }
+  /** Sets the labels of a cached message to what a write just returned. */
+  setLabels(email: string, id: string, labelIds: string[]): void {
+    this.relabel(email, id, (labels) => {
+      labels.clear();
+      for (const label of labelIds) labels.add(label);
+    });
+  }
+  /** Rewrites the label set on every cached copy of a message, keeping its expiry. */
+  private relabel(
+    email: string,
+    id: string,
+    edit: (labels: Set<string>) => void,
+  ): void {
+    for (const key of ["message:v2:" + id, "meta:v2:" + id]) {
+      const row = this.db
+        .prepare("SELECT value FROM gmail_cache WHERE email=? AND key=?")
+        .get(email, key) as { value: Buffer } | undefined;
+      if (!row) continue;
+      try {
+        const place = sealPlace.gmailCache(email, key);
+        const message = JSON.parse(
+          unseal(this.vaultKey, place, row.value).toString("utf8"),
+        ) as { labelIds?: string[] };
+        const labels = new Set(message.labelIds ?? []);
+        edit(labels);
+        message.labelIds = [...labels];
+        const value = seal(
+          this.vaultKey,
+          place,
+          Buffer.from(JSON.stringify(message), "utf8"),
+        );
+        this.db
+          .prepare(
+            "UPDATE gmail_cache SET value=?, size=? WHERE email=? AND key=?",
+          )
+          .run(value, value.length, email, key);
+      } catch {
+        // Unreadable: let the next read fetch it again.
+        this.db
+          .prepare("DELETE FROM gmail_cache WHERE email=? AND key=?")
+          .run(email, key);
+      }
+    }
+  }
+  /**
+   * The message-to-thread index: every message of the account and the
+   * conversation it belongs to.
+   *
+   * Gmail charges 40 quota units to say who is in one conversation, and a
+   * client asks that of every row it lists: 2,000 of the 6,000 units a minute
+   * for a page of fifty. Listing ids is the cheap call - 5 units for 500
+   * messages, each with its thread - so the whole account is listed once (800
+   * units for 80,000 messages) and kept current from the history every sync
+   * already reads. From then on a conversation's members cost nothing.
+   *
+   * `ord` puts a conversation's messages in order: a listing runs newest
+   * first and numbers downwards from zero, arrivals count up from the clock.
+   */
+  threadIndexBegin(email: string): void {
+    // Listed beside the index in use, and swapped in when complete: an index
+    // that is only being refreshed keeps answering in the meantime.
+    this.db.prepare("DELETE FROM gmail_thread_index_next WHERE email=?").run(email);
+  }
+  /** One listed page, `firstOrd` for its first (newest) message and downwards. Never replaces a row history has already written. */
+  threadIndexInsert(
+    email: string,
+    rows: { id: string; threadId: string }[],
+    firstOrd: number,
+  ): void {
+    const insert = this.db.prepare(
+      "INSERT OR IGNORE INTO gmail_thread_index_next VALUES(?,?,?,?)",
+    );
+    this.db.transaction(() => {
+      rows.forEach((row, i) => insert.run(email, row.id, row.threadId, firstOrd - i));
+    })();
+  }
+  /** The listing is whole: it becomes the index. */
+  threadIndexComplete(email: string): void {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM gmail_thread_index WHERE email=?").run(email);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_thread_index SELECT email,message,thread,ord FROM gmail_thread_index_next WHERE email=?",
+        )
+        .run(email);
+      this.db.prepare("DELETE FROM gmail_thread_index_next WHERE email=?").run(email);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_thread_index_state VALUES(?,1,?) ON CONFLICT(email) DO UPDATE SET complete=1, built_at=excluded.built_at",
+        )
+        .run(email, Date.now());
+    })();
+  }
+  /** When the index was last listed whole, or null when there is none to answer from. */
+  threadIndexBuiltAt(email: string): number | null {
+    const row = this.db
+      .prepare(
+        "SELECT built_at FROM gmail_thread_index_state WHERE email=? AND complete=1",
+      )
+      .get(email) as { built_at: number } | undefined;
+    return row ? row.built_at : null;
+  }
+  threadIndexReset(email: string): void {
+    this.db
+      .prepare("DELETE FROM gmail_thread_index_state WHERE email=?")
+      .run(email);
+  }
+  /** The messages of a conversation, oldest first. */
+  threadIndexMembers(email: string, thread: string): string[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT message FROM gmail_thread_index WHERE email=? AND thread=? ORDER BY ord",
+        )
+        .all(email, thread) as { message: string }[]
+    ).map((row) => row.message);
+  }
+  threadIndexSize(email: string): number {
+    return (
+      this.db
+        .prepare("SELECT COUNT(*) AS n FROM gmail_thread_index WHERE email=?")
+        .get(email) as { n: number }
+    ).n;
   }
   mailboxSnapshot(
     email: string,
@@ -625,7 +814,27 @@ export class GmailStore {
     return row ? JSON.parse(row.value) : null;
   }
   private lastSweep = 0;
+  /** Whether a live entry exists, without paying to decrypt it. */
+  has(email: string, key: string): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM gmail_cache WHERE email=? AND key=? AND expires>?",
+        )
+        .get(email, key, Date.now()) !== undefined
+    );
+  }
   cached<T>(email: string, key: string): T | null {
+    const trace = currentTrace();
+    if (!trace) return this.read<T>(email, key);
+    const began = performance.now();
+    try {
+      return this.read<T>(email, key);
+    } finally {
+      trace.cacheMs += performance.now() - began;
+    }
+  }
+  private read<T>(email: string, key: string): T | null {
     const now = Date.now();
     const row = this.db
       .prepare(
@@ -661,6 +870,16 @@ export class GmailStore {
    * costs microseconds against the network round trip it saves.
    */
   cache(email: string, key: string, data: unknown, ttl: number): void {
+    const trace = currentTrace();
+    if (!trace) return this.write(email, key, data, ttl);
+    const began = performance.now();
+    try {
+      this.write(email, key, data, ttl);
+    } finally {
+      trace.cacheMs += performance.now() - began;
+    }
+  }
+  private write(email: string, key: string, data: unknown, ttl: number): void {
     const value = seal(this.vaultKey, sealPlace.gmailCache(email, key), Buffer.from(JSON.stringify(data), "utf8"));
     const size = value.length;
     if (size > 16 * 1024 * 1024) return;
@@ -677,10 +896,14 @@ export class GmailStore {
         ON CONFLICT(email,key) DO UPDATE SET value=excluded.value,expires=excluded.expires,touched=excluded.touched,size=excluded.size`,
         )
         .run(email, key, value, now + ttl, now, size);
+      // Answered from the (email, size) index. Off the table itself the sum
+      // walks every cached message of the account to reach a column stored
+      // behind its body - 0.16 s on a 175 MB cache, on every single write, a
+      // hundred of them for one folder page, with the event loop held.
       let total = (
         this.db
           .prepare(
-            "SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache WHERE email=?",
+            "SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache INDEXED BY gmail_cache_size WHERE email=?",
           )
           .get(email) as {
           n: number;
@@ -806,6 +1029,9 @@ export class GmailStore {
       "gmail_watch",
       "gmail_push",
       "gmail_push_sub",
+      "gmail_thread_index",
+      "gmail_thread_index_next",
+      "gmail_thread_index_state",
     ];
     this.db.transaction(() => {
       for (const table of tables)

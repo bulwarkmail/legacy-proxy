@@ -1,6 +1,6 @@
 import {
   readHistory,
-  affected,
+  classify,
   emailDelta,
   addedMessages,
   isDelivery,
@@ -33,6 +33,7 @@ import {
   unsupportedSort,
 } from "../jmap/errors.js";
 import type { MethodTable } from "../jmap/router.js";
+import { log } from "../util/log.js";
 
 const hash = (value: unknown) =>
   crypto
@@ -64,6 +65,15 @@ const MAX_BLOB = 50_000_000;
 /** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
 /** How long an idle account keeps its label counters; any change moves the cache key first. */
 const LABELS_TTL = 10 * 60_000;
+const SEND_AS_TTL = 60 * 60_000;
+/** The smallest page worth starting early: below it the query is a count or a probe, not a list. */
+const LIST_FROM = 5;
+/** A thread index older than this is listed again: cheap insurance against a history record that never came. */
+const THREAD_INDEX_MAX_AGE = 7 * 24 * 60 * 60_000;
+/** How long a failed index build waits before the next attempt. */
+const THREAD_INDEX_RETRY_MS = 5 * 60_000;
+/** Label changes sent to Gmail side by side in one `Email/set`. */
+const WRITES_AT_ONCE = 6;
 /**
  * Distinct labels {@link GmailMail.labelDetail} reads one by one in an account
  * state before it reads them all at once through {@link GmailMail.labels}.
@@ -93,6 +103,31 @@ const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
   "preview",
   "headers",
 ]);
+
+/**
+ * How much of a message is read from Gmail, and at what price.
+ *
+ * - `metadata` (20 quota units): headers, labels and snippet.
+ * - `full` (60): with the MIME tree and the bodies.
+ *
+ * A user gets 6,000 units a minute. A list row used to be read `full`, because
+ * rows ask for `hasAttachment` and only the MIME tree answers that exactly: a
+ * page of fifty cost 3,000 units, half the minute, before its conversation
+ * sizes cost another 2,000. Rows are read as `metadata` now, and the flag is
+ * told from the message's own Content-Type until the message is opened (see
+ * `mapMessage`).
+ */
+type MessageFormat = "full" | "metadata";
+const messageKey = (format: MessageFormat, id: string): string =>
+  `${format === "full" ? "message" : "meta"}:v2:${id}`;
+/** Cache keys that can answer a read of `format`, richest first: a full copy also serves a metadata read. */
+const messageKeys = (format: MessageFormat, id: string): string[] =>
+  format === "full"
+    ? [messageKey("full", id)]
+    : [messageKey("full", id), messageKey("metadata", id)];
+/** What a list row can ask of a message read as `metadata`. */
+const rowProperty = (p: string): boolean =>
+  METADATA_PROPERTIES.has(p) || p === "hasAttachment" || p.startsWith("header:");
 
 /**
  * How long a cached message may outlive its last read.
@@ -157,6 +192,10 @@ export class GmailMail {
   private writeTail: Promise<unknown> = Promise.resolve();
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
+  /** The thread index build in flight, and the messages deleted since it began. */
+  private indexing?: Promise<void>;
+  private indexDeleted?: Set<string>;
+  private indexRetryAt = 0;
   private flights = new Map<string, Promise<unknown>>();
   /** Labels {@link labelDetail} was asked for in the current account state. */
   private labelsAsked?: { state: string; ids: Set<string> };
@@ -181,6 +220,8 @@ export class GmailMail {
     private schedule?: { maxDelayedSend: number; lateTolerance: number },
     private pushEnabled = false,
     private labelTags = true,
+    /** Keep a message-to-thread index of the account (see `GmailStore.threadIndexBegin`). */
+    private threadIndex = false,
   ) {
     this.accountId = gmailAccountId(email);
     this.subscriptions = new GmailSubscriptions(
@@ -258,9 +299,7 @@ export class GmailMail {
   ): Promise<Record<string, unknown>[]> {
     const ids = [...this.lastDelivered];
     if (ids.length === 0) return [];
-    const format = properties.every((p) => METADATA_PROPERTIES.has(p))
-      ? "metadata"
-      : "full";
+    const format: MessageFormat = properties.every(rowProperty) ? "metadata" : "full";
     await this.prefetch(ids, format).catch(() => {});
     const tag = await this.tags();
     const out: Record<string, unknown>[] = [];
@@ -366,19 +405,15 @@ export class GmailMail {
           ...new Set([...this.undelivered, ...delivered]),
         ].slice(-MAX_BATCH);
         if (this.store.revision(this.email) === revision) {
-          const changed = affected(history.records);
-          this.store.checkpoint(
-            this.email,
-            history.historyId,
-            changed.messages,
-            changed.threads,
-          );
+          const changed = classify(history.records);
+          this.applyHistory(history.historyId, changed);
           // What just arrived is what the client reads next. Fetching it here,
           // in one batch, is the difference between a notification the user
           // opens instantly and one that waits on Google. Detached on purpose:
-          // nothing about this request depends on it.
+          // nothing about this request depends on it. A message that was only
+          // relabelled kept its cached copy and needs no read at all.
           void this.prefetch(
-            changed.messages.slice(0, MAX_BATCH),
+            changed.drop.slice(0, MAX_BATCH),
             "metadata",
           ).catch(() => {});
         }
@@ -397,6 +432,100 @@ export class GmailMail {
       historyId: this.store.cursor(this.email) ?? profile.historyId,
     };
   }
+  /** Brings the cache and the thread index up to `historyId`. */
+  private applyHistory(historyId: string, change: ReturnType<typeof classify>): void {
+    // A message deleted while the index is being listed must not be put back
+    // by a page that was read before it went.
+    if (this.indexDeleted)
+      for (const step of change.membership)
+        if ("remove" in step) this.indexDeleted.add(step.remove);
+    this.store.applyHistory(this.email, historyId, change, this.indexDeleted !== undefined);
+  }
+  /**
+   * Whether conversations can be answered from the thread index. Starts
+   * listing the account, in the background, when it is missing or old.
+   */
+  private threadIndexReady(): boolean {
+    if (!this.threadIndex) return false;
+    const built = this.store.threadIndexBuiltAt(this.email);
+    if (built !== null && Date.now() - built < THREAD_INDEX_MAX_AGE) return true;
+    // An index that is only old keeps answering while it is listed again.
+    if (!this.indexing && Date.now() >= this.indexRetryAt)
+      this.indexing = this.buildThreadIndex()
+        .catch((error: unknown) => {
+          this.indexRetryAt = Date.now() + THREAD_INDEX_RETRY_MS;
+          log.warn(
+            { err: error instanceof Error ? error.message : String(error) },
+            "gmail thread index build failed",
+          );
+        })
+        .finally(() => {
+          this.indexing = undefined;
+          this.indexDeleted = undefined;
+        });
+    return built !== null;
+  }
+  /**
+   * A conversation's messages by date, when every one of them is cached.
+   *
+   * The index knows the order Gmail listed them in, and puts what history
+   * adds later at the end. That is the date order except for a message that
+   * arrives carrying an older date - an import. A conversation the client is
+   * looking at has its rows cached, so their dates settle it; otherwise the
+   * index's order stands.
+   */
+  private byDate(members: string[]): string[] {
+    if (members.length < 2) return members;
+    const dated: { id: string; at: number }[] = [];
+    for (const id of members) {
+      const message =
+        this.store.cached<GmailMessage>(this.email, messageKey("metadata", id)) ??
+        this.store.cached<GmailMessage>(this.email, messageKey("full", id));
+      const at = Number(message?.internalDate);
+      if (!message || !Number.isFinite(at)) return members;
+      dated.push({ id, at });
+    }
+    // Stable: equal dates keep the index's order.
+    return dated.sort((a, b) => a.at - b.at).map((d) => d.id);
+  }
+  /** Lists every message of the account with its thread: 5 quota units per 500 messages. */
+  private async buildThreadIndex(): Promise<void> {
+    const began = Date.now();
+    // The cursor must exist before the listing starts, so that everything
+    // that happens from here on reaches the index through history.
+    await this.state();
+    this.indexDeleted = new Set();
+    this.store.threadIndexBegin(this.email);
+    let token = "";
+    let listed = 0;
+    const tokens = new Set<string>();
+    do {
+      const page = await this.api.get<{
+        messages?: { id: string; threadId: string }[];
+        nextPageToken?: string;
+      }>("messages", 5, {
+        includeSpamTrash: "true",
+        maxResults: "500",
+        ...(token ? { pageToken: token } : {}),
+      });
+      const rows = (page.messages ?? []).filter(
+        (m) => m.threadId && !this.indexDeleted!.has(m.id),
+      );
+      this.store.threadIndexInsert(this.email, rows, -listed);
+      listed += (page.messages ?? []).length;
+      token = page.nextPageToken ?? "";
+      if (token && tokens.has(token))
+        throw new JmapError("serverUnavailable", "Gmail repeated a pagination cursor");
+      if (token) tokens.add(token);
+      if (tokens.size > 10_000)
+        throw new JmapError("serverUnavailable", "Mailbox too large to index");
+    } while (token);
+    this.store.threadIndexComplete(this.email);
+    log.info(
+      { messages: listed, calls: tokens.size + 1, ms: Date.now() - began },
+      "gmail thread index built",
+    );
+  }
   async writable(): Promise<boolean> {
     return (
       this.writeEnabled &&
@@ -413,9 +542,10 @@ export class GmailMail {
     const read = async () =>
       (await this.api.get<{ sendAs?: SendAs[] }>("settings/sendAs", 5))
         .sendAs ?? [];
-    if (!fresh) return this.cached("sendAs", 300_000, read);
+    // Aliases change a few times a year, and a send reads them fresh anyway.
+    if (!fresh) return this.cached("sendAs", SEND_AS_TTL, read);
     const list = await read();
-    this.store.cache(this.email, "sendAs", list, 300_000);
+    this.store.cache(this.email, "sendAs", list, SEND_AS_TTL);
     return list;
   }
   async upload(body: Buffer, type: string): Promise<string> {
@@ -755,11 +885,9 @@ export class GmailMail {
    */
   private async prefetch(
     ids: string[],
-    format: "full" | "metadata",
+    format: MessageFormat,
   ): Promise<void> {
     if (!this.api.batch || ids.length < 2) return;
-    const key = (id: string) =>
-      `${format === "full" ? "message" : "meta"}:v2:${id}`;
     const wanted = [
       ...new Set(
         ids
@@ -767,10 +895,9 @@ export class GmailMail {
           .filter(
             (id) =>
               /^[A-Za-z0-9_-]{1,128}$/.test(id) &&
-              this.store.cached(this.email, key(id)) === null &&
-              // A cached full message already answers a metadata read.
-              (format === "full" ||
-                this.store.cached(this.email, `message:v2:${id}`) === null),
+              // Asked without decrypting: on a warm page that was fifty
+              // messages opened here only to be opened again below.
+              !messageKeys(format, id).some((key) => this.store.has(this.email, key)),
           ),
       ),
     ];
@@ -797,7 +924,7 @@ export class GmailMail {
       for (const [index, id] of page.entries()) {
         const answer = answers[index];
         if (answer?.data)
-          this.store.cache(this.email, key(id), answer.data, MESSAGE_TTL);
+          this.store.cache(this.email, messageKey(format, id), answer.data, MESSAGE_TTL);
       }
     }
   }
@@ -847,28 +974,22 @@ export class GmailMail {
       }
     }
   }
-  /** `metadata` omits bodies and parts: enough for list views, and much smaller to transfer and cache. */
+  /** See {@link MessageFormat}: ask for the leanest one that answers the read. */
   async message(
     id: string,
-    format: "full" | "metadata" = "full",
+    format: MessageFormat = "full",
   ): Promise<GmailMessage> {
     id = this.store.upstreamId(this.email, id);
     await this.state();
     if (format === "metadata") {
       // A cached full message also answers metadata-only reads.
-      const full = this.store.cached<GmailMessage>(
-        this.email,
-        `message:v2:${id}`,
-      );
+      const full = this.store.cached<GmailMessage>(this.email, messageKey("full", id));
       if (full) return full;
     }
-    return this.cached(
-      `${format === "full" ? "message" : "meta"}:v2:${id}`,
-      MESSAGE_TTL,
-      () =>
-        this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 5, {
-          format,
-        }),
+    return this.cached(messageKey(format, id), MESSAGE_TTL, () =>
+      this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 5, {
+        format,
+      }),
     );
   }
   private async bytes(messageId: string, part: GmailPart): Promise<Buffer> {
@@ -929,7 +1050,10 @@ export class GmailMail {
     // only if something really asks for it.
     let search: string | undefined;
     const q = async () =>
-      (search ??= gmailFilter(args.filter, await this.labels()));
+      // Names only: the counters `labels()` adds cost a call per label, and
+      // a push preview asks "what arrived in this folder since then" on
+      // every notification.
+      (search ??= gmailFilter(args.filter, await this.labelList()));
     const sort = args.sort ?? [{ property: "receivedAt", isAscending: false }];
     if (
       !Array.isArray(sort) ||
@@ -997,11 +1121,40 @@ export class GmailMail {
       );
       return box && unread ? (box.inMailbox as string) : undefined;
     })();
+    // "Read in a folder" is the other half of an unread-first folder view: the
+    // client lists the unread mail on top and pages through the read mail
+    // below. Gmail has no label for read mail, but the folder's counters give
+    // the exact total and `is:read` narrows the label listing, so a page costs
+    // one listing instead of an enumeration of every read message (68k ids,
+    // ~30 s, on a large Inbox - again on every change of the account).
+    const readIn = ((): string | undefined => {
+      if (
+        !f ||
+        f.operator !== "AND" ||
+        !Array.isArray(f.conditions) ||
+        f.conditions.length !== 2
+      )
+        return undefined;
+      const parts = f.conditions as Record<string, unknown>[];
+      const box = parts.find(
+        (c) =>
+          c && Object.keys(c).length === 1 && typeof c.inMailbox === "string",
+      );
+      const read = parts.find(
+        (c) => c && Object.keys(c).length === 1 && c.hasKeyword === "$seen",
+      );
+      const id = box && read ? (box.inMailbox as string) : undefined;
+      // Only a real label has the counters the total comes from.
+      return id && id !== ALL_MAIL && /^l_[A-Za-z0-9_-]+$/.test(id)
+        ? id
+        : undefined;
+    })();
     const simple =
       !f ||
       Object.keys(f).length === 0 ||
       (Object.keys(f).length === 1 && typeof f.inMailbox === "string") ||
-      unreadIn !== undefined;
+      unreadIn !== undefined ||
+      readIn !== undefined;
     const pos = args.position ?? 0;
     if (
       simple &&
@@ -1013,6 +1166,7 @@ export class GmailMail {
     ) {
       const box =
         unreadIn ??
+        readIn ??
         (typeof f?.inMailbox === "string" ? f.inMailbox : undefined);
       // A mailbox id carries the Gmail label id, so one `labels.get` answers
       // "how many (unread) messages are in this folder" without listing the
@@ -1021,8 +1175,47 @@ export class GmailMail {
         box && box !== ALL_MAIL && /^l_[A-Za-z0-9_-]+$/.test(box)
           ? box.slice(2)
           : undefined;
+      const count = Math.min(limit as number, MAX_QUERY);
+      // Ask Gmail for no more than the page needs: a count asks for one id,
+      // and listing 500 of a large label to return one takes seconds.
+      const pageSize = String(Math.min(500, Math.max(1, (pos as number) + count)));
+      type Listing = Record<string, string | string[]>;
+      const labelListing = (id: string): Listing => ({
+        labelIds: unreadIn ? [id, "UNREAD"] : id,
+        ...(readIn ? { q: "is:read" } : {}),
+        ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
+      });
+      const listPage = (listing: Listing, cursor: string) =>
+        this.cached<{
+          messages?: { id: string; threadId: string }[];
+          nextPageToken?: string;
+        }>(
+          // Keyed by account state: a listing that survives here is one
+          // no history record has touched, so it cannot go stale.
+          `page:${state}:${hash(listing)}:${pageSize}:${hash(cursor)}`,
+          MESSAGE_TTL,
+          () =>
+            this.api.get("messages", 5, {
+              includeSpamTrash: "true",
+              ...listing,
+              maxResults: pageSize,
+              ...(cursor ? { pageToken: cursor } : {}),
+            }),
+        );
+      // The folder's counters and its first page do not depend on each
+      // other: asked together, a refreshed folder waits for one answer from
+      // Google instead of two in a row. The loop below picks this read up.
+      // Not for a count (`limit: 1`): an empty folder needs no listing at all.
+      if (labelId && count >= LIST_FROM)
+        void listPage(labelListing(labelId), "").catch(() => {});
       const label = labelId ? await this.labelDetail(labelId) : undefined;
-      const total = unreadIn
+      const total = readIn
+        ? label &&
+          label.messagesTotal !== undefined &&
+          label.messagesUnread !== undefined
+          ? Math.max(0, label.messagesTotal - label.messagesUnread)
+          : undefined
+        : unreadIn
         ? label
           ? label.messagesUnread
           : (await this.labelDetail("UNREAD"))?.messagesTotal
@@ -1031,40 +1224,21 @@ export class GmailMail {
           : (await this.profile()).messagesTotal;
       if (total !== undefined) {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
-        // dependence on search syntax, label names or search-index lag.
-        const listing: Record<string, string | string[]> = label
-          ? {
-              labelIds: unreadIn ? [label.id, "UNREAD"] : label.id,
-              ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
-            }
+        // dependence on search syntax, label names or search-index lag. The
+        // one exception is the read half of a folder: Gmail has no label for
+        // read mail, so that listing is the label narrowed by `is:read`, and
+        // its total (counters) can run a moment ahead of its rows (search).
+        const listing: Listing = label
+          ? labelListing(label.id)
           : { q: await q() };
-        const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
-        // Ask Gmail for no more than the page needs: a count asks for one id,
-        // and listing 500 of a large label to return one takes seconds.
-        const pageSize = String(Math.min(500, Math.max(1, wanted)));
         const refs = new Map<string, { id: string; threadId: string }>();
         let token = "";
         const tokens = new Set<string>();
         if (count && (pos as number) < total)
           do {
             const cursor = token;
-            const page = await this.cached<{
-              messages?: { id: string; threadId: string }[];
-              nextPageToken?: string;
-            }>(
-              // Keyed by account state: a listing that survives here is one
-              // no history record has touched, so it cannot go stale.
-              `page:${state}:${hash(listing)}:${pageSize}:${hash(cursor)}`,
-              MESSAGE_TTL,
-              () =>
-                this.api.get("messages", 5, {
-                  includeSpamTrash: "true",
-                  ...listing,
-                  maxResults: pageSize,
-                  ...(cursor ? { pageToken: cursor } : {}),
-                }),
-            );
+            const page = await listPage(listing, cursor);
             for (const reference of page.messages ?? [])
               refs.set(reference.id, reference);
             token = page.nextPageToken ?? "";
@@ -1088,7 +1262,12 @@ export class GmailMail {
           queryState: hash([
             state,
             label
-              ? ["label", label.id, unreadIn ? "unread" : "all", skipSpamTrash]
+              ? [
+                  "label",
+                  label.id,
+                  unreadIn ? "unread" : readIn ? "read" : "all",
+                  skipSpamTrash,
+                ]
               : search,
           ]),
           canCalculateChanges: false,
@@ -1259,6 +1438,38 @@ export class GmailMail {
         forget();
       }
     };
+    // A label change on one message. Its cached copy is not forgotten but
+    // given the labels Gmail answers with: the next list of the folder then
+    // finds the row where it left it instead of reading it again. Before and
+    // after, the listings and the profile are dropped, as for any write.
+    const relabel = async (
+      message: GmailMessage,
+      delta: { addLabelIds: string[]; removeLabelIds: string[] },
+    ): Promise<GmailMessage> => {
+      this.store.forget(this.email, [], []);
+      let result: GmailMessage;
+      try {
+        result = await this.api.mutate!<GmailMessage>(
+          `messages/${encodeURIComponent(message.id)}/modify`,
+          5,
+          "POST",
+          delta,
+        );
+      } catch (error) {
+        // Unknown outcome: read it again next time.
+        this.store.forget(
+          this.email,
+          [message.id],
+          message.threadId ? [message.threadId] : [],
+        );
+        throw error;
+      }
+      this.store.forget(this.email, [], []);
+      if (Array.isArray(result.labelIds))
+        this.store.setLabels(this.email, message.id, result.labelIds);
+      else this.store.forget(this.email, [message.id], []);
+      return result;
+    };
     // Fresh label metadata validates membership and prevents editing system labels.
     let labels =
       kind === "Mailbox" || Object.keys(update).length
@@ -1292,7 +1503,7 @@ export class GmailMail {
         notCreated[id] = error(e);
       }
     }
-    for (const [id, patch] of Object.entries(update)) {
+    const applyUpdate = async (id: string, patch: unknown): Promise<void> => {
       try {
         if (kind === "Mailbox") {
           const label = labels.find((l) => "l_" + l.id === id);
@@ -1312,22 +1523,38 @@ export class GmailMail {
         } else {
           if (!/^m_[A-Za-z0-9_-]{1,128}$/.test(id))
             throw new JmapError("notFound");
-          // Read current labels directly: cached metadata may predate a change in Gmail.
-          const message = await this.api.get<GmailMessage>(
-            `messages/${encodeURIComponent(this.store.upstreamId(this.email, upstreamId(id, "m_")))}`,
-            5,
-            { format: "minimal" },
-          );
+          // The labels the message has now, to tell what the patch changes.
+          // A patch that names single keywords or mailboxes ("keywords/$seen",
+          // how a client marks mail read or starred) says what each label
+          // should become, so the cached copy will do: it follows Gmail's
+          // history label by label (see `classify`), and being a sync behind
+          // can at worst skip a change Gmail already has. That spares 20
+          // units and a round trip for every mail marked read.
+          // A patch that replaces `mailboxIds` or `keywords` whole - how a
+          // client moves, archives or bins mail - is different: every label
+          // it does not name is to go, so a label put on the message since
+          // the last sync (up to thirty seconds ago without push) would be
+          // left behind. Those read the labels from Gmail, as before.
+          const native = this.store.upstreamId(this.email, upstreamId(id, "m_"));
+          const whole =
+            !!patch &&
+            typeof patch === "object" &&
+            ("mailboxIds" in patch || "keywords" in patch);
+          const held = whole
+            ? null
+            : (this.store.cached<GmailMessage>(this.email, messageKey("metadata", native)) ??
+              this.store.cached<GmailMessage>(this.email, messageKey("full", native)));
+          const message: GmailMessage = held
+            ? { id: held.id, threadId: held.threadId, labelIds: held.labelIds, internalDate: held.internalDate }
+            : await this.api.get<GmailMessage>(
+                `messages/${encodeURIComponent(native)}`,
+                5,
+                { format: "minimal" },
+              );
           const delta = emailPatch(message, patch, labels);
           const result =
             delta.addLabelIds.length || delta.removeLabelIds.length
-              ? await mutate<GmailMessage>(
-                  `messages/${encodeURIComponent(message.id)}/modify`,
-                  5,
-                  "POST",
-                  delta,
-                  message,
-                )
+              ? await relabel(message, delta)
               : message;
           const mapped = await mapMessage(
             { ...result, internalDate: result.internalDate ?? "0" },
@@ -1343,7 +1570,17 @@ export class GmailMail {
       } catch (e) {
         notUpdated[id] = error(e);
       }
-    }
+    };
+    // Label changes on different messages do not depend on each other: sent a
+    // few at a time, marking twenty mails read takes one round trip's time
+    // instead of twenty. Mailbox updates stay in order.
+    const updates = Object.entries(update);
+    if (kind === "Email")
+      for (let i = 0; i < updates.length; i += WRITES_AT_ONCE)
+        await Promise.all(
+          updates.slice(i, i + WRITES_AT_ONCE).map(([id, patch]) => applyUpdate(id, patch)),
+        );
+    else for (const [id, patch] of updates) await applyUpdate(id, patch);
     for (const id of destroy) {
       try {
         if (kind === "Email") {
@@ -1428,13 +1665,7 @@ export class GmailMail {
         "Too many changes; reload the current mailbox",
       );
     // Do not claim that a later history cursor is already reflected in local cached reads.
-    const changed = affected(history.records);
-    this.store.checkpoint(
-      this.email,
-      history.historyId,
-      changed.messages,
-      changed.threads,
-    );
+    this.applyHistory(history.historyId, classify(history.records));
     return {
       accountId: this.accountId,
       oldState,
@@ -1564,14 +1795,11 @@ export class GmailMail {
       "Email/get": async (a) => {
         this.account(a);
         const properties = this.properties(a);
-        // List views ask only for header-derived properties: Gmail's metadata format serves them without bodies.
-        const format =
-          properties &&
-          properties.every(
-            (p) => METADATA_PROPERTIES.has(p) || p.startsWith("header:"),
-          )
-            ? "metadata"
-            : "full";
+        // List rows ask only for what the headers hold (and `hasAttachment`,
+        // which they answer closely enough): Gmail's metadata format serves
+        // them at a third of the price of the whole message.
+        const format: MessageFormat =
+          properties && properties.every(rowProperty) ? "metadata" : "full";
         let ids = this.ids(a);
         if (ids === null) {
           if ((await this.profile()).messagesTotal > MAX_GET)
@@ -1719,10 +1947,31 @@ export class GmailMail {
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
         const state = await this.state();
-        await this.prefetchThreads(ids);
+        // From the index when there is one: no call to Gmail at all. A
+        // conversation it does not know is asked of Gmail as before, which
+        // also covers a thread that does not exist.
+        const known = new Map<string, string[]>();
+        if (this.threadIndexReady())
+          for (const id of ids) {
+            if (!/^t_[A-Za-z0-9_-]{1,128}$/.test(id)) continue;
+            const members = this.store.threadIndexMembers(this.email, id.slice(2));
+            if (members.length) known.set(id, this.byDate(members));
+          }
+        await this.prefetchThreads(ids.filter((id) => !known.has(id)));
         const read = async (
           id: string,
         ): Promise<Record<string, unknown> | null> => {
+          const members = known.get(id);
+          if (members)
+            return this.project(
+              {
+                id,
+                emailIds: members.map(
+                  (m) => "m_" + this.store.originalId(this.email, m),
+                ),
+              },
+              properties,
+            );
           try {
             const thread = await this.cached<ThreadMembers>(
               `thread:v3:${id}`,
