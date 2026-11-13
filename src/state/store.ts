@@ -264,6 +264,15 @@ CREATE TABLE IF NOT EXISTS vault_check (
   id    INTEGER PRIMARY KEY CHECK (id = 1),
   value BLOB    NOT NULL
 );
+
+-- Providers discovery found for an email domain (auth/discovery.ts), kept
+-- once the mail server accepted a login, so accounts on them keep working
+-- across restarts. Host names and ports only, as JSON.
+CREATE TABLE IF NOT EXISTS discovered_provider (
+  domain   TEXT    PRIMARY KEY,
+  config   TEXT    NOT NULL,
+  saved_at INTEGER NOT NULL
+);
 `;
 
 // Columns added to tables that existing databases already have.
@@ -441,6 +450,19 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  /** Keep the provider discovered for `domain` (JSON) after a login it served succeeded. */
+  saveDiscoveredProvider(domain: string, config: string): void {
+    this.prep(
+      `INSERT INTO discovered_provider(domain, config, saved_at) VALUES(?,?,?)
+       ON CONFLICT(domain) DO UPDATE SET config = excluded.config, saved_at = excluded.saved_at`,
+    ).run(domain, config, Date.now());
+  }
+
+  /** Every kept discovered provider. */
+  discoveredProviders(): { domain: string; config: string }[] {
+    return this.prep(`SELECT domain, config FROM discovered_provider`).all() as { domain: string; config: string }[];
   }
 
   /**

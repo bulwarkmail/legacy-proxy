@@ -1,6 +1,7 @@
 import nodemailer from "nodemailer";
 import type { Credentials } from "../auth/credentials.js";
-import { assertTransport, transportOf } from "../auth/providers.js";
+import { connectHost } from "../auth/discovery.js";
+import { assertTransport, loginName, transportOf } from "../auth/providers.js";
 import type { ProviderConfig } from "../util/config.js";
 
 export interface SubmitResult {
@@ -24,14 +25,17 @@ export async function submit(opts: {
   // `starttls` nodemailer refuses to authenticate unless the upgrade happened.
   assertTransport("smtp", provider.smtp);
   const { secure, starttls } = transportOf("smtp", provider.smtp);
+  const target = await connectHost(provider, provider.smtp);
+  const user = loginName(provider.smtp, creds.username);
   const transport = nodemailer.createTransport({
-    host: provider.smtp.host,
+    host: target.host,
+    ...(target.servername ? { servername: target.servername } : {}),
     port: provider.smtp.port,
     secure,
     requireTLS: starttls,
     auth: creds.mech === "XOAUTH2" && creds.accessToken
-      ? { type: "OAuth2", user: creds.username, accessToken: creds.accessToken }
-      : { user: creds.username, pass: creds.password ?? "" },
+      ? { type: "OAuth2", user, accessToken: creds.accessToken }
+      : { user, pass: creds.password ?? "" },
   });
 
   const info = await transport.sendMail({

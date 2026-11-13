@@ -1,6 +1,7 @@
 import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
-import { assertTransport, transportOf } from "../auth/providers.js";
+import { connectHost } from "../auth/discovery.js";
+import { assertTransport, loginName, transportOf } from "../auth/providers.js";
 import type { ProviderConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
@@ -12,10 +13,11 @@ export interface ImapConnOpts {
 export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
   const { provider, creds } = opts;
   let auth: { user: string; pass?: string; accessToken?: string };
+  const user = loginName(provider.imap, creds.username);
   if (creds.mech === "XOAUTH2" && creds.accessToken) {
-    auth = { user: creds.username, accessToken: creds.accessToken };
+    auth = { user, accessToken: creds.accessToken };
   } else if (creds.password) {
-    auth = { user: creds.username, pass: creds.password };
+    auth = { user, pass: creds.password };
   } else {
     throw new Error("openImap: no credentials supplied");
   }
@@ -24,8 +26,10 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
   // connect, before any credential is sent, if the server does not offer it.
   assertTransport("imap", provider.imap);
   const { secure, starttls } = transportOf("imap", provider.imap);
+  const target = await connectHost(provider, provider.imap);
   const client = new ImapFlow({
-    host: provider.imap.host,
+    host: target.host,
+    ...(target.servername ? { servername: target.servername } : {}),
     port: provider.imap.port,
     secure,
     ...(starttls ? { doSTARTTLS: true } : {}),

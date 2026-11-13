@@ -10,6 +10,19 @@ export interface TransportEntry {
   secure?: boolean;
   starttls?: boolean;
   allowPlaintext?: boolean;
+  /**
+   * Log in with the part of the user name before the last `@` instead of the
+   * whole name. Set only by discovery, for an autoconfig file that asks for
+   * `%EMAILLOCALPART%`.
+   */
+  localPartLogin?: boolean;
+}
+
+/** The user name to log in with at a server whose entry is `entry`. */
+export function loginName(entry: { localPartLogin?: boolean }, username: string): string {
+  if (!entry.localPartLogin) return username;
+  const at = username.lastIndexOf("@");
+  return at > 0 ? username.slice(0, at) : username;
 }
 
 /**
@@ -85,6 +98,10 @@ export function assertTransport(service: ProviderService, entry: TransportEntry,
 export function validateProviders(providers: Record<string, ProviderConfig>): void {
   const problems: string[] = [];
   for (const [name, raw] of Object.entries(providers)) {
+    if (name.startsWith(DISCOVERED_PREFIX)) {
+      problems.push(`provider "${name}": names starting with "${DISCOVERED_PREFIX}" are kept for discovered providers`);
+      continue;
+    }
     if (!raw || typeof raw !== "object") continue;
     const p = interpolate(raw);
     const entries: [ProviderService, TransportEntry | null | undefined][] = [
@@ -110,11 +127,32 @@ export function validateProviders(providers: Record<string, ProviderConfig>): vo
   if (problems.length) throw new Error(`providers file: ${problems.join("; ")}`);
 }
 
+/** Account kinds of discovered providers start with this, followed by the email domain. */
+export const DISCOVERED_PREFIX = "discovered:";
+
+/** The provider key of the provider discovered for `domain`. */
+export function discoveredKind(domain: string): string {
+  return `${DISCOVERED_PREFIX}${domain}`;
+}
+
 export function resolveProvider(cfg: AppConfig, name?: string): ProviderConfig {
   const key = name ?? cfg.defaultProvider;
   const p = Object.hasOwn(cfg.providers, key) ? cfg.providers[key] : undefined;
-  if (!p) throw new Error(`Unknown provider: ${key}`);
-  return interpolate(p);
+  if (p) return interpolate(p);
+  // A discovered provider a login proved: its hosts are plain host names
+  // checked at discovery, so nothing is interpolated.
+  const found = key.startsWith(DISCOVERED_PREFIX) ? cfg.discovered?.get(key.slice(DISCOVERED_PREFIX.length)) : undefined;
+  if (found) return structuredClone(found);
+  throw new Error(`Unknown provider: ${key}`);
+}
+
+/** The lower-cased domain of an email address, or undefined when `email` has none. */
+export function emailDomain(email?: string): string | undefined {
+  if (!email) return undefined;
+  const at = email.lastIndexOf("@");
+  if (at < 0) return undefined;
+  const domain = email.slice(at + 1).trim().toLowerCase();
+  return domain || undefined;
 }
 
 /**
@@ -123,10 +161,7 @@ export function resolveProvider(cfg: AppConfig, name?: string): ProviderConfig {
  * claims the domain. Matching is case-insensitive.
  */
 export function providerForEmail(cfg: AppConfig, email?: string): string | undefined {
-  if (!email) return undefined;
-  const at = email.lastIndexOf("@");
-  if (at < 0) return undefined;
-  const domain = email.slice(at + 1).trim().toLowerCase();
+  const domain = emailDomain(email);
   if (!domain) return undefined;
   for (const [name, p] of Object.entries(cfg.providers)) {
     if (p.domains?.some((d) => d.trim().toLowerCase() === domain)) return name;
@@ -146,6 +181,44 @@ export function resolveProviderName(
 ): string {
   if (opts.explicit) return opts.explicit;
   return providerForEmail(cfg, opts.username) ?? cfg.defaultProvider;
+}
+
+export interface LoginProvider {
+  /** The provider key, stored as the account's kind. */
+  name: string;
+  provider: ProviderConfig;
+}
+
+/**
+ * The provider a login uses, or null when there is none. Resolution order:
+ *   1. an explicit provider supplied by the client (`/api/login` body),
+ *   2. the provider in providers.json claiming the email domain,
+ *   3. with discovery on (`discover` given): the servers discovery finds for
+ *      the domain, else the ones it found before and a login proved
+ *      (`cfg.discovered`),
+ *   4. the configured default provider, when providers.json has it.
+ * Discovery runs before the default: DEFAULT_PROVIDER is "generic" unless
+ * set, so a default nearly always exists and discovery after it would never
+ * run. Domains the default's server hosts belong in its `domains` list.
+ */
+export async function resolveLoginProvider(
+  cfg: AppConfig,
+  opts: { explicit?: string; username?: string },
+  discover?: (domain: string) => Promise<ProviderConfig | null>,
+): Promise<LoginProvider | null> {
+  const configured = (name: string): LoginProvider | null =>
+    Object.hasOwn(cfg.providers, name) ? { name, provider: resolveProvider(cfg, name) } : null;
+  if (opts.explicit) return configured(opts.explicit);
+  const byDomain = providerForEmail(cfg, opts.username);
+  if (byDomain) return configured(byDomain);
+  const domain = emailDomain(opts.username);
+  if (discover && domain) {
+    const found = await discover(domain);
+    if (found) return { name: discoveredKind(domain), provider: found };
+    const proven = cfg.discovered?.get(domain);
+    if (proven) return { name: discoveredKind(domain), provider: structuredClone(proven) };
+  }
+  return configured(cfg.defaultProvider);
 }
 
 function interpolate(p: ProviderConfig): ProviderConfig {

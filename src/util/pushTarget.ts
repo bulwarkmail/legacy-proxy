@@ -142,7 +142,7 @@ export function pushHost(url: string): string {
 }
 
 /** A lookup that answers every name with the one address that was checked. */
-function pinnedLookup(address: string, family: 4 | 6): LookupFunction {
+export function pinnedLookup(address: string, family: 4 | 6): LookupFunction {
   return ((_hostname: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => {
     if (options?.all) callback(null, [{ address, family }]);
     else callback(null, address, family);

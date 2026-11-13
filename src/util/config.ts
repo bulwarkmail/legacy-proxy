@@ -15,8 +15,10 @@ export interface ProviderConfig {
   // `secure`: implicit TLS. `starttls`: plain connection that must be upgraded
   // before credentials are sent. A connection with neither is refused unless
   // the host is loopback or `allowPlaintext` is true (see auth/providers.ts).
-  imap: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean };
-  smtp: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean };
+  // `localPartLogin`: log in with the part of the user name before the `@`
+  // (set only by discovery, see auth/providers.ts loginName).
+  imap: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean };
+  smtp: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean };
   sieve: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean } | null;
   carddav: {
     host: string;
@@ -34,6 +36,23 @@ export interface ProviderConfig {
     forUser?: string;
   } | null;
   auth: { mech: string[] };
+  /**
+   * Set on a provider found by discovery (auth/discovery.ts), never in
+   * providers.json. Its IMAP and SMTP hosts are resolved again at every
+   * connect and the connection goes to the address that passed the check.
+   */
+  discovered?: { domain: string; source: DiscoverySource };
+}
+
+/** Where discovery looks for a domain's mail servers, always in this order. */
+export const DISCOVERY_SOURCES = ["autoconfig", "srv"] as const;
+export type DiscoverySource = (typeof DISCOVERY_SOURCES)[number];
+
+export interface DiscoveryConfig {
+  /** The sources turned on, in the order they are tried; empty means discovery is off. */
+  sources: DiscoverySource[];
+  /** Host suffixes a discovered IMAP or SMTP host must match; empty allows every public host. */
+  allowedHosts: string[];
 }
 
 export interface AppConfig {
@@ -51,6 +70,14 @@ export interface AppConfig {
   sessionHmacKey: Buffer;
   defaultProvider: string;
   providers: Record<string, ProviderConfig>;
+  /** `DISCOVERY` and `DISCOVERY_ALLOWED_HOSTS`; missing means discovery is off. */
+  discovery?: DiscoveryConfig;
+  /**
+   * Providers discovery found that the mail server then accepted a login
+   * for, by email domain. resolveProvider answers their `discovered:<domain>`
+   * key from here; the server fills it from the database at start.
+   */
+  discovered?: Map<string, ProviderConfig>;
   limits: {
     maxConcurrentRequests: number;
     maxObjectsInGet: number;
@@ -218,6 +245,63 @@ function coversEverything(ranges: AddressRange[], family: 4 | 6): boolean {
   return false;
 }
 
+/**
+ * `DISCOVERY`: the sources the proxy may ask for the mail servers of an email
+ * domain that providers.json does not list, as a comma-separated list of
+ * `autoconfig` and `srv`. Unset, empty, `off`, `false`, `no`, `0` or `none`
+ * turns discovery off. The sources are always tried autoconfig first, whatever
+ * order the list has. Any other value stops the start.
+ */
+export function parseDiscovery(value: string | undefined): DiscoverySource[] {
+  const raw = value ?? "";
+  if (/^\s*(off|false|no|0|none)?\s*$/i.test(raw)) return [];
+  const given = raw.split(",").map((s) => s.trim().toLowerCase());
+  for (const entry of given) {
+    if (!(DISCOVERY_SOURCES as readonly string[]).includes(entry)) {
+      throw new Error(
+        `DISCOVERY=${JSON.stringify(raw)}: ${entry === "" ? "it has an empty entry" : `"${entry}" is not a discovery source`}. ` +
+          `Use a comma-separated list of ${DISCOVERY_SOURCES.join(" and ")} (for example DISCOVERY=autoconfig,srv), or leave it unset to turn discovery off.`,
+      );
+    }
+  }
+  return DISCOVERY_SOURCES.filter((s) => given.includes(s));
+}
+
+const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+/**
+ * `host` lower-cased and without a trailing dot when it is a plain DNS host
+ * name with at least two labels, else null: no IP address, port, user,
+ * placeholder or anything else.
+ */
+export function plainHostName(host: string): string | null {
+  const h = host.trim().toLowerCase().replace(/\.$/, "");
+  if (!HOST_NAME.test(h) || !h.includes(".") || net.isIP(h)) return null;
+  return h;
+}
+
+/**
+ * `DISCOVERY_ALLOWED_HOSTS`: host names a discovered IMAP or SMTP server must
+ * be, or end in, as a comma-separated list (`example.net` allows
+ * `example.net` and `imap.example.net`; a leading `.` or `*.` is the same).
+ * Unset or empty allows every public host. An entry that is not a host name
+ * stops the start.
+ */
+export function parseDiscoveryAllowedHosts(value: string | undefined): string[] {
+  const raw = value ?? "";
+  if (raw.trim() === "") return [];
+  return raw.split(",").map((entry) => {
+    const host = entry.trim().toLowerCase().replace(/^\*?\./, "").replace(/\.$/, "");
+    if (!HOST_NAME.test(host) || net.isIP(host)) {
+      throw new Error(
+        `DISCOVERY_ALLOWED_HOSTS=${JSON.stringify(raw)}: ${JSON.stringify(entry.trim())} is not a host name. ` +
+          `Use a comma-separated list of host names or domains, for example DISCOVERY_ALLOWED_HOSTS=example.net,mail.example.org.`,
+      );
+    }
+    return host;
+  });
+}
+
 export function loadConfig(): AppConfig {
   const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -238,6 +322,11 @@ export function loadConfig(): AppConfig {
     sessionHmacKey: b64Key("SESSION_HMAC_KEY", null),
     defaultProvider: process.env.DEFAULT_PROVIDER ?? "generic",
     providers,
+    discovery: {
+      sources: parseDiscovery(process.env.DISCOVERY),
+      allowedHosts: parseDiscoveryAllowedHosts(process.env.DISCOVERY_ALLOWED_HOSTS),
+    },
+    discovered: new Map(),
     limits: {
       maxConcurrentRequests: Number(process.env.MAX_CONCURRENT_REQUESTS ?? 10),
       maxObjectsInGet: Number(process.env.MAX_OBJECTS_IN_GET ?? 500),

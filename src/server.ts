@@ -9,7 +9,8 @@ import { log } from "./util/log.js";
 import { corsOptions, fromBrowser } from "./util/cors.js";
 import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
-import { resolveProvider, resolveProviderName } from "./auth/providers.js";
+import { emailDomain, resolveLoginProvider, resolveProvider, type LoginProvider } from "./auth/providers.js";
+import { ProviderDiscovery, storedDiscoveredProvider } from "./auth/discovery.js";
 import { sealCredentials, openCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
 import {
   credentialTag,
@@ -47,6 +48,11 @@ openOrExit(() => {
   if (gmailConfig) GmailStore.verifyVaultKey(cfg.dataDir, cfg.vaultKey);
 });
 const store = openOrExit(() => new Store(cfg.dataDir, cfg.vaultKey));
+// Mail servers of email domains providers.json does not list, when DISCOVERY
+// is set. Those a login proved were kept in the database and serve their
+// accounts again after a restart.
+const discovery = new ProviderDiscovery(cfg.discovery ?? { sources: [], allowedHosts: [] });
+if (discovery.enabled) loadDiscoveredProviders();
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
 const dispatcher = new PushDispatcher(store, hub, (id) => store.getAccountById(id));
@@ -182,19 +188,64 @@ function bridgeSecretOffered(...secrets: (string | undefined)[]): boolean {
   return !!gmailConfig && secrets.some((s) => isBridgeSecret(s));
 }
 
+/**
+ * The provider a login uses (see resolveLoginProvider), or null after
+ * logging that the email domain has none. Discovery runs here, so callers
+ * hold a login slot first: a caller can't make the proxy look up domains
+ * faster than the login limits allow.
+ */
+async function loginProvider(username: string, explicit?: string): Promise<LoginProvider | null> {
+  const found = await resolveLoginProvider(
+    cfg,
+    { explicit, username },
+    discovery.enabled ? (domain) => discovery.discover(domain) : undefined,
+  );
+  if (!found) {
+    log.warn(
+      { domain: emailDomain(username) ?? null, defaultProvider: cfg.defaultProvider, discovery: discovery.enabled },
+      discovery.enabled
+        ? "login refused: the email domain is not in providers.json, discovery found no usable mail servers, and DEFAULT_PROVIDER names no provider"
+        : "login refused: the email domain is not in providers.json and DEFAULT_PROVIDER names no provider",
+    );
+  }
+  return found;
+}
+
+/** After a login a discovered provider served succeeded: keep it for the domain's accounts. */
+function keepDiscovered(found: LoginProvider): void {
+  const discovered = found.provider.discovered;
+  if (!discovered || !cfg.discovered) return;
+  const json = JSON.stringify(found.provider);
+  const before = cfg.discovered.get(discovered.domain);
+  if (before && JSON.stringify(before) === json) return;
+  cfg.discovered.set(discovered.domain, structuredClone(found.provider));
+  try {
+    store.saveDiscoveredProvider(discovered.domain, json);
+  } catch (e) {
+    log.warn({ domain: discovered.domain, err: (e as Error).message }, "could not keep the discovered provider in the database");
+  }
+}
+
+/** Discovered providers kept by earlier logins, checked again against today's rules. */
+function loadDiscoveredProviders(): void {
+  let kept = 0;
+  for (const row of store.discoveredProviders()) {
+    const p = storedDiscoveredProvider(row.domain, row.config, cfg.discovery!);
+    if (!p) {
+      log.warn({ domain: row.domain }, "a kept discovered provider no longer passes the discovery rules; not used");
+      continue;
+    }
+    cfg.discovered?.set(row.domain, p);
+    kept++;
+  }
+  if (kept) log.info({ providers: kept }, "discovered providers kept by earlier logins loaded");
+}
+
 app.post("/api/login", async (req, reply) => {
   const body = parseLoginBody(req.body);
   if (!body) return reply.code(400).send({ error: "invalid login request" });
   if (bridgeSecretOffered(body.password, body.accessToken)) return reply.code(401).send({ error: "auth failed" });
 
-  let providerName: string;
-  let provider;
-  try {
-    providerName = resolveProviderName(cfg, { explicit: body.provider, username: body.username });
-    provider = resolveProvider(cfg, providerName);
-  } catch {
-    return reply.code(400).send({ error: "invalid login request" });
-  }
   const creds: Credentials = {
     mech: body.mech ?? (body.accessToken ? "XOAUTH2" : "PLAIN"),
     username: body.username,
@@ -204,6 +255,13 @@ app.post("/api/login", async (req, reply) => {
 
   const gate = await logins.begin(req.ip, body.username);
   if (!gate.ok) return sendLimited(reply, gate);
+  const found = await loginProvider(body.username, body.provider);
+  if (!found) {
+    // Like a refused password: a caller can't probe domains without limit.
+    gate.finish("refused");
+    return reply.code(401).send({ error: "auth failed" });
+  }
+  const { name: providerName, provider } = found;
   // verify by opening an IMAP session once
   let probe;
   try {
@@ -215,6 +273,7 @@ app.post("/api/login", async (req, reply) => {
     return reply.code(401).send({ error: "auth failed" });
   }
   gate.finish("accepted");
+  keepDiscovered(found);
 
   const slug = `${providerName}:${body.username}`;
   const tag = credentialTag(cfg.vaultKey, creds);
@@ -950,18 +1009,16 @@ async function basicLogin(
 ): Promise<AuthOutcome> {
   if (bridgeSecretOffered(password)) return UNAUTHORIZED;
 
-  let providerName: string;
-  let provider;
-  try {
-    providerName = resolveProviderName(cfg, { username });
-    provider = resolveProvider(cfg, providerName);
-  } catch {
-    return UNAUTHORIZED;
-  }
   const creds: Credentials = { mech: "PLAIN", username, password };
 
   const gate = await logins.begin(ip, username, { known });
   if (!gate.ok) return gate;
+  const found = await loginProvider(username);
+  if (!found) {
+    gate.finish("refused");
+    return UNAUTHORIZED;
+  }
+  const { name: providerName, provider } = found;
   let probe;
   try {
     probe = await openImap({ provider, creds });
@@ -974,6 +1031,7 @@ async function basicLogin(
     return UNAUTHORIZED;
   }
   gate.finish("accepted");
+  keepDiscovered(found);
   const slug = `${providerName}:${username}`;
   const signedIn = await recordSignIn({ slug, providerName, provider, creds, tag });
   if (!signedIn.ok) {
