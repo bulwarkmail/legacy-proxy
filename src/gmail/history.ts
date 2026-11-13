@@ -9,8 +9,8 @@ export interface HistoryRecord {
   id: string;
   messagesAdded?: { message: HistoryMessage }[];
   messagesDeleted?: { message: HistoryMessage }[];
-  labelsAdded?: { message: HistoryMessage }[];
-  labelsRemoved?: { message: HistoryMessage }[];
+  labelsAdded?: { message: HistoryMessage; labelIds?: string[] }[];
+  labelsRemoved?: { message: HistoryMessage; labelIds?: string[] }[];
 }
 export interface HistoryResult {
   historyId: string;
@@ -84,6 +84,63 @@ export function affected(records: HistoryRecord[]): {
         if (m.threadId) threads.add(m.threadId);
       }
   return { messages: [...messages], threads: [...threads] };
+}
+/** Labels put on, then taken off, a message by one history record. */
+export interface Relabel {
+  add: string[];
+  remove: string[];
+}
+/**
+ * What a run of history asks of the local copy, change by change.
+ *
+ * {@link affected} treats every record alike: the message is forgotten and
+ * read again. That is right for a message that appeared or went, and wasteful
+ * for the commonest change there is - a mail marked read, starred, archived,
+ * labelled - where the record itself says which labels moved. Those messages
+ * keep their cached copy and have the labels moved on it (`relabel`), so
+ * reading a mail no longer costs a second read of its row; and since no
+ * message joined or left a conversation, their threads are left alone too.
+ *
+ * - `drop`: messages to forget (created, deleted, or relabelled by a record
+ *   that does not say how).
+ * - `relabel`: label moves to apply, in order, to messages not in `drop`.
+ * - `threads`: conversations whose membership changed.
+ */
+export interface HistoryChange {
+  drop: string[];
+  relabel: Map<string, Relabel[]>;
+  threads: string[];
+}
+export function classify(records: HistoryRecord[]): HistoryChange {
+  const drop = new Set<string>(),
+    threads = new Set<string>();
+  const relabel = new Map<string, Relabel[]>();
+  for (const h of records) {
+    for (const { message: m } of h.messagesDeleted ?? []) {
+      drop.add(m.id);
+      if (m.threadId) threads.add(m.threadId);
+    }
+    for (const { message: m } of h.messagesAdded ?? []) {
+      drop.add(m.id);
+      if (m.threadId) threads.add(m.threadId);
+    }
+    for (const [group, adding] of [
+      [h.labelsRemoved, false],
+      [h.labelsAdded, true],
+    ] as const)
+      for (const item of group ?? []) {
+        const id = item.message.id;
+        if (!Array.isArray(item.labelIds)) {
+          drop.add(id);
+          continue;
+        }
+        const moves = relabel.get(id) ?? [];
+        moves.push(adding ? { add: item.labelIds, remove: [] } : { add: [], remove: item.labelIds });
+        relabel.set(id, moves);
+      }
+  }
+  for (const id of drop) relabel.delete(id);
+  return { drop: [...drop], relabel, threads: [...threads] };
 }
 /** Messages Gmail added to this account, with the labels the history record carried (if any). */
 export function addedMessages(

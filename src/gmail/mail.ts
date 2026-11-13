@@ -1,6 +1,6 @@
 import {
   readHistory,
-  affected,
+  classify,
   emailDelta,
   addedMessages,
   isDelivery,
@@ -67,6 +67,8 @@ const LABELS_TTL = 10 * 60_000;
 const SEND_AS_TTL = 60 * 60_000;
 /** The smallest page worth starting early: below it the query is a count or a probe, not a list. */
 const LIST_FROM = 5;
+/** Label changes sent to Gmail side by side in one `Email/set`. */
+const WRITES_AT_ONCE = 6;
 /**
  * Distinct labels {@link GmailMail.labelDetail} reads one by one in an account
  * state before it reads them all at once through {@link GmailMail.labels}.
@@ -392,19 +394,15 @@ export class GmailMail {
           ...new Set([...this.undelivered, ...delivered]),
         ].slice(-MAX_BATCH);
         if (this.store.revision(this.email) === revision) {
-          const changed = affected(history.records);
-          this.store.checkpoint(
-            this.email,
-            history.historyId,
-            changed.messages,
-            changed.threads,
-          );
+          const changed = classify(history.records);
+          this.applyHistory(history.historyId, changed);
           // What just arrived is what the client reads next. Fetching it here,
           // in one batch, is the difference between a notification the user
           // opens instantly and one that waits on Google. Detached on purpose:
-          // nothing about this request depends on it.
+          // nothing about this request depends on it. A message that was only
+          // relabelled kept its cached copy and needs no read at all.
           void this.prefetch(
-            changed.messages.slice(0, MAX_BATCH),
+            changed.drop.slice(0, MAX_BATCH),
             "metadata",
           ).catch(() => {});
         }
@@ -422,6 +420,10 @@ export class GmailMail {
       ...profile,
       historyId: this.store.cursor(this.email) ?? profile.historyId,
     };
+  }
+  /** Brings the cache up to `historyId`. */
+  private applyHistory(historyId: string, change: ReturnType<typeof classify>): void {
+    this.store.applyHistory(this.email, historyId, change);
   }
   async writable(): Promise<boolean> {
     return (
@@ -1335,6 +1337,38 @@ export class GmailMail {
         forget();
       }
     };
+    // A label change on one message. Its cached copy is not forgotten but
+    // given the labels Gmail answers with: the next list of the folder then
+    // finds the row where it left it instead of reading it again. Before and
+    // after, the listings and the profile are dropped, as for any write.
+    const relabel = async (
+      message: GmailMessage,
+      delta: { addLabelIds: string[]; removeLabelIds: string[] },
+    ): Promise<GmailMessage> => {
+      this.store.forget(this.email, [], []);
+      let result: GmailMessage;
+      try {
+        result = await this.api.mutate!<GmailMessage>(
+          `messages/${encodeURIComponent(message.id)}/modify`,
+          5,
+          "POST",
+          delta,
+        );
+      } catch (error) {
+        // Unknown outcome: read it again next time.
+        this.store.forget(
+          this.email,
+          [message.id],
+          message.threadId ? [message.threadId] : [],
+        );
+        throw error;
+      }
+      this.store.forget(this.email, [], []);
+      if (Array.isArray(result.labelIds))
+        this.store.setLabels(this.email, message.id, result.labelIds);
+      else this.store.forget(this.email, [message.id], []);
+      return result;
+    };
     // Fresh label metadata validates membership and prevents editing system labels.
     let labels =
       kind === "Mailbox" || Object.keys(update).length
@@ -1368,7 +1402,7 @@ export class GmailMail {
         notCreated[id] = error(e);
       }
     }
-    for (const [id, patch] of Object.entries(update)) {
+    const applyUpdate = async (id: string, patch: unknown): Promise<void> => {
       try {
         if (kind === "Mailbox") {
           const label = labels.find((l) => "l_" + l.id === id);
@@ -1388,22 +1422,27 @@ export class GmailMail {
         } else {
           if (!/^m_[A-Za-z0-9_-]{1,128}$/.test(id))
             throw new JmapError("notFound");
-          // Read current labels directly: cached metadata may predate a change in Gmail.
-          const message = await this.api.get<GmailMessage>(
-            `messages/${encodeURIComponent(this.store.upstreamId(this.email, upstreamId(id, "m_")))}`,
-            5,
-            { format: "minimal" },
-          );
+          // The labels the message has now, to tell what the patch changes.
+          // The cached copy follows Gmail's history label by label (see
+          // `classify`), so it is as current as the last sync, which the
+          // state read above has just run; only a message never read is
+          // asked of Gmail (20 units and a round trip, for every mail
+          // marked read).
+          const native = this.store.upstreamId(this.email, upstreamId(id, "m_"));
+          const held =
+            this.store.cached<GmailMessage>(this.email, messageKey("metadata", native)) ??
+            this.store.cached<GmailMessage>(this.email, messageKey("full", native));
+          const message: GmailMessage = held
+            ? { id: held.id, threadId: held.threadId, labelIds: held.labelIds, internalDate: held.internalDate }
+            : await this.api.get<GmailMessage>(
+                `messages/${encodeURIComponent(native)}`,
+                5,
+                { format: "minimal" },
+              );
           const delta = emailPatch(message, patch, labels);
           const result =
             delta.addLabelIds.length || delta.removeLabelIds.length
-              ? await mutate<GmailMessage>(
-                  `messages/${encodeURIComponent(message.id)}/modify`,
-                  5,
-                  "POST",
-                  delta,
-                  message,
-                )
+              ? await relabel(message, delta)
               : message;
           const mapped = await mapMessage(
             { ...result, internalDate: result.internalDate ?? "0" },
@@ -1419,7 +1458,17 @@ export class GmailMail {
       } catch (e) {
         notUpdated[id] = error(e);
       }
-    }
+    };
+    // Label changes on different messages do not depend on each other: sent a
+    // few at a time, marking twenty mails read takes one round trip's time
+    // instead of twenty. Mailbox updates stay in order.
+    const updates = Object.entries(update);
+    if (kind === "Email")
+      for (let i = 0; i < updates.length; i += WRITES_AT_ONCE)
+        await Promise.all(
+          updates.slice(i, i + WRITES_AT_ONCE).map(([id, patch]) => applyUpdate(id, patch)),
+        );
+    else for (const [id, patch] of updates) await applyUpdate(id, patch);
     for (const id of destroy) {
       try {
         if (kind === "Email") {
@@ -1504,13 +1553,7 @@ export class GmailMail {
         "Too many changes; reload the current mailbox",
       );
     // Do not claim that a later history cursor is already reflected in local cached reads.
-    const changed = affected(history.records);
-    this.store.checkpoint(
-      this.email,
-      history.historyId,
-      changed.messages,
-      changed.threads,
-    );
+    this.applyHistory(history.historyId, classify(history.records));
     return {
       accountId: this.accountId,
       oldState,
