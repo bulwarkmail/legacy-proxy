@@ -1,4 +1,8 @@
-import { expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 import { email, fakeGmail } from "./gmail-fake.js";
 
 it("lists the account once and then answers conversations without asking Gmail", async () => {
@@ -67,4 +71,59 @@ it("does not put back a message deleted while the account was being listed", asy
   await f.indexed();
   expect(fired).toBe(true);
   expect(f.store.threadIndexMembers(email, "t1")).toEqual(["m2", "m3"]);
+});
+
+it("keeps answering from the index while it is listed again", async () => {
+  const f = await fakeGmail({ index: true, pageSize: 2 });
+  await f.threads("t_t1");
+  await f.indexed();
+  const listings = () => f.calls("messages").filter((c) => c[0] === "messages" && !c[2].labelIds).length;
+  const first = listings();
+  const built = f.store.threadIndexBuiltAt(email)!;
+  // Eight days on, the index is due for a fresh listing. A message arrives
+  // while that listing is half way through.
+  vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 8 * 24 * 60 * 60_000 });
+  f.sync();
+  let arrived = false;
+  f.onPage(async (page) => {
+    if (page !== 1 || arrived) return;
+    arrived = true;
+    f.messages.unshift({ id: "m7", threadId: "t1", labelIds: ["INBOX"] });
+    f.record({ messagesAdded: [{ message: { id: "m7", threadId: "t1", labelIds: ["INBOX"] } }] });
+    // Asked in the middle of the listing: answered, from the index, current.
+    f.get.mockClear();
+    expect((await f.threads("t_t1")).list[0]!.emailIds).toEqual(["m_m1", "m_m2", "m_m3", "m_m7"]);
+    expect(f.calls("threads/")).toEqual([]);
+  });
+  f.get.mockClear();
+  expect((await f.threads("t_t1", "t_t5")).list.map((t) => t.emailIds.length)).toEqual([3, 1]);
+  expect(f.calls("threads/")).toEqual([]);
+  for (let i = 0; i < 200 && f.store.threadIndexBuiltAt(email) === built; i++)
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(f.store.threadIndexBuiltAt(email)).toBeGreaterThan(built);
+  expect(arrived).toBe(true);
+  expect(listings()).toBeGreaterThan(0);
+  expect(first).toBeGreaterThan(0);
+  // The fresh listing heard of the arrival too.
+  expect(f.store.threadIndexMembers(email, "t1")).toEqual(["m1", "m2", "m3", "m7"]);
+});
+
+it("orders a conversation by date once its rows are cached, wherever history added a message", async () => {
+  const f = await fakeGmail({ index: true });
+  await f.threads("t_t1");
+  await f.indexed();
+  // An imported message: new to the account, older than the rest of its thread.
+  f.messages.push({ id: "m0", threadId: "t1", labelIds: ["INBOX"] });
+  f.record({ messagesAdded: [{ message: { id: "m0", threadId: "t1", labelIds: ["INBOX"] } }] });
+  // Unseen, it sits where history put it: last.
+  expect((await f.threads("t_t1")).list[0]!.emailIds).toEqual(["m_m1", "m_m2", "m_m3", "m_m0"]);
+  // Once the conversation's rows are read, their dates decide.
+  await f.methods["Email/get"]!({
+    accountId: f.mail.accountId,
+    ids: ["m_m0", "m_m1", "m_m2", "m_m3"],
+    properties: ["receivedAt"],
+  });
+  f.get.mockClear();
+  expect((await f.threads("t_t1")).list[0]!.emailIds).toEqual(["m_m0", "m_m1", "m_m2", "m_m3"]);
+  expect(f.calls("threads/")).toEqual([]);
 });

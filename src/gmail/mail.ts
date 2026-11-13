@@ -439,16 +439,17 @@ export class GmailMail {
     if (this.indexDeleted)
       for (const step of change.membership)
         if ("remove" in step) this.indexDeleted.add(step.remove);
-    this.store.applyHistory(this.email, historyId, change);
+    this.store.applyHistory(this.email, historyId, change, this.indexDeleted !== undefined);
   }
   /**
    * Whether conversations can be answered from the thread index. Starts
-   * building it, in the background, when it is missing or old.
+   * listing the account, in the background, when it is missing or old.
    */
   private threadIndexReady(): boolean {
     if (!this.threadIndex) return false;
     const built = this.store.threadIndexBuiltAt(this.email);
     if (built !== null && Date.now() - built < THREAD_INDEX_MAX_AGE) return true;
+    // An index that is only old keeps answering while it is listed again.
     if (!this.indexing && Date.now() >= this.indexRetryAt)
       this.indexing = this.buildThreadIndex()
         .catch((error: unknown) => {
@@ -462,7 +463,30 @@ export class GmailMail {
           this.indexing = undefined;
           this.indexDeleted = undefined;
         });
-    return false;
+    return built !== null;
+  }
+  /**
+   * A conversation's messages by date, when every one of them is cached.
+   *
+   * The index knows the order Gmail listed them in, and puts what history
+   * adds later at the end. That is the date order except for a message that
+   * arrives carrying an older date - an import. A conversation the client is
+   * looking at has its rows cached, so their dates settle it; otherwise the
+   * index's order stands.
+   */
+  private byDate(members: string[]): string[] {
+    if (members.length < 2) return members;
+    const dated: { id: string; at: number }[] = [];
+    for (const id of members) {
+      const message =
+        this.store.cached<GmailMessage>(this.email, messageKey("metadata", id)) ??
+        this.store.cached<GmailMessage>(this.email, messageKey("full", id));
+      const at = Number(message?.internalDate);
+      if (!message || !Number.isFinite(at)) return members;
+      dated.push({ id, at });
+    }
+    // Stable: equal dates keep the index's order.
+    return dated.sort((a, b) => a.at - b.at).map((d) => d.id);
   }
   /** Lists every message of the account with its thread: 5 quota units per 500 messages. */
   private async buildThreadIndex(): Promise<void> {
@@ -1931,7 +1955,7 @@ export class GmailMail {
           for (const id of ids) {
             if (!/^t_[A-Za-z0-9_-]{1,128}$/.test(id)) continue;
             const members = this.store.threadIndexMembers(this.email, id.slice(2));
-            if (members.length) known.set(id, members);
+            if (members.length) known.set(id, this.byDate(members));
           }
         await this.prefetchThreads(ids.filter((id) => !known.has(id)));
         const read = async (

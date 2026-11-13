@@ -83,6 +83,10 @@ export class GmailStore {
         PRIMARY KEY(email, message)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS gmail_thread_index_thread ON gmail_thread_index(email, thread, ord);
+      CREATE TABLE IF NOT EXISTS gmail_thread_index_next (
+        email TEXT NOT NULL, message TEXT NOT NULL, thread TEXT NOT NULL, ord INTEGER NOT NULL,
+        PRIMARY KEY(email, message)
+      ) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS gmail_thread_index_state (email TEXT PRIMARY KEY, complete INTEGER NOT NULL, built_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS gmail_schedule (
         id TEXT PRIMARY KEY, email TEXT NOT NULL, original TEXT NOT NULL, identity TEXT NOT NULL, thread TEXT NOT NULL,
@@ -621,7 +625,13 @@ export class GmailStore {
    * and replays who joined or left which conversation. One transaction, so the
    * cursor never claims more than the copy holds.
    */
-  applyHistory(email: string, history: string, change: HistoryChange): void {
+  applyHistory(
+    email: string,
+    history: string,
+    change: HistoryChange,
+    /** A listing of the account is under way (see {@link threadIndexBegin}): it must hear of these changes too. */
+    listing = false,
+  ): void {
     this.db.transaction(() => {
       const previous = this.cursor(email);
       if (previous && BigInt(previous) >= BigInt(history)) return;
@@ -634,17 +644,22 @@ export class GmailStore {
             for (const label of move.remove) labels.delete(label);
           }
         });
-      const add = this.db.prepare(
-        "INSERT OR IGNORE INTO gmail_thread_index VALUES(?,?,?,?)",
-      );
-      const remove = this.db.prepare(
-        "DELETE FROM gmail_thread_index WHERE email=? AND message=?",
-      );
       // Newer than anything listed: a listing numbers downwards from zero.
       let ord = Date.now() * 1000;
-      for (const step of change.membership)
-        if ("add" in step) add.run(email, step.add, step.thread, ord++);
-        else remove.run(email, step.remove);
+      for (const table of listing
+        ? ["gmail_thread_index", "gmail_thread_index_next"]
+        : ["gmail_thread_index"]) {
+        const add = this.db.prepare(
+          `INSERT OR IGNORE INTO ${table} VALUES(?,?,?,?)`,
+        );
+        const remove = this.db.prepare(
+          `DELETE FROM ${table} WHERE email=? AND message=?`,
+        );
+        let at = ord;
+        for (const step of change.membership)
+          if ("add" in step) add.run(email, step.add, step.thread, at++);
+          else remove.run(email, step.remove);
+      }
       this.db
         .prepare(
           "INSERT INTO gmail_cursor VALUES(?,?) ON CONFLICT(email) DO UPDATE SET history=excluded.history",
@@ -711,14 +726,9 @@ export class GmailStore {
    * first and numbers downwards from zero, arrivals count up from the clock.
    */
   threadIndexBegin(email: string): void {
-    this.db.transaction(() => {
-      this.db.prepare("DELETE FROM gmail_thread_index WHERE email=?").run(email);
-      this.db
-        .prepare(
-          "INSERT INTO gmail_thread_index_state VALUES(?,0,0) ON CONFLICT(email) DO UPDATE SET complete=0, built_at=0",
-        )
-        .run(email);
-    })();
+    // Listed beside the index in use, and swapped in when complete: an index
+    // that is only being refreshed keeps answering in the meantime.
+    this.db.prepare("DELETE FROM gmail_thread_index_next WHERE email=?").run(email);
   }
   /** One listed page, `firstOrd` for its first (newest) message and downwards. Never replaces a row history has already written. */
   threadIndexInsert(
@@ -727,20 +737,30 @@ export class GmailStore {
     firstOrd: number,
   ): void {
     const insert = this.db.prepare(
-      "INSERT OR IGNORE INTO gmail_thread_index VALUES(?,?,?,?)",
+      "INSERT OR IGNORE INTO gmail_thread_index_next VALUES(?,?,?,?)",
     );
     this.db.transaction(() => {
       rows.forEach((row, i) => insert.run(email, row.id, row.threadId, firstOrd - i));
     })();
   }
+  /** The listing is whole: it becomes the index. */
   threadIndexComplete(email: string): void {
-    this.db
-      .prepare(
-        "UPDATE gmail_thread_index_state SET complete=1, built_at=? WHERE email=?",
-      )
-      .run(Date.now(), email);
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM gmail_thread_index WHERE email=?").run(email);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_thread_index SELECT email,message,thread,ord FROM gmail_thread_index_next WHERE email=?",
+        )
+        .run(email);
+      this.db.prepare("DELETE FROM gmail_thread_index_next WHERE email=?").run(email);
+      this.db
+        .prepare(
+          "INSERT INTO gmail_thread_index_state VALUES(?,1,?) ON CONFLICT(email) DO UPDATE SET complete=1, built_at=excluded.built_at",
+        )
+        .run(email, Date.now());
+    })();
   }
-  /** When the index was last built whole, or null while it is missing or being built. */
+  /** When the index was last listed whole, or null when there is none to answer from. */
   threadIndexBuiltAt(email: string): number | null {
     const row = this.db
       .prepare(
@@ -1010,6 +1030,7 @@ export class GmailStore {
       "gmail_push",
       "gmail_push_sub",
       "gmail_thread_index",
+      "gmail_thread_index_next",
       "gmail_thread_index_state",
     ];
     this.db.transaction(() => {

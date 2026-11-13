@@ -851,9 +851,10 @@ Gmail charges 40 quota units to say which messages are in a conversation, and a
 client asks that of every row it lists. The bridge therefore keeps its own index of
 every message and its thread: it lists the account once in the background (5 units
 per 500 messages, about 45 seconds for 100,000 messages), keeps it current from the
-history each sync already reads, and lists it again once a week or when Gmail's
-history can no longer be replayed. Until the index is complete, and for any thread it
-does not know, conversations are read from Gmail as before. `GMAIL_THREAD_INDEX=false`
+history each sync already reads, and lists it again once a week (the index in use
+keeps answering meanwhile) or when Gmail's history can no longer be replayed. Until
+the first listing is complete, and for any thread the index does not know,
+conversations are read from Gmail as before. `GMAIL_THREAD_INDEX=false`
 turns it off.
 
 ### Push notifications (Cloud Pub/Sub)
