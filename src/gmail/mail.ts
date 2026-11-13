@@ -203,10 +203,13 @@ export class GmailMail {
   private indexDeleted?: Set<string>;
   private indexRetryAt = 0;
   private flights = new Map<string, Promise<unknown>>();
-  /** The page reads {@link warm} has in flight, if any. */
-  private warming?: Promise<void>;
-  /** Messages a batch is reading right now, each with the (never failing) end of that read. */
+  /**
+   * Messages and threads being read right now, each with the (never failing)
+   * end of that read. Whoever wants one of them waits for it, and only for
+   * it: a read of other messages has nothing to wait for.
+   */
   private reading = new Map<string, Promise<void>>();
+  private readingThreads = new Map<string, Promise<void>>();
   /** Labels {@link labelDetail} was asked for in the current account state. */
   private labelsAsked?: { state: string; ids: Set<string> };
   /** Messages Gmail delivered during the last push sync, for push fan-out. */
@@ -909,10 +912,17 @@ export class GmailMail {
     next: R[] = [],
   ): R[] {
     if (!this.api.batch || page.length < LIST_FROM) return page;
-    const previous = this.warming;
     const indexed = this.threadIndexReady();
+    const rows = page.map((r) => this.store.upstreamId(this.email, r.id));
+    // Without the index the conversations are read along with the rows.
+    const threads = indexed ? [] : [...new Set(page.map((r) => r.threadId))];
+    // The same page may have been listed a moment ago, by another tab.
+    const before = new Set([
+      ...rows.flatMap((id) => this.reading.get(id) ?? []),
+      ...threads.flatMap((id) => this.readingThreads.get(id) ?? []),
+    ]);
     const flight: Promise<void> = (async () => {
-      await previous;
+      await Promise.all(before);
       // With the index the conversations are already known: only the rows
       // are read, at 20 units each instead of 40 a thread.
       if (indexed) return this.prefetch(page.map((r) => r.id), "metadata", true);
@@ -931,15 +941,21 @@ export class GmailMail {
       );
       await Promise.all([
         this.prefetch(page.map((r) => r.id), "metadata", true),
-        this.prefetchThreads([...new Set(page.map((r) => "t_" + r.threadId))], true),
+        this.prefetchThreads(threads.map((id) => "t_" + id), true),
       ]);
     })()
       // Best effort: whoever needs the data asks again and reports the failure.
-      .catch(() => {})
-      .finally(() => {
-        if (this.warming === flight) this.warming = undefined;
-      });
-    this.warming = flight;
+      .catch(() => {});
+    // The calls that ask for these rows and conversations wait for this read
+    // - and nothing else does: new mail read as it arrives, or another page,
+    // is not held up behind a page it has nothing to do with.
+    for (const id of rows) this.reading.set(id, flight);
+    for (const id of threads) this.readingThreads.set(id, flight);
+    void flight.finally(() => {
+      for (const id of rows) if (this.reading.get(id) === flight) this.reading.delete(id);
+      for (const id of threads)
+        if (this.readingThreads.get(id) === flight) this.readingThreads.delete(id);
+    });
     // The page after this one is where a scroll goes next. Its rows are read
     // once this page's are in, so scrolling finds them there instead of
     // waiting a second for Google - but only out of a minute that has plenty
@@ -948,7 +964,7 @@ export class GmailMail {
       void flight
         .then(() =>
           (this.api.spare?.() ?? 0) >= READ_AHEAD_SPARE_UNITS
-            ? this.prefetch(next.map((r) => r.id), "metadata", true)
+            ? this.prefetch(next.map((r) => r.id), "metadata")
             : undefined,
         )
         .catch(() => {});
@@ -970,10 +986,9 @@ export class GmailMail {
     ids: string[],
     format: MessageFormat,
     /** Set by {@link warm} for its own reads, which must not wait on themselves. */
-    warming = false,
+    own = false,
   ): Promise<void> {
     if (!this.api.batch || ids.length < 2) return;
-    if (!warming) await this.warming;
     const native = [
       ...new Set(
         ids
@@ -984,7 +999,7 @@ export class GmailMail {
     // Some of these may be on their way already - read ahead of a scroll, or
     // asked for by another tab: wait for that answer rather than buy it twice.
     const underway = new Set(
-      native.flatMap((id) => this.reading.get(id) ?? []),
+      own ? [] : native.flatMap((id) => this.reading.get(id) ?? []),
     );
     if (underway.size) await Promise.all(underway);
     const wanted = native.filter(
@@ -1086,9 +1101,13 @@ export class GmailMail {
    * so a folder page's conversation sizes cost one round trip to Google
    * instead of fifty, four at a time. Best effort like {@link prefetch}.
    */
-  private async prefetchThreads(ids: string[], warming = false): Promise<void> {
+  private async prefetchThreads(ids: string[], own = false): Promise<void> {
     if (!this.api.batch || ids.length < 2) return;
-    if (!warming) await this.warming;
+    // A page's warm-up may be reading these very conversations.
+    const underway = new Set(
+      own ? [] : ids.flatMap((id) => this.readingThreads.get(id.slice(2)) ?? []),
+    );
+    if (underway.size) await Promise.all(underway);
     const wanted = [
       ...new Set(
         ids.filter(

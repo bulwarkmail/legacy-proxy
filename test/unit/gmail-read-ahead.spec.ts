@@ -73,3 +73,37 @@ it("reads rows two callers ask for at the same moment only once", async () => {
   expect(batchedIds(f)).toEqual([["m5", "m4", "m3"]]);
   expect(f.calls("messages/")).toHaveLength(3); // the three reads of that one batch
 });
+
+it("does not hold a read of other messages behind a page being read", async () => {
+  const f = await fakeGmail({ index: true, older: 12 });
+  await f.threads("t_t1");
+  await f.indexed();
+  const read = f.batch.getMockImplementation()!;
+  let pageDone = false;
+  // The page's rows take a while; anything else answers at once.
+  f.batch.mockImplementation(async (reads: { resource: string }[]) => {
+    if (reads.some((r) => r.resource === "messages/m5")) {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      pageDone = true;
+    }
+    return (read as any)(reads);
+  });
+  await f.methods["Email/query"]!({ accountId: f.mail.accountId, filter: { inMailbox: "l_INBOX" }, limit: 5 });
+  // Two old messages nobody listed - new mail read as it arrives is the same case.
+  const other = (await f.methods["Email/get"]!({
+    accountId: f.mail.accountId,
+    ids: ["m_o90", "m_o89"],
+    properties: ["subject"],
+  })) as any;
+  expect(other.list).toHaveLength(2);
+  expect(pageDone).toBe(false);
+  // The page's own rows do wait for it, and are read once.
+  const rows = (await f.methods["Email/get"]!({
+    accountId: f.mail.accountId,
+    ids: ["m_m5", "m_m4"],
+    properties: ["subject"],
+  })) as any;
+  expect(rows.list).toHaveLength(2);
+  expect(pageDone).toBe(true);
+  expect(batchedIds(f).filter((ids) => ids.includes("m5"))).toHaveLength(1);
+});
