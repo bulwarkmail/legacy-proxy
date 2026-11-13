@@ -4,6 +4,8 @@ import { GmailConnection } from "./connection.js";
 import { GmailStore } from "./store.js";
 import { GMAIL_MODIFY } from "./config.js";
 import { JmapError } from "../jmap/errors.js";
+import { currentTrace } from "../jmap/trace.js";
+import { log } from "../util/log.js";
 
 /** A write Google never received or explicitly refused: nothing changed upstream, so it is safe to retry. */
 export class GmailNotSent extends JmapError {}
@@ -21,6 +23,9 @@ export class GmailNotSent extends JmapError {}
  * pacer alone.
  */
 const UNITS_PER_SECOND = 200;
+
+/** A Google answer slower than this is worth a line of its own in the log. */
+const SLOW_UPSTREAM_MS = 3000;
 
 /** In-flight requests per account, high enough that the quota pacer above stays the limit rather than the socket count. */
 export const MAX_CONCURRENT = 12;
@@ -165,6 +170,7 @@ export class GmailApi {
         url: "https://gmail.googleapis.com/batch/gmail/v1",
         data: body,
         contentType: `multipart/mixed; boundary=${boundary}`,
+        reads: reads.length,
       },
     );
     const answers = parseBatch(text);
@@ -172,8 +178,32 @@ export class GmailApi {
     // still 200: without this the caller would read a uniform refusal as a
     // cache miss and spend the same budget again, one request per message.
     let limited = 0;
-    for (const answer of answers.values())
+    const refused = new Map<string, number>();
+    for (const answer of answers.values()) {
       if (answer.status === 429 || answer.status === 403) limited++;
+      if (answer.status < 200 || answer.status >= 300) {
+        // Google's own words for the refusal: "too many concurrent requests"
+        // and "quota exceeded" call for different remedies.
+        let why = "";
+        try {
+          why = String(
+            (JSON.parse(answer.body) as { error?: { message?: string } }).error?.message ?? "",
+          ).slice(0, 120);
+        } catch {
+          // Not JSON: the status alone is the reason.
+        }
+        const key = `${answer.status} ${why}`;
+        refused.set(key, (refused.get(key) ?? 0) + 1);
+      }
+    }
+    if (refused.size) {
+      const trace = currentTrace();
+      if (trace) trace.refused += limited;
+      log.info(
+        { reads: reads.length, resource: reads[0]!.resource.split("/")[0], refused: Object.fromEntries(refused) },
+        "gmail batch parts refused",
+      );
+    }
     if (limited === reads.length) {
       this.blockedUntil = Math.max(this.blockedUntil, Date.now() + 1000);
       throw new JmapError("serverUnavailable", "Google rate limit; retry later");
@@ -197,8 +227,14 @@ export class GmailApi {
     method?: "POST" | "PATCH" | "DELETE",
     body?: unknown,
     /** A ready-made POST that replaces the `resource`/`params` call, used by {@link batch}: it is a read, and shares this account's credentials, pacing and retries. */
-    prepared?: { url: string; data: string; contentType: string },
+    prepared?: { url: string; data: string; contentType: string; reads: number },
   ): Promise<T> {
+    const trace = currentTrace();
+    const began = performance.now();
+    let net = 0;
+    // Every time the request is sent, a retry included: each one is a call
+    // Google counts and prices.
+    let sends = 0;
     if (this.waiting.length >= 200)
       throw new (method ? GmailNotSent : JmapError)(
         "serverUnavailable",
@@ -218,6 +254,9 @@ export class GmailApi {
         this.waiting.push(admit);
       });
       // Not admitted means no slot was handed over: nothing to release below.
+      // The wait is booked here, because that `finally` is never reached: a
+      // call that queued until it timed out is exactly what the log is for.
+      if (!admitted && trace) trace.waitMs += performance.now() - began;
       if (!admitted)
         throw new (method ? GmailNotSent : JmapError)(
           "serverUnavailable",
@@ -291,6 +330,8 @@ export class GmailApi {
             );
           await new Promise((resolve) => setTimeout(resolve, wait));
         }
+        const sent = performance.now();
+        sends++;
         try {
           dispatched = true;
           const { data } = await client.request<T>(
@@ -315,8 +356,22 @@ export class GmailApi {
                     : {}),
                 },
           );
+          const took = performance.now() - sent;
+          net += took;
+          if (took >= SLOW_UPSTREAM_MS)
+            log.info(
+              { resource: resource.split("/")[0], reads: prepared?.reads, ms: Math.round(took) },
+              "gmail request slow",
+            );
           return data;
         } catch (error) {
+          const failedAfter = performance.now() - sent;
+          net += failedAfter;
+          if (failedAfter >= SLOW_UPSTREAM_MS)
+            log.info(
+              { resource: resource.split("/")[0], reads: prepared?.reads, ms: Math.round(failedAfter), failed: true },
+              "gmail request slow",
+            );
           const response = (
             error as {
               response?: {
@@ -336,6 +391,22 @@ export class GmailApi {
           const code =
             (error as { code?: string; cause?: { code?: string } }).code ??
             (error as { cause?: { code?: string } }).cause?.code;
+          if (rateLimited) {
+            // A refused batch envelope turns away every read it carried.
+            if (trace) trace.refused += prepared?.reads ?? 1;
+            log.info(
+              {
+                resource: resource.split("/")[0],
+                status,
+                reason,
+                why: String(
+                  (response?.data as { error?: { message?: string } } | undefined)?.error?.message ?? "",
+                ).slice(0, 160),
+                attempt,
+              },
+              "gmail rate limited",
+            );
+          }
           const timedOut = isTimeout(error);
           const networkFailure =
             timedOut ||
@@ -418,6 +489,13 @@ export class GmailApi {
         throw new GmailNotSent(mapped.type, mapped.message);
       throw mapped;
     } finally {
+      if (trace) {
+        trace.calls += sends;
+        trace.reads += (prepared?.reads ?? 1) * sends;
+        trace.units += cost * sends;
+        trace.netMs += net;
+        trace.waitMs += performance.now() - began - net;
+      }
       const next = this.waiting.shift();
       if (next) next();
       else this.active--;
