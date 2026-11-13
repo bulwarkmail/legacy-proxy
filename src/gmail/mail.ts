@@ -64,6 +64,9 @@ const MAX_BLOB = 50_000_000;
 /** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
 /** How long an idle account keeps its label counters; any change moves the cache key first. */
 const LABELS_TTL = 10 * 60_000;
+const SEND_AS_TTL = 60 * 60_000;
+/** The smallest page worth starting early: below it the query is a count or a probe, not a list. */
+const LIST_FROM = 5;
 /**
  * Distinct labels {@link GmailMail.labelDetail} reads one by one in an account
  * state before it reads them all at once through {@link GmailMail.labels}.
@@ -93,6 +96,31 @@ const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
   "preview",
   "headers",
 ]);
+
+/**
+ * How much of a message is read from Gmail, and at what price.
+ *
+ * - `metadata` (20 quota units): headers, labels and snippet.
+ * - `full` (60): with the MIME tree and the bodies.
+ *
+ * A user gets 6,000 units a minute. A list row used to be read `full`, because
+ * rows ask for `hasAttachment` and only the MIME tree answers that exactly: a
+ * page of fifty cost 3,000 units, half the minute, before its conversation
+ * sizes cost another 2,000. Rows are read as `metadata` now, and the flag is
+ * told from the message's own Content-Type until the message is opened (see
+ * `mapMessage`).
+ */
+type MessageFormat = "full" | "metadata";
+const messageKey = (format: MessageFormat, id: string): string =>
+  `${format === "full" ? "message" : "meta"}:v2:${id}`;
+/** Cache keys that can answer a read of `format`, richest first: a full copy also serves a metadata read. */
+const messageKeys = (format: MessageFormat, id: string): string[] =>
+  format === "full"
+    ? [messageKey("full", id)]
+    : [messageKey("full", id), messageKey("metadata", id)];
+/** What a list row can ask of a message read as `metadata`. */
+const rowProperty = (p: string): boolean =>
+  METADATA_PROPERTIES.has(p) || p === "hasAttachment" || p.startsWith("header:");
 
 /**
  * How long a cached message may outlive its last read.
@@ -258,9 +286,7 @@ export class GmailMail {
   ): Promise<Record<string, unknown>[]> {
     const ids = [...this.lastDelivered];
     if (ids.length === 0) return [];
-    const format = properties.every((p) => METADATA_PROPERTIES.has(p))
-      ? "metadata"
-      : "full";
+    const format: MessageFormat = properties.every(rowProperty) ? "metadata" : "full";
     await this.prefetch(ids, format).catch(() => {});
     const tag = await this.tags();
     const out: Record<string, unknown>[] = [];
@@ -413,9 +439,10 @@ export class GmailMail {
     const read = async () =>
       (await this.api.get<{ sendAs?: SendAs[] }>("settings/sendAs", 5))
         .sendAs ?? [];
-    if (!fresh) return this.cached("sendAs", 300_000, read);
+    // Aliases change a few times a year, and a send reads them fresh anyway.
+    if (!fresh) return this.cached("sendAs", SEND_AS_TTL, read);
     const list = await read();
-    this.store.cache(this.email, "sendAs", list, 300_000);
+    this.store.cache(this.email, "sendAs", list, SEND_AS_TTL);
     return list;
   }
   async upload(body: Buffer, type: string): Promise<string> {
@@ -755,11 +782,9 @@ export class GmailMail {
    */
   private async prefetch(
     ids: string[],
-    format: "full" | "metadata",
+    format: MessageFormat,
   ): Promise<void> {
     if (!this.api.batch || ids.length < 2) return;
-    const key = (id: string) =>
-      `${format === "full" ? "message" : "meta"}:v2:${id}`;
     const wanted = [
       ...new Set(
         ids
@@ -767,10 +792,9 @@ export class GmailMail {
           .filter(
             (id) =>
               /^[A-Za-z0-9_-]{1,128}$/.test(id) &&
-              this.store.cached(this.email, key(id)) === null &&
-              // A cached full message already answers a metadata read.
-              (format === "full" ||
-                this.store.cached(this.email, `message:v2:${id}`) === null),
+              // Asked without decrypting: on a warm page that was fifty
+              // messages opened here only to be opened again below.
+              !messageKeys(format, id).some((key) => this.store.has(this.email, key)),
           ),
       ),
     ];
@@ -797,7 +821,7 @@ export class GmailMail {
       for (const [index, id] of page.entries()) {
         const answer = answers[index];
         if (answer?.data)
-          this.store.cache(this.email, key(id), answer.data, MESSAGE_TTL);
+          this.store.cache(this.email, messageKey(format, id), answer.data, MESSAGE_TTL);
       }
     }
   }
@@ -847,28 +871,22 @@ export class GmailMail {
       }
     }
   }
-  /** `metadata` omits bodies and parts: enough for list views, and much smaller to transfer and cache. */
+  /** See {@link MessageFormat}: ask for the leanest one that answers the read. */
   async message(
     id: string,
-    format: "full" | "metadata" = "full",
+    format: MessageFormat = "full",
   ): Promise<GmailMessage> {
     id = this.store.upstreamId(this.email, id);
     await this.state();
     if (format === "metadata") {
       // A cached full message also answers metadata-only reads.
-      const full = this.store.cached<GmailMessage>(
-        this.email,
-        `message:v2:${id}`,
-      );
+      const full = this.store.cached<GmailMessage>(this.email, messageKey("full", id));
       if (full) return full;
     }
-    return this.cached(
-      `${format === "full" ? "message" : "meta"}:v2:${id}`,
-      MESSAGE_TTL,
-      () =>
-        this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 5, {
-          format,
-        }),
+    return this.cached(messageKey(format, id), MESSAGE_TTL, () =>
+      this.api.get<GmailMessage>(`messages/${encodeURIComponent(id)}`, 5, {
+        format,
+      }),
     );
   }
   private async bytes(messageId: string, part: GmailPart): Promise<Buffer> {
@@ -929,7 +947,10 @@ export class GmailMail {
     // only if something really asks for it.
     let search: string | undefined;
     const q = async () =>
-      (search ??= gmailFilter(args.filter, await this.labels()));
+      // Names only: the counters `labels()` adds cost a call per label, and
+      // a push preview asks "what arrived in this folder since then" on
+      // every notification.
+      (search ??= gmailFilter(args.filter, await this.labelList()));
     const sort = args.sort ?? [{ property: "receivedAt", isAscending: false }];
     if (
       !Array.isArray(sort) ||
@@ -997,11 +1018,40 @@ export class GmailMail {
       );
       return box && unread ? (box.inMailbox as string) : undefined;
     })();
+    // "Read in a folder" is the other half of an unread-first folder view: the
+    // client lists the unread mail on top and pages through the read mail
+    // below. Gmail has no label for read mail, but the folder's counters give
+    // the exact total and `is:read` narrows the label listing, so a page costs
+    // one listing instead of an enumeration of every read message (68k ids,
+    // ~30 s, on a large Inbox - again on every change of the account).
+    const readIn = ((): string | undefined => {
+      if (
+        !f ||
+        f.operator !== "AND" ||
+        !Array.isArray(f.conditions) ||
+        f.conditions.length !== 2
+      )
+        return undefined;
+      const parts = f.conditions as Record<string, unknown>[];
+      const box = parts.find(
+        (c) =>
+          c && Object.keys(c).length === 1 && typeof c.inMailbox === "string",
+      );
+      const read = parts.find(
+        (c) => c && Object.keys(c).length === 1 && c.hasKeyword === "$seen",
+      );
+      const id = box && read ? (box.inMailbox as string) : undefined;
+      // Only a real label has the counters the total comes from.
+      return id && id !== ALL_MAIL && /^l_[A-Za-z0-9_-]+$/.test(id)
+        ? id
+        : undefined;
+    })();
     const simple =
       !f ||
       Object.keys(f).length === 0 ||
       (Object.keys(f).length === 1 && typeof f.inMailbox === "string") ||
-      unreadIn !== undefined;
+      unreadIn !== undefined ||
+      readIn !== undefined;
     const pos = args.position ?? 0;
     if (
       simple &&
@@ -1013,6 +1063,7 @@ export class GmailMail {
     ) {
       const box =
         unreadIn ??
+        readIn ??
         (typeof f?.inMailbox === "string" ? f.inMailbox : undefined);
       // A mailbox id carries the Gmail label id, so one `labels.get` answers
       // "how many (unread) messages are in this folder" without listing the
@@ -1021,8 +1072,47 @@ export class GmailMail {
         box && box !== ALL_MAIL && /^l_[A-Za-z0-9_-]+$/.test(box)
           ? box.slice(2)
           : undefined;
+      const count = Math.min(limit as number, MAX_QUERY);
+      // Ask Gmail for no more than the page needs: a count asks for one id,
+      // and listing 500 of a large label to return one takes seconds.
+      const pageSize = String(Math.min(500, Math.max(1, (pos as number) + count)));
+      type Listing = Record<string, string | string[]>;
+      const labelListing = (id: string): Listing => ({
+        labelIds: unreadIn ? [id, "UNREAD"] : id,
+        ...(readIn ? { q: "is:read" } : {}),
+        ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
+      });
+      const listPage = (listing: Listing, cursor: string) =>
+        this.cached<{
+          messages?: { id: string; threadId: string }[];
+          nextPageToken?: string;
+        }>(
+          // Keyed by account state: a listing that survives here is one
+          // no history record has touched, so it cannot go stale.
+          `page:${state}:${hash(listing)}:${pageSize}:${hash(cursor)}`,
+          MESSAGE_TTL,
+          () =>
+            this.api.get("messages", 5, {
+              includeSpamTrash: "true",
+              ...listing,
+              maxResults: pageSize,
+              ...(cursor ? { pageToken: cursor } : {}),
+            }),
+        );
+      // The folder's counters and its first page do not depend on each
+      // other: asked together, a refreshed folder waits for one answer from
+      // Google instead of two in a row. The loop below picks this read up.
+      // Not for a count (`limit: 1`): an empty folder needs no listing at all.
+      if (labelId && count >= LIST_FROM)
+        void listPage(labelListing(labelId), "").catch(() => {});
       const label = labelId ? await this.labelDetail(labelId) : undefined;
-      const total = unreadIn
+      const total = readIn
+        ? label &&
+          label.messagesTotal !== undefined &&
+          label.messagesUnread !== undefined
+          ? Math.max(0, label.messagesTotal - label.messagesUnread)
+          : undefined
+        : unreadIn
         ? label
           ? label.messagesUnread
           : (await this.labelDetail("UNREAD"))?.messagesTotal
@@ -1031,40 +1121,21 @@ export class GmailMail {
           : (await this.profile()).messagesTotal;
       if (total !== undefined) {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
-        // dependence on search syntax, label names or search-index lag.
-        const listing: Record<string, string | string[]> = label
-          ? {
-              labelIds: unreadIn ? [label.id, "UNREAD"] : label.id,
-              ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
-            }
+        // dependence on search syntax, label names or search-index lag. The
+        // one exception is the read half of a folder: Gmail has no label for
+        // read mail, so that listing is the label narrowed by `is:read`, and
+        // its total (counters) can run a moment ahead of its rows (search).
+        const listing: Listing = label
+          ? labelListing(label.id)
           : { q: await q() };
-        const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
-        // Ask Gmail for no more than the page needs: a count asks for one id,
-        // and listing 500 of a large label to return one takes seconds.
-        const pageSize = String(Math.min(500, Math.max(1, wanted)));
         const refs = new Map<string, { id: string; threadId: string }>();
         let token = "";
         const tokens = new Set<string>();
         if (count && (pos as number) < total)
           do {
             const cursor = token;
-            const page = await this.cached<{
-              messages?: { id: string; threadId: string }[];
-              nextPageToken?: string;
-            }>(
-              // Keyed by account state: a listing that survives here is one
-              // no history record has touched, so it cannot go stale.
-              `page:${state}:${hash(listing)}:${pageSize}:${hash(cursor)}`,
-              MESSAGE_TTL,
-              () =>
-                this.api.get("messages", 5, {
-                  includeSpamTrash: "true",
-                  ...listing,
-                  maxResults: pageSize,
-                  ...(cursor ? { pageToken: cursor } : {}),
-                }),
-            );
+            const page = await listPage(listing, cursor);
             for (const reference of page.messages ?? [])
               refs.set(reference.id, reference);
             token = page.nextPageToken ?? "";
@@ -1088,7 +1159,12 @@ export class GmailMail {
           queryState: hash([
             state,
             label
-              ? ["label", label.id, unreadIn ? "unread" : "all", skipSpamTrash]
+              ? [
+                  "label",
+                  label.id,
+                  unreadIn ? "unread" : readIn ? "read" : "all",
+                  skipSpamTrash,
+                ]
               : search,
           ]),
           canCalculateChanges: false,
@@ -1564,14 +1640,11 @@ export class GmailMail {
       "Email/get": async (a) => {
         this.account(a);
         const properties = this.properties(a);
-        // List views ask only for header-derived properties: Gmail's metadata format serves them without bodies.
-        const format =
-          properties &&
-          properties.every(
-            (p) => METADATA_PROPERTIES.has(p) || p.startsWith("header:"),
-          )
-            ? "metadata"
-            : "full";
+        // List rows ask only for what the headers hold (and `hasAttachment`,
+        // which they answer closely enough): Gmail's metadata format serves
+        // them at a third of the price of the whole message.
+        const format: MessageFormat =
+          properties && properties.every(rowProperty) ? "metadata" : "full";
         let ids = this.ids(a);
         if (ids === null) {
           if ((await this.profile()).messagesTotal > MAX_GET)

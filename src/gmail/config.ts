@@ -10,6 +10,12 @@ export interface GmailConfig {
   aliasesEnabled?: boolean;
   /** Carry Gmail user labels as `$label:` keywords as well as mailboxes. On unless explicitly disabled. */
   labelTags?: boolean;
+  /**
+   * Quota units Google gives one user of this Cloud project a minute. 6,000 for
+   * projects created from 1 May 2026; `GMAIL_QUOTA_PER_MINUTE` says otherwise
+   * for a project that kept an earlier or a raised limit.
+   */
+  quotaPerMinute?: number;
   /** Delayed send queue (FUTURERELEASE). Absent = immediate sends only. */
   schedule?: { maxDelayedSend: number; lateTolerance: number };
   /**
@@ -147,6 +153,12 @@ const pushConfig = (
 };
 
 /** Opt-in: absent credentials leave every existing legacy deployment unchanged. */
+function quotaPerMinute(): number {
+  const units = Number(process.env.GMAIL_QUOTA_PER_MINUTE);
+  if (!Number.isSafeInteger(units) || units < 100)
+    throw new Error("GMAIL_QUOTA_PER_MINUTE must be a whole number of quota units, 100 or more");
+  return units;
+}
 export function loadGmailConfig(publicUrl: string): GmailConfig | null {
   const file = process.env.GMAIL_OAUTH_CLIENT_FILE;
   if (!file) return null;
@@ -179,6 +191,7 @@ export function loadGmailConfig(publicUrl: string): GmailConfig | null {
     composeEnabled: process.env.GMAIL_COMPOSE_ENABLED === "true",
     aliasesEnabled: process.env.GMAIL_ALIASES_ENABLED === "true",
     labelTags: process.env.GMAIL_LABEL_TAGS !== "false",
+    ...(process.env.GMAIL_QUOTA_PER_MINUTE ? { quotaPerMinute: quotaPerMinute() } : {}),
     ...(process.env.GMAIL_SCHEDULE_ENABLED === "true"
       ? {
           schedule: {
