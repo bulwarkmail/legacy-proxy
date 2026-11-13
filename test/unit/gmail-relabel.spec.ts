@@ -89,3 +89,28 @@ it("reads the labels of a message it has never seen before changing them", async
   expect(set.updated.m_m5.keywords).toEqual({ $seen: true });
   expect(f.calls("messages/m5").map((c) => c[2].format)).toEqual(["minimal"]);
 });
+
+it("reads the labels from Gmail before replacing a message's mailboxes whole, cached or not", async () => {
+  const f = await fakeGmail();
+  await f.methods["Email/get"]!({ accountId: f.mail.accountId, ids: ["m_m5", "m_m4"], properties: ["subject"] });
+  // Starred in another client since the last sync: the cached copy has not heard.
+  f.messages[0]!.labelIds = ["INBOX", "UNREAD", "STARRED"];
+  f.get.mockClear();
+  // Archive: every mailbox but All mail is to go.
+  const set = (await f.methods["Email/set"]!({
+    accountId: f.mail.accountId,
+    update: { m_m5: { mailboxIds: { all: true } } },
+  })) as any;
+  expect(f.calls("messages/m5").map((c) => c[2].format)).toEqual(["minimal"]);
+  expect(set.updated.m_m5.mailboxIds).toEqual({ all: true });
+  // The star put on elsewhere survives, and the row shows it without a read.
+  expect(f.messages[0]!.labelIds.sort()).toEqual(["STARRED", "UNREAD"]);
+  f.get.mockClear();
+  const row = ((await f.methods["Email/get"]!({
+    accountId: f.mail.accountId,
+    ids: ["m_m5"],
+    properties: ["keywords"],
+  })) as any).list[0];
+  expect(row.keywords).toEqual({ $flagged: true });
+  expect(f.calls("messages/")).toEqual([]);
+});

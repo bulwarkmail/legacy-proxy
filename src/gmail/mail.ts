@@ -1423,15 +1423,26 @@ export class GmailMail {
           if (!/^m_[A-Za-z0-9_-]{1,128}$/.test(id))
             throw new JmapError("notFound");
           // The labels the message has now, to tell what the patch changes.
-          // The cached copy follows Gmail's history label by label (see
-          // `classify`), so it is as current as the last sync, which the
-          // state read above has just run; only a message never read is
-          // asked of Gmail (20 units and a round trip, for every mail
-          // marked read).
+          // A patch that names single keywords or mailboxes ("keywords/$seen",
+          // how a client marks mail read or starred) says what each label
+          // should become, so the cached copy will do: it follows Gmail's
+          // history label by label (see `classify`), and being a sync behind
+          // can at worst skip a change Gmail already has. That spares 20
+          // units and a round trip for every mail marked read.
+          // A patch that replaces `mailboxIds` or `keywords` whole - how a
+          // client moves, archives or bins mail - is different: every label
+          // it does not name is to go, so a label put on the message since
+          // the last sync (up to thirty seconds ago without push) would be
+          // left behind. Those read the labels from Gmail, as before.
           const native = this.store.upstreamId(this.email, upstreamId(id, "m_"));
-          const held =
-            this.store.cached<GmailMessage>(this.email, messageKey("metadata", native)) ??
-            this.store.cached<GmailMessage>(this.email, messageKey("full", native));
+          const whole =
+            !!patch &&
+            typeof patch === "object" &&
+            ("mailboxIds" in patch || "keywords" in patch);
+          const held = whole
+            ? null
+            : (this.store.cached<GmailMessage>(this.email, messageKey("metadata", native)) ??
+              this.store.cached<GmailMessage>(this.email, messageKey("full", native)));
           const message: GmailMessage = held
             ? { id: held.id, threadId: held.threadId, labelIds: held.labelIds, internalDate: held.internalDate }
             : await this.api.get<GmailMessage>(
