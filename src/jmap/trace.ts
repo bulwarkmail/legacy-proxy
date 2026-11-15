@@ -78,6 +78,32 @@ const SHOWN_KEYS = new Set([
 const hidden = (value: unknown): string =>
   `<${Array.isArray(value) ? "array" : value === null ? "null" : typeof value} ${JSON.stringify(value)?.length ?? 0}>`;
 
+/**
+ * Keys whose value is a keyword. The system keywords say what kind of query
+ * this is; any other keyword is a name the user chose (a Gmail label travels
+ * as `$label:<name>`), so it is logged like text.
+ */
+const KEYWORD_KEYS = new Set([
+  "hasKeyword",
+  "notKeyword",
+  "allInThreadHaveKeyword",
+  "someInThreadHaveKeyword",
+  "noneInThreadHaveKeyword",
+  "keyword",
+]);
+const SYSTEM_KEYWORDS = new Set([
+  "$seen",
+  "$flagged",
+  "$answered",
+  "$draft",
+  "$forwarded",
+  "$junk",
+  "$notjunk",
+  "$phishing",
+  "$important",
+  "$mdnsent",
+]);
+
 function redact(value: unknown, depth = 0): unknown {
   if (depth > 6) return "…";
   if (Array.isArray(value))
@@ -90,7 +116,9 @@ function redact(value: unknown, depth = 0): unknown {
         key,
         key === "conditions"
           ? redact(v, depth + 1)
-          : !SHOWN_KEYS.has(key)
+          : !SHOWN_KEYS.has(key) ||
+              (KEYWORD_KEYS.has(key) &&
+                !(typeof v === "string" && SYSTEM_KEYWORDS.has(v.toLowerCase())))
             ? hidden(v)
             : typeof v === "object" && v !== null
               ? // A shown key holds ids or flags, never an object to walk into.

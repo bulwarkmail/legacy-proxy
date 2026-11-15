@@ -62,6 +62,25 @@ it("shows only the filter keys known to be safe, whatever the method", () => {
   expect(JSON.parse(logged).filter).toMatchObject({ operator: "OR", uid: "<string 26>" });
 });
 
+it("shows system keywords and hides the ones a user named", () => {
+  const logged = describeArgs({
+    filter: {
+      operator: "AND",
+      conditions: [
+        { hasKeyword: "$label:divorce_lawyer" },
+        { notKeyword: "$Flagged" },
+        { someInThreadHaveKeyword: "projekt-x" },
+      ],
+    },
+    sort: [{ property: "hasKeyword", keyword: "$label:therapy", isAscending: false }],
+  });
+  const text = JSON.stringify(logged);
+  for (const secret of ["divorce", "projekt", "therapy"]) expect(text).not.toContain(secret);
+  expect(logged.filter).toMatchObject({
+    conditions: [{ hasKeyword: "<string 23>" }, { notKeyword: "$Flagged" }, {}],
+  });
+});
+
 it("books upstream work to the call it was done for", async () => {
   const seen: Record<number, number[]> = {};
   await dispatch(
