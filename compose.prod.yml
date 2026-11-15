@@ -1,6 +1,6 @@
 services:
   legacy-proxy:
-    image: ghcr.io/bulwarkmail/legacy-proxy:latest
+    image: ghcr.io/bulwarkmail/legacy-proxy:1.0
     pull_policy: always
     restart: unless-stopped
     ports:
