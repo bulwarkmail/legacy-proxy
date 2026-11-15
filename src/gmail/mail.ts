@@ -196,6 +196,8 @@ export class GmailMail {
   private indexing?: Promise<void>;
   private indexDeleted?: Set<string>;
   private indexRetryAt = 0;
+  /** Times history could not be replayed and the cache started over. */
+  private historyResets = 0;
   private flights = new Map<string, Promise<unknown>>();
   /** Labels {@link labelDetail} was asked for in the current account state. */
   private labelsAsked?: { state: string; ids: Set<string> };
@@ -420,8 +422,10 @@ export class GmailMail {
       } catch (e) {
         if (!(e instanceof JmapError) || e.type !== "cannotCalculateChanges")
           throw e;
-        if (this.store.revision(this.email) === revision)
+        if (this.store.revision(this.email) === revision) {
+          this.historyResets++;
           this.store.checkpoint(this.email, profile.historyId, [], [], true);
+        }
       }
     })().finally(() => {
       this.syncFlight = undefined;
@@ -494,6 +498,7 @@ export class GmailMail {
     // The cursor must exist before the listing starts, so that everything
     // that happens from here on reaches the index through history.
     await this.state();
+    const resets = this.historyResets;
     this.indexDeleted = new Set();
     this.store.threadIndexBegin(this.email);
     let token = "";
@@ -519,6 +524,11 @@ export class GmailMail {
       if (token) tokens.add(token);
       if (tokens.size > 10_000)
         throw new JmapError("serverUnavailable", "Mailbox too large to index");
+      // History that could not be replayed while this listing ran left a
+      // hole in what it has already listed: arrivals at the newest end and
+      // deletions on pages behind it went unheard. Start again later.
+      if (this.historyResets !== resets)
+        throw new JmapError("serverUnavailable", "Gmail history was reset during the thread index listing");
     } while (token);
     this.store.threadIndexComplete(this.email);
     log.info(

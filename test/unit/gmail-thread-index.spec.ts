@@ -4,6 +4,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 import { email, fakeGmail } from "./gmail-fake.js";
+import { JmapError } from "../../src/jmap/errors.js";
 
 it("lists the account once and then answers conversations without asking Gmail", async () => {
   const f = await fakeGmail({ index: true, pageSize: 2 });
@@ -126,4 +127,31 @@ it("orders a conversation by date once its rows are cached, wherever history add
   f.get.mockClear();
   expect((await f.threads("t_t1")).list[0]!.emailIds).toEqual(["m_m0", "m_m1", "m_m2", "m_m3"]);
   expect(f.calls("threads/")).toEqual([]);
+});
+
+it("does not finish a listing during which history could not be replayed", async () => {
+  const f = await fakeGmail({ index: true, pageSize: 2 });
+  let reset = false;
+  f.onPage(async (page) => {
+    if (page !== 1 || reset) return;
+    reset = true;
+    // A reply arrives at the newest end, already listed, and Gmail's history
+    // no longer reaches back to the cursor: the arrival is never replayed.
+    f.messages.unshift({ id: "m6", threadId: "t1", labelIds: ["INBOX"] });
+    const history = f.get.getMockImplementation()!;
+    f.get.mockImplementation(async (resource: string, ...rest: any[]) => {
+      if (resource === "history") throw new JmapError("notFound");
+      return (history as any)(resource, ...rest);
+    });
+    f.record({ messagesAdded: [{ message: { id: "m6", threadId: "t1", labelIds: ["INBOX"] } }] });
+    await f.mail.state();
+    f.get.mockImplementation(history);
+  });
+  await f.threads("t_t5");
+  for (let i = 0; i < 100 && !reset; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(reset).toBe(true);
+  // No index that is missing m6 answers for t1: Gmail does, until a fresh listing.
+  expect(f.store.threadIndexBuiltAt(email)).toBeNull();
+  expect((await f.threads("t_t1")).list[0]!.emailIds).toEqual(["m_m1", "m_m2", "m_m3", "m_m6"]);
 });
