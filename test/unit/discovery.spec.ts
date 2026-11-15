@@ -261,12 +261,16 @@ describe("the autoconfig fetch", () => {
     await expect(fetchPinned(`https://${PUBLIC}/x`, opts)).rejects.toThrow(/not a plain host name/);
   });
 
-  it("follows redirects only to https on the same host and port", () => {
+  it("follows redirects only to https host names, the hoster's own host included", () => {
     const from = new URL("https://example.org/.well-known/autoconfig/mail/config-v1.1.xml");
     expect(redirectAllowed(from, new URL("https://example.org/autoconfig.xml"))).toBe(true);
+    // What a shared hoster answers on its customers' domains.
+    expect(redirectAllowed(from, new URL("https://mail.hoster.net/.well-known/autoconfig/mail/config-v1.1.xml"))).toBe(true);
     expect(redirectAllowed(from, new URL("http://example.org/autoconfig.xml"))).toBe(false);
-    expect(redirectAllowed(from, new URL("https://www.example.org/autoconfig.xml"))).toBe(false);
-    expect(redirectAllowed(from, new URL("https://example.org:8443/autoconfig.xml"))).toBe(false);
+    expect(redirectAllowed(from, new URL("http://mail.hoster.net/autoconfig.xml"))).toBe(false);
+    expect(redirectAllowed(from, new URL("https://user:pass@mail.hoster.net/autoconfig.xml"))).toBe(false);
+    expect(redirectAllowed(from, new URL(`https://${PUBLIC}/autoconfig.xml`))).toBe(false);
+    expect(redirectAllowed(from, new URL("https://[2001:db8::1]/autoconfig.xml"))).toBe(false);
   });
 });
 

@@ -520,7 +520,11 @@ The proxy is public, so what a domain publishes is not trusted:
   `imap.hoster.net`). It does not limit where the autoconfig file is fetched
   from. Kept providers that no longer match are not used.
 - The autoconfig fetch has a 5 second timeout and reads at most 64 KB. It
-  follows redirects only to https on the same host and port. DNS lookups time
+  follows at most three redirects, only to https and to a host name, which may
+  be another host (shared hosters send the domain's `/.well-known` URL to their
+  own autoconfig host). Each hop is checked like the first: public addresses
+  only, a connection to the checked address, and a certificate valid for that
+  hop's host. Plain http is never fetched. DNS lookups time
   out after 3 seconds, and one domain's whole discovery after 10 seconds.
 - Answers are cached in memory per domain: found servers for an hour, nothing
   found for 5 minutes, at most 1,000 domains. Logins for one domain at the same

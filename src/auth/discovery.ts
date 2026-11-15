@@ -9,8 +9,8 @@
 //   name that resolves to public addresses only (isPrivateAddress), and the
 //   IMAP and SMTP hosts must match DISCOVERY_ALLOWED_HOSTS when it is set.
 // - The autoconfig fetch connects to the address that passed the check, has
-//   a timeout and a size cap, and follows redirects only to https on the same
-//   host. The IMAP and SMTP connections of a discovered provider resolve and
+//   a timeout and a size cap, and follows at most three redirects, only to
+//   https, each hop checked like the first. The IMAP and SMTP connections of a discovered provider resolve and
 //   check their host again at every connect and go to that checked address
 //   (imap/client.ts, smtp/submit.ts), with the host name kept for TLS.
 // - Answers, found or not, are cached per domain for a while, and lookups
@@ -239,7 +239,8 @@ export async function srvOffer(domain: string, resolveSrv: (name: string) => Pro
  * GET an https URL and return the body of a 200 answer, at most `maxBytes`.
  * The host must resolve to public addresses only, and the connection goes to
  * the address that was checked; the certificate is verified against the host
- * name. Redirects are followed (at most 3) only to https on the same host.
+ * name. Redirects are followed (at most 3) only to https (see
+ * {@link redirectAllowed}), each hop resolved, checked and verified again.
  */
 export async function fetchPinned(
   url: string,
@@ -293,15 +294,23 @@ export async function fetchPinned(
     const next = new URL(answer.location, u);
     const left = opts.redirectsLeft ?? 3;
     if (left <= 0) throw new DiscoveryRefusal(`${host}: too many redirects`);
-    if (!redirectAllowed(u, next)) throw new DiscoveryRefusal(`${host}: redirect to another host or to http`);
+    if (!redirectAllowed(u, next)) throw new DiscoveryRefusal(`${host}: redirect to http or to an address`);
     return fetchPinned(next.href, { ...opts, redirectsLeft: left - 1 });
   }
   throw new DiscoveryRefusal(`${host}: answered ${answer.status}`);
 }
 
-/** A redirect is followed only to https on the same host and port. */
-export function redirectAllowed(from: URL, to: URL): boolean {
-  return to.protocol === "https:" && to.hostname.toLowerCase() === from.hostname.toLowerCase() && to.port === from.port && !to.username && !to.password;
+/**
+ * A redirect is followed only to https, without credentials, to a plain host
+ * name. It may go to another host: shared hosters answer the domain's
+ * /.well-known URL with a redirect to their own autoconfig host. The redirect
+ * comes from a server whose certificate is valid for the domain, so it is as
+ * trustworthy as a file that server would have served itself, and the next
+ * hop is checked like the first (public addresses, pinned connection,
+ * certificate valid for its own name).
+ */
+export function redirectAllowed(_from: URL, to: URL): boolean {
+  return to.protocol === "https:" && !to.username && !to.password && plainHostName(to.hostname) !== null;
 }
 
 export class ProviderDiscovery {
