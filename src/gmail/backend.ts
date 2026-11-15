@@ -71,6 +71,7 @@ export function registerGmailBackend<L extends FastifyBaseLogger>(
       google.schedule,
       !!google.push,
       google.labelTags ?? true,
+      google.threadIndex ?? true,
     ),
   logins?: LoginLimiter,
 ): void {

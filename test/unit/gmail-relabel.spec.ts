@@ -46,6 +46,8 @@ it("tells a relabel from a change that has to be read again", () => {
   ]);
   // Only conversations that gained or lost a message.
   expect(change.threads.sort()).toEqual(["tc", "td"]);
+  // What an index of who is in which conversation replays, in order.
+  expect(change.membership).toEqual([{ add: "c", thread: "tc" }, { remove: "d" }]);
 });
 
 it("marks cached mail read without reading it first, a few at a time, and keeps the rows", async () => {
