@@ -1,8 +1,9 @@
 # legacy-proxy
 
-> Pre-1.0. The wire shapes, storage formats, and config keys can change without
-> notice. There is no third-party security audit. Run it for development,
-> testing, and self-hosted experiments.
+> Stable since 1.0.0. Changes to settings or stored data come with upgrade
+> notes in the [release notes](https://github.com/bulwarkmail/legacy-proxy/releases);
+> read them before you pull a new image. There is no third-party security
+> audit.
 
 ## About
 
@@ -203,6 +204,15 @@ curl -fsSLo compose.prod.yml https://raw.githubusercontent.com/bulwarkmail/legac
 $EDITOR providers.json   # point the `generic` entry at your IMAP/SMTP/Sieve/CardDAV hosts
 
 docker compose -f compose.prod.yml up -d
+```
+
+The compose file pulls `ghcr.io/bulwarkmail/legacy-proxy:1.0`, which follows
+the 1.0.x releases. Each release is also tagged with its full version
+(`1.0.0`); `latest` and `main` follow the main branch and are not releases.
+Every image carries a signed build provenance attestation:
+
+```bash
+gh attestation verify oci://ghcr.io/bulwarkmail/legacy-proxy:1.0.0 --owner bulwarkmail
 ```
 
 `curl http://localhost:8080/healthz` returns `{"ok":true}` once the server is
@@ -1116,8 +1126,8 @@ the Gmail bridge the Google grant, the cache and uploaded files. Each table has 
 key of its own derived from `VAULT_KEY` (HKDF-SHA256), and every value is bound
 to its row: the table, the account and the row's key go in as associated data, so
 a value copied into another account's row does not open there. Values sealed by
-earlier versions (with `VAULT_KEY` itself and no binding) are rewritten on the
-first start of this version, in one transaction per database: stored IMAP
+0.2.0 and earlier (with `VAULT_KEY` itself and no binding) are rewritten on the
+first start of 1.0.0 or later, in one transaction per database: stored IMAP
 credentials and Google grants are sealed again for their row (users stay signed
 in), Gmail cache entries are dropped and fetched again, and uploads stored in
 clear are sealed for their row. That happens once; afterwards a value in the
@@ -1135,7 +1145,7 @@ sign-in tokens are stored only as keyed hashes: an HMAC-SHA256, under a key deri
 from `VAULT_KEY`, of the secret's SHA-256, with a MAC that ties each row to its
 account, its sign-in date and its expiry. Without the key nobody can write a row
 that a password or token of their choosing opens, or move their own row to
-another account. The first start of this version keys the plain SHA-256 hashes
+another account. The first start of 1.0.0 or later keys the plain SHA-256 hashes
 earlier versions stored, so existing bridge passwords and sign-ins keep working.
 
 Each database keeps a value sealed under the key. The proxy checks both databases
@@ -1155,22 +1165,28 @@ every bridge sign-in signs in again, the Gmail cache is fetched again and
 pending uploads are attached again. To start over without the key,
 move `proxy.db` and `gmail.sqlite3` out of `DATA_DIR`.
 
-### Upgrading and rolling back
+### Upgrading from 0.2.0 and rolling back
 
-- The first start of this version rewrites what earlier versions sealed and keys
+- Some settings 0.2.0 accepted now stop the proxy at start, with one line that
+  says what to change: plain connections to the mail server (see
+  [Encryption to the mail server](#encryption-to-the-mail-server)), and
+  `TRUST_PROXY=1` or `true` (see [Configuration](#configuration)). Push relays
+  on `http` or a private network need `PUSH_ALLOW_PRIVATE_URLS=1` (see
+  [What works](#what-works)).
+- The first start of 1.0.0 rewrites what earlier versions sealed and keys
   the hashes of bridge passwords and sign-in tokens (see above); nothing else to
   do.
 - Gmail bridge sign-ins made before the upgrade are dated at the upgrade, so all
   of them end in the same minute one year after it; those users then sign in
   again.
-- Rolling back to an earlier version: it can't open what this version sealed, so
+- Rolling back to 0.2.0: it can't open what 1.0.0 sealed, so
   IMAP users sign in again, Gmail accounts reconnect, the cache refills, and
-  uploads from the last day are attached again. It doesn't find this version's
+  uploads from the last day are attached again. It doesn't find 1.0.0's
   keyed hashes either: bridge passwords must be issued again and bridge
-  sign-ins sign in again. (The retired refresh tokens this version keeps, up to
-  180 days so that a copy can be recognised, are among them: an earlier version
+  sign-ins sign in again. (The retired refresh tokens 1.0.0 keeps, up to
+  180 days so that a copy can be recognised, are among them: 0.2.0
   doesn't rotate refresh tokens and would accept them again if it could find
-  them.) Coming back to this version after that: what the earlier version sealed
+  them.) Coming back to 1.0.0 after that: what 0.2.0 sealed
   or issued in the meantime doesn't open (sign in, reconnect, issue a bridge
   password, attach again).
 
