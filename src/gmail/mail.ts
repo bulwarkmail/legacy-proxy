@@ -1429,8 +1429,10 @@ export class GmailMail {
           // A patch that names single keywords or mailboxes ("keywords/$seen",
           // how a client marks mail read or starred) says what each label
           // should become, so the cached copy will do: it follows Gmail's
-          // history label by label (see `classify`), and being a sync behind
-          // can at worst skip a change Gmail already has. That spares 20
+          // history label by label (see `classify`). It can be a sync behind,
+          // so every label the patch names is sent, not only the ones the
+          // cached copy says differ: a mail read elsewhere a moment ago and
+          // marked unread here must still become unread. That spares 20
           // units and a round trip for every mail marked read.
           // A patch that replaces `mailboxIds` or `keywords` whole - how a
           // client moves, archives or bins mail - is different: every label
@@ -1453,7 +1455,7 @@ export class GmailMail {
                 5,
                 { format: "minimal" },
               );
-          const delta = emailPatch(message, patch, labels);
+          const delta = emailPatch(message, patch, labels, held !== null);
           const result =
             delta.addLabelIds.length || delta.removeLabelIds.length
               ? await relabel(message, delta)

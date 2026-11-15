@@ -23,6 +23,12 @@ export function emailPatch(
   message: GmailMessage,
   patch: unknown,
   labels: GmailLabel[],
+  /**
+   * `message.labelIds` may be behind Gmail (a cached copy): send every label
+   * change the patch asks for, not only the ones that differ from it. Gmail
+   * ignores adding a label a message has or removing one it lacks.
+   */
+  unsure = false,
 ): { addLabelIds: string[]; removeLabelIds: string[] } {
   const p = object(patch);
   const current = new Set(message.labelIds ?? []);
@@ -118,7 +124,7 @@ export function emailPatch(
   const addLabelIds: string[] = [],
     removeLabelIds: string[] = [];
   for (const [id, value] of desired)
-    if (current.has(id) !== value) (value ? addLabelIds : removeLabelIds).push(id);
+    if (unsure || current.has(id) !== value) (value ? addLabelIds : removeLabelIds).push(id);
   if (addLabelIds.length > 100 || removeLabelIds.length > 100) invalid("Too many label changes");
   return { addLabelIds, removeLabelIds };
 }

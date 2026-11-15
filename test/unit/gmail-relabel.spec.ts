@@ -97,6 +97,19 @@ it("reads no label counters to mark mail read", async () => {
   }
 });
 
+it("marks a cached mail unread that was read elsewhere since the last sync", async () => {
+  const f = await fakeGmail();
+  await f.methods["Email/get"]!({ accountId: f.mail.accountId, ids: ["m_m5", "m_m4"], properties: ["subject"] });
+  // Read in another client; the cached copy still says unread.
+  f.messages[0]!.labelIds = ["INBOX"];
+  const set = (await f.methods["Email/set"]!({
+    accountId: f.mail.accountId,
+    update: { m_m5: { "keywords/$seen": null } },
+  })) as any;
+  expect(set.updated.m_m5.keywords).toEqual({});
+  expect(f.messages[0]!.labelIds).toContain("UNREAD");
+});
+
 it("reads the labels of a message it has never seen before changing them", async () => {
   const f = await fakeGmail();
   const set = (await f.methods["Email/set"]!({
