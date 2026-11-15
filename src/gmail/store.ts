@@ -105,6 +105,7 @@ export class GmailStore {
       );
       CREATE INDEX IF NOT EXISTS gmail_cache_expires ON gmail_cache(expires);
       CREATE INDEX IF NOT EXISTS gmail_cache_touched ON gmail_cache(email, touched);
+      CREATE INDEX IF NOT EXISTS gmail_cache_size ON gmail_cache(email, size);
       CREATE TABLE IF NOT EXISTS gmail_connection (
         email TEXT PRIMARY KEY,
         vault BLOB NOT NULL,
@@ -156,6 +157,7 @@ export class GmailStore {
         );
         CREATE INDEX gmail_cache_expires ON gmail_cache(expires);
         CREATE INDEX gmail_cache_touched ON gmail_cache(email, touched);
+        CREATE INDEX gmail_cache_size ON gmail_cache(email, size);
       `);
     }
   }
@@ -626,6 +628,16 @@ export class GmailStore {
     return row ? JSON.parse(row.value) : null;
   }
   private lastSweep = 0;
+  /** Whether a live entry exists, without paying to decrypt it. */
+  has(email: string, key: string): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM gmail_cache WHERE email=? AND key=? AND expires>?",
+        )
+        .get(email, key, Date.now()) !== undefined
+    );
+  }
   cached<T>(email: string, key: string): T | null {
     const trace = currentTrace();
     if (!trace) return this.read<T>(email, key);
@@ -698,10 +710,14 @@ export class GmailStore {
         ON CONFLICT(email,key) DO UPDATE SET value=excluded.value,expires=excluded.expires,touched=excluded.touched,size=excluded.size`,
         )
         .run(email, key, value, now + ttl, now, size);
+      // Answered from the (email, size) index. Off the table itself the sum
+      // walks every cached message of the account to reach a column stored
+      // behind its body - 0.16 s on a 175 MB cache, on every single write, a
+      // hundred of them for one folder page, with the event loop held.
       let total = (
         this.db
           .prepare(
-            "SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache WHERE email=?",
+            "SELECT COALESCE(SUM(size),0) AS n FROM gmail_cache INDEXED BY gmail_cache_size WHERE email=?",
           )
           .get(email) as {
           n: number;

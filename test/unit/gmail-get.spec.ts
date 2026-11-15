@@ -76,6 +76,66 @@ it("reads list properties with the metadata format and bodies with the full form
   expect(formats).toEqual(["metadata", "full"]);
 });
 
+it("reads a list row that asks for hasAttachment as metadata, telling the flag from the Content-Type", async () => {
+  const store = open();
+  const formats: string[] = [];
+  const whole = {
+    ...message,
+    payload: {
+      mimeType: "multipart/mixed",
+      headers: [
+        { name: "Subject", value: "Hello" },
+        { name: "Content-Type", value: 'multipart/mixed; boundary="x"' },
+      ],
+      parts: [
+        { partId: "0", mimeType: "text/plain", headers: [], body: { data: Buffer.from("body").toString("base64url"), size: 4 } },
+        { partId: "1", mimeType: "application/pdf", filename: "a.pdf", headers: [], body: { attachmentId: "att", size: 9 } },
+      ],
+    },
+  };
+  const plain = {
+    ...message,
+    id: "b",
+    payload: { mimeType: "multipart/alternative", headers: [{ name: "Content-Type", value: "multipart/alternative; boundary=y" }] },
+  };
+  const get = vi.fn(async (resource: string, _cost: number, params: any = {}) => {
+    if (resource === "profile") return profile;
+    if (resource === "labels") return { labels: [] };
+    if (resource === "messages/a") {
+      formats.push(params.format);
+      // Metadata: the headers, without the MIME tree.
+      return params.format === "metadata"
+        ? { ...whole, payload: { mimeType: whole.payload.mimeType, headers: whole.payload.headers } }
+        : whole;
+    }
+    if (resource === "messages/b") return plain;
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as any, store);
+  const methods = mail.methods();
+  const row = async (id: string) =>
+    ((await methods["Email/get"]!({
+      accountId: mail.accountId,
+      ids: [id],
+      properties: ["subject", "preview", "hasAttachment", "blobId", "header:Authentication-Results:all"],
+    })) as any).list[0];
+  // A mail that carries files says so in its own Content-Type; one that only
+  // offers two renderings of its text does not.
+  expect(await row("m_a")).toMatchObject({ subject: "Hello", hasAttachment: true });
+  expect(await row("m_b")).toMatchObject({ hasAttachment: false });
+  expect(formats).toEqual(["metadata"]);
+  // Opening the message reads it whole, once; rows are exact from then on.
+  const opened = (await methods["Email/get"]!({
+    accountId: mail.accountId,
+    ids: ["m_a"],
+    properties: ["bodyValues", "textBody", "attachments"],
+    fetchTextBodyValues: true,
+  })) as any;
+  expect(opened.list[0].attachments).toHaveLength(1);
+  expect(await row("m_a")).toMatchObject({ hasAttachment: true });
+  expect(formats).toEqual(["metadata", "full"]);
+});
+
 it("fetches threads concurrently, at most four at a time, in request order", async () => {
   const store = open();
   let active = 0;
