@@ -15,6 +15,7 @@ import {
 import { ownerOnly, SEALED_AGAIN_MESSAGE } from "../state/store.js";
 import { log } from "../util/log.js";
 import type { EmailPushConfig } from "./emailpush.js";
+import { currentTrace } from "../jmap/trace.js";
 
 export interface GmailProfile {
   emailAddress: string;
@@ -626,6 +627,16 @@ export class GmailStore {
   }
   private lastSweep = 0;
   cached<T>(email: string, key: string): T | null {
+    const trace = currentTrace();
+    if (!trace) return this.read<T>(email, key);
+    const began = performance.now();
+    try {
+      return this.read<T>(email, key);
+    } finally {
+      trace.cacheMs += performance.now() - began;
+    }
+  }
+  private read<T>(email: string, key: string): T | null {
     const now = Date.now();
     const row = this.db
       .prepare(
@@ -661,6 +672,16 @@ export class GmailStore {
    * costs microseconds against the network round trip it saves.
    */
   cache(email: string, key: string, data: unknown, ttl: number): void {
+    const trace = currentTrace();
+    if (!trace) return this.write(email, key, data, ttl);
+    const began = performance.now();
+    try {
+      this.write(email, key, data, ttl);
+    } finally {
+      trace.cacheMs += performance.now() - began;
+    }
+  }
+  private write(email: string, key: string, data: unknown, ttl: number): void {
     const value = seal(this.vaultKey, sealPlace.gmailCache(email, key), Buffer.from(JSON.stringify(data), "utf8"));
     const size = value.length;
     if (size > 16 * 1024 * 1024) return;

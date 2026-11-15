@@ -1,6 +1,7 @@
 import { log } from "../util/log.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
 import { harvestCreatedIds, resolveArgs, type CreatedIds } from "./refs.js";
+import { describeArgs, describeTrace, newTrace, runTraced } from "./trace.js";
 
 export type MethodCall = [string, Record<string, unknown>, string];
 
@@ -219,8 +220,11 @@ async function runCall(
 ): Promise<CallOutcome> {
   const [name, rawArgs, callId] = call;
   const t0 = Date.now();
+  const trace = newTrace();
+  let shape: Record<string, unknown> | undefined;
   try {
     const args = resolveArgs(rawArgs, prior, createdIds) as Record<string, unknown>;
+    shape = describeArgs(args);
     const handler = Object.hasOwn(ctx.methods, name) ? ctx.methods[name] : undefined;
     if (!handler) throw unknownMethod(name);
     const requiredCap = METHOD_CAPABILITY[name];
@@ -231,9 +235,14 @@ async function runCall(
       throw unknownMethod(name);
     }
     checkObjectLimits(name, args, ctx);
-    const result = await handler(args);
+    const result = await runTraced(trace, () => handler(args));
     const ms = Date.now() - t0;
-    if (ms >= 250) log.info({ method: name, callId, ms }, "jmap method slow");
+    // What was asked and where the time went, so a slow call names its cause.
+    if (ms >= 250)
+      log.info(
+        { method: name, callId, ms, args: shape, upstream: describeTrace(trace) },
+        "jmap method slow",
+      );
 
     // RFC 8621 §7.3: EmailSubmission/set's `onSuccessUpdateEmail` /
     // `onSuccessDestroyEmail` produce an implicit Email/set response alongside
@@ -247,7 +256,10 @@ async function runCall(
     return { name, result, sideResponses: null };
   } catch (e) {
     const ms = Date.now() - t0;
-    log.warn({ method: name, callId, ms, err: (e as Error).message }, "jmap method error");
+    log.warn(
+      { method: name, callId, ms, err: (e as Error).message, args: shape, upstream: describeTrace(trace) },
+      "jmap method error",
+    );
     const result =
       e instanceof JmapError
         ? e.toMethodError()
