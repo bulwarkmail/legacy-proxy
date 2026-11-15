@@ -80,6 +80,23 @@ it("marks cached mail read without reading it first, a few at a time, and keeps 
   expect(f.batch.mock.calls.filter((c) => c[0][0].resource.startsWith("messages/")).length).toBe(1);
 });
 
+it("reads no label counters to mark mail read", async () => {
+  const f = await fakeGmail();
+  await f.methods["Email/get"]!({ accountId: f.mail.accountId, ids: ["m_m5", "m_m3"], properties: ["subject"] });
+  for (const id of ["m_m5", "m_m3"]) {
+    f.get.mockClear();
+    f.batch.mockClear();
+    const set = (await f.methods["Email/set"]!({
+      accountId: f.mail.accountId,
+      update: { [id]: { "keywords/$seen": true } },
+    })) as any;
+    expect(Object.keys(set.updated)).toEqual([id]);
+    // One label listing at most, never a read per label.
+    expect(f.calls("labels/")).toEqual([]);
+    expect(f.batch.mock.calls.filter((c) => c[0][0].resource.startsWith("labels/"))).toEqual([]);
+  }
+});
+
 it("reads the labels of a message it has never seen before changing them", async () => {
   const f = await fakeGmail();
   const set = (await f.methods["Email/set"]!({

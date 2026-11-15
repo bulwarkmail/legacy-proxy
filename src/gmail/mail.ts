@@ -1369,10 +1369,13 @@ export class GmailMail {
       else this.store.forget(this.email, [message.id], []);
       return result;
     };
-    // Fresh label metadata validates membership and prevents editing system labels.
+    // Label metadata of the current state validates membership and prevents
+    // editing system labels. Names and types are all a write needs: the
+    // counters `labels()` adds cost one read per label, again after every
+    // write, since each write moves the state.
     let labels =
       kind === "Mailbox" || Object.keys(update).length
-        ? await this.labels()
+        ? await this.labelList()
         : [];
     const tag = await this.tags();
     for (const [id, input] of Object.entries(create)) {
