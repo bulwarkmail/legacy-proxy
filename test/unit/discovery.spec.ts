@@ -1,7 +1,7 @@
 // Discovery of a domain's mail servers with DNS and https replaced by
 // recorders: nothing here reaches the network.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   ProviderDiscovery,
   fetchPinned,
@@ -59,6 +59,22 @@ const AC2 = "https://example.org/.well-known/autoconfig/mail/config-v1.1.xml";
 const srv = (name: string, port: number, priority = 0, weight = 0): SrvRecord => ({ name, port, priority, weight });
 
 describe("ProviderDiscovery", () => {
+  it("names an empty autoconfig answer in its reasons", async () => {
+    const { log } = await import("../../src/util/log.js");
+    const lines: unknown[] = [];
+    const spy = vi.spyOn(log, "info").mockImplementation(((first: unknown) => {
+      lines.push(first);
+    }) as never);
+    try {
+      const { d } = deps({ files: { [AC2]: "" } });
+      expect(await new ProviderDiscovery(on(["autoconfig"]), d).discover("example.org")).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+    const reasons = lines.flatMap((l) => ((l as { reasons?: string[] }).reasons ?? []));
+    expect(reasons).toContain("autoconfig: example.org answered without IMAP or SMTP servers");
+  });
+
   it("does nothing when discovery is off", async () => {
     const { d, calls } = deps({ files: { [AC1]: autoconfigXml("imap.example.org", "smtp.example.org") } });
     expect(await new ProviderDiscovery(on([]), d).discover("example.org")).toBeNull();

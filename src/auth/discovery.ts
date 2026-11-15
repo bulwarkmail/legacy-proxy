@@ -431,7 +431,14 @@ export class ProviderDiscovery {
         `https://autoconfig.${domain}/mail/config-v1.1.xml`,
         `https://${domain}/.well-known/autoconfig/mail/config-v1.1.xml`,
       ]) {
-        yield this.deps.fetchText(url).then((xml) => parseAutoconfig(xml, domain));
+        yield this.deps.fetchText(url).then((xml) => {
+          const offer = parseAutoconfig(xml, domain);
+          // An empty answer or a page that is no autoconfig file: say so, or
+          // the log names no reason for this URL at all.
+          if (!offer.imap.length && !offer.smtp.length && !offer.refused.length)
+            offer.refused.push(`autoconfig: ${new URL(url).host} answered without IMAP or SMTP servers`);
+          return offer;
+        });
       }
     } else {
       yield srvOffer(domain, this.deps.resolveSrv);
