@@ -20,7 +20,7 @@ interface Fake {
   labelIds: string[];
 }
 /** A small Gmail: messages newest first, a history log, and a count of what each call cost in round trips. */
-export async function fakeGmail(opts: { index?: boolean; pageSize?: number; older?: number } = {}) {
+export async function fakeGmail(opts: { index?: boolean; pageSize?: number; older?: number; spare?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-index-"));
   const store = new GmailStore(dir, crypto.randomBytes(32));
   cleanup.push(() => {
@@ -123,7 +123,7 @@ export async function fakeGmail(opts: { index?: boolean; pageSize?: number; olde
   });
   const mail = new GmailMail(
     email,
-    { get, batch, mutate } as any,
+    { get, batch, mutate, ...(opts.spare === undefined ? {} : { spare: () => opts.spare }) } as any,
     store,
     true,
     false,
