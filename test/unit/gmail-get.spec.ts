@@ -76,6 +76,38 @@ it("reads list properties with the metadata format and bodies with the full form
   expect(formats).toEqual(["metadata", "full"]);
 });
 
+it("answers header:Name:all with every instance of the field, and [] when there is none", async () => {
+  const store = open();
+  const headed = {
+    ...message,
+    payload: {
+      ...message.payload,
+      headers: [
+        { name: "Received", value: "from relay by mx.google.com" },
+        { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass" },
+        { name: "Authentication-Results", value: "mx.google.com; dkim=pass; spf=pass" },
+        { name: "Received", value: "from sender by relay" },
+        { name: "Subject", value: "Hello" },
+      ],
+    },
+  };
+  const get = vi.fn(async (resource: string) => {
+    if (resource === "profile") return profile;
+    if (resource === "labels") return { labels: [] };
+    if (resource === "messages/a") return headed;
+    throw Error("Unexpected fixture resource " + resource);
+  });
+  const mail = new GmailMail(email, { get } as any, store);
+  const row = ((await mail.methods()["Email/get"]!({
+    accountId: mail.accountId,
+    ids: ["m_a"],
+    properties: ["subject", "header:Authentication-Results:all", "header:Received:all", "header:List-Id:asText:all"],
+  })) as any).list[0];
+  expect(row["header:Authentication-Results:all"]).toEqual([" mx.google.com; dkim=pass; spf=pass"]);
+  expect(row["header:Received:all"]).toEqual([" from relay by mx.google.com", " from sender by relay"]);
+  expect(row["header:List-Id:asText:all"]).toEqual([]);
+});
+
 it("reads a list row that asks for hasAttachment as metadata, telling the flag from the Content-Type", async () => {
   const store = open();
   const formats: string[] = [];

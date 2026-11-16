@@ -278,31 +278,44 @@ function hashThreadId(messageId: string): string {
   return "T" + out;
 }
 
-// Project a JMAP `header:Name:asForm` (or `header:Name`, defaulting to asRaw)
-// property string against a parsed header set. Returns the JMAP value the
-// client should see in the Email response.
-export function projectHeaderProp(
-  headers: ParsedHeader[],
-  prop: string,
-):
+type HeaderFormValue =
   | string
   | string[]
   | { name: string | null; email: string }[]
   | { name: string | null; addresses: { name: string | null; email: string }[] }[]
-  | null {
-  // header:Name:asForm  → split on ':' but only the first two : are structural
-  const m = /^header:([^:]+)(?::([^:]+))?$/.exec(prop);
-  if (!m) return null;
-  const name = m[1]!;
-  const form = (m[2] ?? "asRaw").toLowerCase();
-  switch (form) {
-    case "asraw": return asRaw(headers, name);
-    case "astext": return asText(headers, name);
-    case "asaddresses": return asAddresses(headers, name);
-    case "asgroupedaddresses": return asGroupedAddresses(headers, name);
-    case "asmessageids": return asMessageIds(headers, name);
-    case "asurls": return asURLs(headers, name);
-    case "asdate": return asDate(headers, name);
-    default: return null;
-  }
+  | null;
+
+const HEADER_FORMS: Record<string, (headers: ParsedHeader[], name: string) => HeaderFormValue> = {
+  asraw: asRaw,
+  astext: asText,
+  asaddresses: asAddresses,
+  asgroupedaddresses: asGroupedAddresses,
+  asmessageids: asMessageIds,
+  asurls: asURLs,
+  asdate: asDate,
+};
+
+// Project a JMAP `header:{name}[:{form}][:all]` property (RFC 8621 §4.1.3)
+// against a parsed header set. The form defaults to asRaw. Without `:all` the
+// value is that of the last instance of the field, or null when it is absent;
+// with `:all` it is an array of one value per instance in message order, empty
+// when the field is absent.
+export function projectHeaderProp(
+  headers: ParsedHeader[],
+  prop: string,
+): HeaderFormValue | HeaderFormValue[] {
+  const parts = prop.split(":");
+  if (parts[0] !== "header" || !parts[1]) return null;
+  const name = parts[1];
+  let rest = parts.slice(2);
+  const all = rest.length > 0 && rest[rest.length - 1]!.toLowerCase() === "all";
+  if (all) rest = rest.slice(0, -1);
+  if (rest.length > 1) return null;
+  const project = HEADER_FORMS[(rest[0] ?? "asRaw").toLowerCase()];
+  if (!project) return null;
+  // Each instance is projected on its own, so values never mix across fields.
+  const one = (h: ParsedHeader) => project([h], h.name);
+  const instances = findHeaders(headers, name);
+  if (all) return instances.map(one);
+  return instances.length ? one(instances[instances.length - 1]!) : null;
 }
