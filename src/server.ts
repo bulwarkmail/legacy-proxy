@@ -21,6 +21,7 @@ import {
   verifySession,
   type SessionToken,
 } from "./auth/session.js";
+import { blobCacheLimits, configureBlobCache } from "./jmap/blobs.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
@@ -48,6 +49,7 @@ openOrExit(() => {
   if (gmailConfig) GmailStore.verifyVaultKey(cfg.dataDir, cfg.vaultKey);
 });
 const store = openOrExit(() => new Store(cfg.dataDir, cfg.vaultKey));
+configureBlobCache(cfg.blobCache);
 // Mail servers of email domains providers.json does not list, when DISCOVERY
 // is set. Those a login proved were kept in the database and serve their
 // accounts again after a restart.
@@ -616,13 +618,10 @@ app.post("/jmap", async (req, reply) => {
   }
 });
 
-// Blob cache bounds. Parts above the per-blob cap stream straight through
-// without being cached -- they are the ones streaming exists for, and holding
-// one in memory to write it to SQLite would undo that. The total cap keeps the
-// database file bounded; the TTL keeps a deleted message's parts from lingering.
+// Parts above this cap stream straight through without being cached -- they
+// are the ones streaming exists for, and holding one in memory to write it to
+// SQLite would undo that. Total cap and TTL are the BLOB_CACHE_* settings.
 const BLOB_CACHE_MAX_BYTES = 2 * 1024 * 1024;
-const BLOB_CACHE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
-const BLOB_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
 
 app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
   "/jmap/download/:accountId/:blobId/:type/:name",
@@ -773,9 +772,9 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
             accountId: account.id,
             ctype: contentType,
             body: Buffer.concat(collected),
-            ttlMs: BLOB_CACHE_TTL_MS,
+            ttlMs: blobCacheLimits().ttlMs,
           });
-          store.pruneBlobCache(BLOB_CACHE_MAX_TOTAL_BYTES);
+          store.pruneBlobCache(blobCacheLimits().maxTotalBytes);
         } catch (cacheErr) {
           // Caching is best-effort; a failure here must not fail the download.
           log.warn({ err: (cacheErr as Error).message }, "blob cache write failed");

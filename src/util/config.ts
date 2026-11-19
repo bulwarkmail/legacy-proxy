@@ -88,6 +88,8 @@ export interface AppConfig {
     maxSizeRequest: number;
     maxCallsInRequest: number;
   };
+  /** Bounds of the SQLite cache of mail parts (downloads, parts a new message is built from). */
+  blobCache: { maxTotalBytes: number; maxPartBytes: number; ttlMs: number };
 }
 
 function reqEnv(name: string): string {
@@ -335,6 +337,11 @@ export function loadConfig(): AppConfig {
       maxUploadStoragePerAccount: Number(process.env.MAX_UPLOAD_STORAGE_PER_ACCOUNT ?? 100_000_000),
       maxSizeRequest: Number(process.env.MAX_SIZE_REQUEST ?? 10_000_000),
       maxCallsInRequest: Number(process.env.MAX_CALLS_IN_REQUEST ?? 64),
+    },
+    blobCache: {
+      maxTotalBytes: Number(process.env.BLOB_CACHE_MAX_BYTES ?? 256 * 1024 * 1024),
+      maxPartBytes: Number(process.env.BLOB_CACHE_MAX_PART_BYTES ?? 50_000_000),
+      ttlMs: Number(process.env.BLOB_CACHE_TTL_HOURS ?? 168) * 60 * 60_000,
     },
   };
 }

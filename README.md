@@ -991,6 +991,9 @@ network and needs no published port at all. Publish it on all interfaces
 | `MAX_OBJECTS_IN_SET`       | `500`                              | advertised and enforced (see below)                  |
 | `MAX_SIZE_UPLOAD`          | `50_000_000` (50 MB)               | upload endpoint body limit, advertised in caps       |
 | `MAX_UPLOAD_STORAGE_PER_ACCOUNT` | `100_000_000` (100 MB)       | pending uploads one account may have stored          |
+| `BLOB_CACHE_MAX_BYTES`     | `268435456` (256 MiB)              | total size of cached mail parts                      |
+| `BLOB_CACHE_MAX_PART_BYTES`| `50_000_000` (50 MB)               | largest part kept when a new message is built from it; `0` keeps none |
+| `BLOB_CACHE_TTL_HOURS`     | `168` (7 days)                     | how long a cached part is kept                       |
 | `MAX_SIZE_REQUEST`         | `10_000_000` (10 MB)               | JMAP POST body limit, advertised in caps             |
 | `MAX_CALLS_IN_REQUEST`     | `64`                               | per-envelope method-call cap                         |
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
