@@ -40,6 +40,25 @@ function paramName(parameters: Record<string, string> | undefined, dispParams: R
   return null;
 }
 
+// RFC 8621 §4.1.4: a part's size is that of its data after transfer
+// decoding - the file the client downloads. BODYSTRUCTURE gives the encoded
+// size, which for base64 is a third larger: a 43 KB PDF showed as 58 KB.
+//
+// IMAP only says the decoded size through BINARY.SIZE, a FETCH per part, so
+// base64 is worked out instead. RFC 2045 lines are 76 characters and CRLF
+// separates them, so the body holds ceil((size + 2) / 78) lines; what is left
+// after their line breaks decodes 4 characters to 3 bytes. The padding isn't
+// known from the size alone, so this can be up to 2 bytes over; lines of
+// another length make it a little further off, still far closer than the
+// encoded size. 7bit/8bit/binary are already their decoded size;
+// quoted-printable can't be told without the data and stays as it is.
+export function decodedSize(size: number, encoding: string | null | undefined): number {
+  if (encoding?.toLowerCase() !== "base64" || size <= 0) return size;
+  const lines = Math.ceil((size + 2) / 78);
+  const chars = Math.max(0, size - 2 * (lines - 1));
+  return Math.floor(chars / 4) * 3;
+}
+
 export function structureToBodyParts(
   root: ImapflowPart,
   blobIdFor: (partId: string | null) => string | null,
@@ -54,7 +73,7 @@ export function structureToBodyParts(
     return {
       partId: isMulti ? null : partId,
       blobId: isMulti ? null : blobIdFor(partId),
-      size: p.size ?? 0,
+      size: decodedSize(p.size ?? 0, p.encoding),
       headers: [],
       name: paramName(p.parameters, p.dispositionParameters ?? null),
       type: (p.type ?? "application/octet-stream").toLowerCase(),
