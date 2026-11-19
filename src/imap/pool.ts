@@ -21,6 +21,10 @@ interface PoolEntry {
    * The account's email state when this session last synced its mailbox view.
    * Dovecot shows a session mail added through another connection only once
    * it syncs, so a connection lent after the state moved gets a NOOP first.
+   *
+   * The state moves on a write through the proxy and on what IDLE reports for
+   * INBOX. Mail the server files into another folder leaves it where it is:
+   * a connection with that folder selected syncs at the idle NOOP only.
    */
   emailState: number;
 }
