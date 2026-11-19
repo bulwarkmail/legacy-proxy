@@ -9,9 +9,16 @@ import type { ImapPool } from "../imap/pool.js";
 import { decodeBlobId, decodeEmailId } from "../mapping/ids.js";
 import type { AccountRow, Store } from "../state/store.js";
 
+/**
+ * With `limit`, a mail part longer than that is not fetched whole: the read
+ * stops one byte past it, so the caller sees a body over the limit and must
+ * not use it. Uploads and cached blobs are already held and come back as
+ * they are.
+ */
 export async function readBlob(
   blobId: string,
   ctx: { account: AccountRow; store: Store; client: ImapFlow; pool?: ImapPool },
+  limit?: number,
 ): Promise<{ body: Buffer; ctype: string } | null> {
   if (blobId.startsWith("U")) return ctx.store.getUpload(blobId, ctx.account.id);
   const cached = ctx.store.getCachedBlob(blobId, ctx.account.id);
@@ -32,7 +39,10 @@ export async function readBlob(
 
   const fetch = (client: ImapFlow) =>
     withMailbox(client, mbox.name, async () => {
-      const dl = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
+      const dl = await client.download(`${email.uid}`, part.partId ?? undefined, {
+        uid: true,
+        ...(limit === undefined ? {} : { maxBytes: limit + 1 }),
+      });
       // imapflow answers `{}` rather than null for an expunged message or part.
       if (!dl?.content) return null;
       const chunks: Buffer[] = [];

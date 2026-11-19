@@ -16,6 +16,7 @@ import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
 import { readBlob } from "../blobs.js";
+import { MAX_SIZE_ATTACHMENTS_PER_EMAIL } from "../capabilities.js";
 import {
   changesFromLog,
   changesOrCannotCalculate,
@@ -1413,14 +1414,19 @@ export async function applyEmailUpdate(
   });
 }
 
-function referencedBlobIds(create: JmapEmailCreate): Set<string> {
-  const out = new Set<string>();
+/**
+ * Each blob buildRfc822 writes for a create, with the number of parts that
+ * carry it. Like buildRfc822, `attachments` is read only without a
+ * `bodyStructure`.
+ */
+function referencedBlobIds(create: JmapEmailCreate): Map<string, number> {
+  const out = new Map<string, number>();
   const walk = (p: BodyStructurePart): void => {
-    if (p.blobId) out.add(p.blobId);
+    if (p.blobId) out.set(p.blobId, (out.get(p.blobId) ?? 0) + 1);
     p.subParts?.forEach(walk);
   };
   if (create.bodyStructure) walk(create.bodyStructure);
-  create.attachments?.forEach(walk);
+  else create.attachments?.forEach(walk);
   return out;
 }
 
@@ -1475,9 +1481,18 @@ async function applyEmailCreate(
   // uploads these can be parts of existing mail: a re-opened draft or a
   // forward references its attachments by their part blobIds.
   const blobs = new Map<string, { body: Buffer; ctype: string }>();
-  for (const blobId of referencedBlobIds(payload as JmapEmailCreate)) {
-    const blob = await readBlob(blobId, ctx);
-    if (blob) blobs.set(blobId, blob);
+  let total = 0;
+  for (const [blobId, parts] of referencedBlobIds(payload as JmapEmailCreate)) {
+    // No more of a mail part is fetched than still fits, plus the one byte
+    // that shows it does not.
+    const blob = await readBlob(blobId, ctx, MAX_SIZE_ATTACHMENTS_PER_EMAIL - total);
+    if (!blob) continue;
+    // A blob named by several parts is written into the message once per part.
+    total += blob.body.length * parts;
+    if (total > MAX_SIZE_ATTACHMENTS_PER_EMAIL) {
+      throw new JmapError("tooLarge", `attachments exceed ${MAX_SIZE_ATTACHMENTS_PER_EMAIL} octets`);
+    }
+    blobs.set(blobId, blob);
   }
 
   let mime: Buffer;

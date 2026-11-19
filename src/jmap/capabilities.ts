@@ -50,6 +50,9 @@ export function coreCapabilityProps(cfg: AppConfig) {
   };
 }
 
+/** Announced as maxSizeAttachmentsPerEmail and enforced by Email/set create. */
+export const MAX_SIZE_ATTACHMENTS_PER_EMAIL = 50_000_000;
+
 export function mailCapabilityProps() {
   return {
     // IMAP messages live in exactly one mailbox; expose the cap as 1 so
@@ -57,7 +60,7 @@ export function mailCapabilityProps() {
     maxMailboxesPerEmail: 1,
     maxMailboxDepth: null,
     maxSizeMailboxName: 490,
-    maxSizeAttachmentsPerEmail: 50_000_000,
+    maxSizeAttachmentsPerEmail: MAX_SIZE_ATTACHMENTS_PER_EMAIL,
     // Without IMAP SORT, only UID-order (≈ receivedAt) is cheap. The other
     // properties would require fetching headers for every match before
     // sorting; refuse them up front so clients don't pick something we'll
