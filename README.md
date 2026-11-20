@@ -114,8 +114,10 @@ Transport:
 
 Backends:
 
-- IMAP via [imapflow](https://github.com/postalsys/imapflow), one connection
-  per account in a request-path pool (separate from the IDLE socket).
+- IMAP via [imapflow](https://github.com/postalsys/imapflow), through a
+  request-path pool of up to three interactive and two bulk connections per
+  account (separate from the IDLE socket). A free connection is logged out
+  after 5 minutes without use.
 - ManageSieve (RFC 5804) for the vacation autoresponder.
 - SMTP Submission via nodemailer.
 - CardDAV (RFC 6352) for AddressBook and ContactCard. Reads are live
