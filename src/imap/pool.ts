@@ -17,6 +17,16 @@ interface PoolEntry {
   // Logged in with credentials that are no longer the account's: closed as
   // soon as its borrower gives it back.
   retired?: boolean;
+  /**
+   * The account's email state when this session last synced its mailbox view.
+   * Dovecot shows a session mail added through another connection only once
+   * it syncs, so a connection lent after the state moved gets a NOOP first.
+   *
+   * The state moves on a write through the proxy and on what IDLE reports for
+   * INBOX. Mail the server files into another folder leaves it where it is:
+   * a connection with that folder selected syncs at the idle NOOP only.
+   */
+  emailState: number;
 }
 
 // Skip the sanity-NOOP if the connection was used within this window.
@@ -122,9 +132,11 @@ export class ImapPool {
       entry.busy = true;
       const idleMs = Date.now() - entry.lastUsed;
       entry.lastUsed = Date.now();
-      if (idleMs < NOOP_FRESHNESS_MS) return entry;
+      const emailState = this.store.getState(account.id, "email");
+      if (idleMs < NOOP_FRESHNESS_MS && entry.emailState === emailState) return entry;
       try {
         await entry.client.noop();
+        entry.emailState = emailState;
         return entry;
       } catch {
         // Dead despite looking usable; drop it and keep looking.
@@ -170,7 +182,8 @@ export class ImapPool {
       }
       if (current.cred_refusals > 0) this.store.noteCredentialSuccess(current.id);
       this.verified.add(account.id);
-      const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
+      const emailState = this.store.getState(account.id, "email");
+      const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true, emailState };
       this.attach(account, key, entry);
       opened = true;
       return entry;
@@ -246,7 +259,7 @@ export class ImapPool {
       client.logout().catch(() => {});
       return;
     }
-    this.attach(account, key, { client, lastUsed: Date.now(), busy: false });
+    this.attach(account, key, { client, lastUsed: Date.now(), busy: false, emailState: this.store.getState(account.id, "email") });
     this.wake(key);
   }
 
