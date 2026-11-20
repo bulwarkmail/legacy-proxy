@@ -1016,6 +1016,9 @@ The limits the Session resource advertises are the ones the proxy enforces:
   of pending uploads stored (they expire after 24 hours). An upload past that is
   answered `413` with the `urn:ietf:params:jmap:error:limit` problem and
   `"limit": "maxUploadStoragePerAccount"`.
+- Attachments: an `Email/set` create whose attachments together exceed
+  `maxSizeAttachmentsPerEmail` is answered `tooLarge`, before anything is
+  written to the mail server.
 - Event streams: at most 10 open per account. The eleventh closes the oldest.
 
 The Gmail backend advertises and enforces its own object limits (100 per get,
