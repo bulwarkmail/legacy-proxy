@@ -51,4 +51,24 @@ describe("Email/set patch resolution", () => {
     expect(r.keywordRemove.has("$seen")).toBe(true);
     expect(r.keywordAdd.has("$flagged")).toBe(true);
   });
+
+  it("decodes the JSON Pointer escapes of a keyword path", () => {
+    // Bulwark nests tags with "/", sent as "~1" (RFC 8620 §5.3, RFC 6901).
+    const r = resolvePatch({
+      "keywords/$label:work~1clients": true,
+      "keywords/$label:old~1tag": null,
+    });
+    expect([...r.keywordAdd]).toEqual(["$label:work/clients"]);
+    expect([...r.keywordRemove]).toEqual(["$label:old/tag"]);
+  });
+
+  it("reads ~01 as a literal ~1, not as a slash", () => {
+    const r = resolvePatch({ "keywords/$label:a~01b": null });
+    expect([...r.keywordRemove]).toEqual(["$label:a~1b"]);
+  });
+
+  it("decodes the JSON Pointer escapes of a mailbox path", () => {
+    const r = resolvePatch({ "mailboxIds/a~1b": true });
+    expect([...r.mailboxAdd]).toEqual(["a/b"]);
+  });
 });
