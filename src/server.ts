@@ -11,7 +11,7 @@ import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
 import { emailDomain, resolveLoginProvider, resolveProvider, type LoginProvider } from "./auth/providers.js";
 import { ProviderDiscovery, storedDiscoveredProvider } from "./auth/discovery.js";
-import { sealCredentials, openCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
+import { sealCredentials, openCredentials, openAccountCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
 import {
   credentialTag,
   generationValid,
@@ -33,6 +33,8 @@ import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedChec
 import { BasicLoginCache } from "./auth/basicCache.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
+import { CalendarWatcher } from "./push/calendar-watch.js";
+import { calendarEventState, calendarsAvailable, isKnownEventState, lastServedEventState } from "./jmap/methods/calendars.js";
 
 import { loadGmailConfig } from "./gmail/config.js";
 import { GmailStore } from "./gmail/store.js";
@@ -107,6 +109,25 @@ store.setCredentialListener((accountId) => {
 void idleManager.sync().catch((err) =>
   log.warn({ err: (err as Error).message }, "idle: initial sync failed"),
 );
+
+// Calendar changes made elsewhere reach open event streams by polling; see
+// push/calendar-watch.ts. CALDAV_POLL_SECONDS sets the interval.
+const calendarWatcher = new CalendarWatcher({
+  intervalMs: cfg.caldavPollSeconds * 1000,
+  accounts: () => hub.accountIds(),
+  accountById: (id) => store.getAccountById(id),
+  stateOf: async (account) => {
+    const provider = resolveProvider(cfg, account.kind);
+    if (!calendarsAvailable(provider)) return null;
+    const creds = await openAccountCredentials(cfg.vaultKey, account);
+    const state = await calendarEventState({ account, provider, creds });
+    return isKnownEventState(state) ? state : null;
+  },
+  served: lastServedEventState,
+  publish: (account, state) =>
+    hub.publish(account, { "@type": "StateChange", changed: { [String(account.id)]: { CalendarEvent: state } } }),
+});
+calendarWatcher.start();
 
 const app = Fastify({
   loggerInstance: log,
@@ -1063,6 +1084,7 @@ const shutdown = async () => {
   log.info("shutting down");
   try {
     await app.close();
+    calendarWatcher.stop();
     await idleManager.closeAll();
     // Best-effort flush so the burst of changes a user just made still reaches
     // any connected SSE / push relay before we exit.
