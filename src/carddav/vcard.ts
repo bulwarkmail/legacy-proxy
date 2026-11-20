@@ -61,7 +61,7 @@ export type AnniversaryDate =
   | { "@type"?: "Timestamp"; utc: string }
   | { "@type"?: "PartialDate"; year?: number; month?: number; day?: number };
 
-interface ParsedLine {
+export interface ParsedLine {
   name: string;
   params: Record<string, string[]>;
   value: string;
@@ -97,13 +97,14 @@ export function parseVCards(text: string): JsContact[] {
   return out;
 }
 
-function unfold(text: string): string {
+export function unfold(text: string): string {
   // RFC 6350 §3.2: a line wrapped at 75 octets is folded by inserting CRLF
   // followed by a single whitespace. To unfold, drop those join points.
   return text.replace(/\r?\n[ \t]/g, "");
 }
 
-function parseLine(line: string): ParsedLine | null {
+// `keepCase` preserves parameter values: iCalendar's TZID=Europe/Berlin is case-sensitive.
+export function parseLine(line: string, keepCase = false): ParsedLine | null {
   // Property syntax:  GROUP.NAME;PARAM=val;PARAM=val:value
   // Values can contain ":" if escaped or inside quoted parameters; we look
   // for the first unquoted ":".
@@ -141,7 +142,7 @@ function parseLine(line: string): ParsedLine | null {
     }
     const k = seg.slice(0, eq).toUpperCase();
     const v = seg.slice(eq + 1);
-    const values = splitUnquoted(v, ",").map((x) => stripQuotes(x).toUpperCase());
+    const values = splitUnquoted(v, ",").map((x) => (keepCase ? stripQuotes(x) : stripQuotes(x).toUpperCase()));
     params[k] = (params[k] ?? []).concat(values);
   }
   return { name, params, value };
@@ -171,7 +172,7 @@ function stripQuotes(s: string): string {
   return s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s;
 }
 
-function unescapeValue(v: string): string {
+export function unescapeValue(v: string): string {
   return v.replace(/\\([nN,;:\\])/g, (_m, c: string) => (c === "n" || c === "N" ? "\n" : c));
 }
 

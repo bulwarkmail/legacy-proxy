@@ -3,6 +3,22 @@ import net from "node:net";
 import path from "node:path";
 import { validateProviders } from "../auth/providers.js";
 
+export interface DavConfig {
+  host: string;
+  port: number;
+  secure?: boolean;
+  allowPlaintext?: boolean;
+  basePath?: string;
+  principalPath?: string;
+  /**
+   * DAV login for the one mail login named in `forUser`, when it differs
+   * from the mail login. Everyone else keeps their IMAP credentials.
+   */
+  username?: string;
+  password?: string;
+  forUser?: string;
+}
+
 export interface ProviderConfig {
   /**
    * Email domains served by this provider. When a client authenticates with a
@@ -20,21 +36,9 @@ export interface ProviderConfig {
   imap: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean };
   smtp: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean };
   sieve: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean } | null;
-  carddav: {
-    host: string;
-    port: number;
-    secure?: boolean;
-    allowPlaintext?: boolean;
-    basePath?: string;
-    principalPath?: string;
-    /**
-     * DAV login for the one mail login named in `forUser`, when it differs
-     * from the mail login. Everyone else keeps their IMAP credentials.
-     */
-    username?: string;
-    password?: string;
-    forUser?: string;
-  } | null;
+  carddav: DavConfig | null;
+  /** Optional; omitted or null means no calendars. */
+  caldav?: DavConfig | null;
   auth: { mech: string[] };
   /**
    * Set on a provider found by discovery (auth/discovery.ts), never in
@@ -78,6 +82,8 @@ export interface AppConfig {
    * key from here; the server fills it from the database at start.
    */
   discovered?: Map<string, ProviderConfig>;
+  /** How often open event streams get a CalDAV change check, in seconds; 0 = never. */
+  caldavPollSeconds: number;
   limits: {
     maxConcurrentRequests: number;
     maxObjectsInGet: number;
@@ -90,6 +96,15 @@ export interface AppConfig {
   };
   /** Bounds of the SQLite cache of mail parts (downloads, parts a new message is built from). */
   blobCache: { maxTotalBytes: number; maxPartBytes: number; ttlMs: number };
+}
+
+// Default two minutes: CalDAV has no push, so clients poll, and every check is
+// one PROPFIND per account. Below 30 s would only add load on the DAV server.
+function pollSeconds(v: string | undefined): number {
+  if (v === undefined || v === "") return 120;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error("CALDAV_POLL_SECONDS must be a number of seconds, 0 to turn it off");
+  return n === 0 ? 0 : Math.max(30, n);
 }
 
 function reqEnv(name: string): string {
@@ -329,6 +344,7 @@ export function loadConfig(): AppConfig {
       allowedHosts: parseDiscoveryAllowedHosts(process.env.DISCOVERY_ALLOWED_HOSTS),
     },
     discovered: new Map(),
+    caldavPollSeconds: pollSeconds(process.env.CALDAV_POLL_SECONDS),
     limits: {
       maxConcurrentRequests: Number(process.env.MAX_CONCURRENT_REQUESTS ?? 10),
       maxObjectsInGet: Number(process.env.MAX_OBJECTS_IN_GET ?? 500),
