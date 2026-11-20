@@ -18,7 +18,7 @@ import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
 import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
-import { THREAD_HEADER_FIELDS } from "../../imap/fetcher.js";
+import { THREAD_HEADER_FIELDS, dateMs } from "../../imap/fetcher.js";
 import { log } from "../../util/log.js";
 import { type ChangesResponse } from "./_shared.js";
 
@@ -121,7 +121,7 @@ async function syncMailboxScan(
         uidvalidity,
         uid: msg.uid,
         threadId: tid,
-        internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
+        internaldate: dateMs(msg.internalDate) ?? 0,
       });
     }
     store.upsertEmailCacheRows(upserts);
@@ -158,7 +158,7 @@ async function syncMailboxScan(
           uidvalidity,
           uid: msg.uid,
           threadId: tid,
-          internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
+          internaldate: dateMs(msg.internalDate) ?? 0,
         });
       }
       store.upsertEmailCacheRows(upserts);
