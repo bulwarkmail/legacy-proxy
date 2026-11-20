@@ -1,4 +1,5 @@
-import type { AccountRow, Store } from "../../state/store.js";
+import { randomBytes } from "node:crypto";
+import type { AccountRow, ExtraIdentity, IdentitySettings, Store } from "../../state/store.js";
 import { encodeCounterState } from "../../state/states.js";
 import { JmapError, accountNotFound } from "../errors.js";
 import { changesFromLog, changesOrCannotCalculate, type ChangesResponse } from "./_shared.js";
@@ -58,12 +59,30 @@ function projectIdentity(account: AccountRow, store: Store): IdentityJson {
   };
 }
 
+function projectExtra(e: ExtraIdentity): IdentityJson {
+  return {
+    id: e.id,
+    name: e.displayName ?? "",
+    email: e.email,
+    replyTo: e.replyTo,
+    bcc: null,
+    textSignature: e.textSignature ?? "",
+    htmlSignature: e.htmlSignature ?? "",
+    mayDelete: true,
+  };
+}
+
+/** The login's identity, then those the user created. */
+function allIdentities(account: AccountRow, store: Store): IdentityJson[] {
+  return [projectIdentity(account, store), ...store.listExtraIdentities(account.id).map(projectExtra)];
+}
+
 export async function identityGet(
   args: { accountId: string; ids: string[] | null },
   ctx: { account: AccountRow; store: Store },
 ): Promise<{ accountId: string; state: string; list: IdentityJson[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
-  const all = [projectIdentity(ctx.account, ctx.store)];
+  const all = allIdentities(ctx.account, ctx.store);
   const list = args.ids ? all.filter((i) => args.ids!.includes(i.id)) : all;
   const notFound = args.ids ? args.ids.filter((x) => !all.some((i) => i.id === x)) : [];
   return {
@@ -85,6 +104,11 @@ export interface IdentitySetArgs {
 // Editable: name, replyTo, textSignature, htmlSignature.
 // Refused: create (we expose exactly one Identity), destroy (mayDelete:false),
 // changes to email (it's the IMAP login).
+// Editable on every identity: name, replyTo, textSignature, htmlSignature.
+// email is immutable (RFC 8621 §6). The login's identity can't be destroyed;
+// further identities can be created with any single address - whether the
+// mail server lets the login send as it is decided when sending
+// (EmailSubmission fails with the server's answer).
 export async function identitySet(
   args: IdentitySetArgs,
   ctx: { account: AccountRow; store: Store },
@@ -95,58 +119,93 @@ export async function identitySet(
     throw new JmapError("stateMismatch", "ifInState does not match current Identity state");
   }
   const id = singletonId(ctx.account.id);
+  const extras = new Map(ctx.store.listExtraIdentities(ctx.account.id).map((e) => [e.id, e]));
+
+  const created: Record<string, { id: string; mayDelete: boolean }> = {};
   const notCreated: Record<string, SetError> = {};
-  for (const tempId of Object.keys(args.create ?? {})) {
-    notCreated[tempId] = {
-      type: "forbidden",
-      description: "Identity is a singleton derived from the account credentials",
-    };
+  for (const [tempId, props] of Object.entries(args.create ?? {})) {
+    try {
+      const email = props.email;
+      if (typeof email !== "string" || !isPlainAddress(email)) {
+        throw new JmapError("invalidProperties", "email must be one plain address", { properties: ["email"] });
+      }
+      const { email: _email, ...rest } = props;
+      const settings = patchSettings({ displayName: null, replyTo: null, textSignature: null, htmlSignature: null }, rest, email);
+      const newId = `${id}-${randomBytes(6).toString("base64url")}`;
+      const extra: ExtraIdentity = { id: newId, email: email.trim(), ...settings };
+      ctx.store.putExtraIdentity(ctx.account.id, extra);
+      extras.set(newId, extra);
+      created[tempId] = { id: newId, mayDelete: true };
+    } catch (e) {
+      notCreated[tempId] = toSetError(e);
+    }
   }
+
   const notUpdated: Record<string, SetError> = {};
   const updated: Record<string, null> = {};
-  let mutated = false;
   for (const [target, patch] of Object.entries(args.update ?? {})) {
-    if (target !== id) {
-      notUpdated[target] = { type: "notFound" };
-      continue;
-    }
     try {
-      applyIdentityPatch(ctx, patch);
+      if (target === id) {
+        const next = patchSettings(ctx.store.getIdentitySettings(ctx.account.id), patch, deriveIdentityEmail(ctx.account), ctx.account.username);
+        ctx.store.putIdentitySettings(ctx.account.id, next);
+      } else {
+        const extra = extras.get(target);
+        if (!extra) {
+          notUpdated[target] = { type: "notFound" };
+          continue;
+        }
+        const next = { ...extra, ...patchSettings(extra, patch, extra.email) };
+        ctx.store.putExtraIdentity(ctx.account.id, next);
+        extras.set(target, next);
+      }
       updated[target] = null;
-      mutated = true;
     } catch (e) {
       notUpdated[target] = toSetError(e);
     }
   }
+
+  const destroyed: string[] = [];
   const notDestroyed: Record<string, SetError> = {};
   for (const target of args.destroy ?? []) {
-    notDestroyed[target] = { type: "forbidden", description: "Identity may not be destroyed" };
+    if (target === id) {
+      notDestroyed[target] = { type: "forbidden", description: "the login's identity may not be destroyed" };
+    } else if (ctx.store.deleteExtraIdentity(ctx.account.id, target)) {
+      extras.delete(target);
+      destroyed.push(target);
+    } else {
+      notDestroyed[target] = { type: "notFound" };
+    }
   }
 
-  if (mutated) {
-    ctx.store.recordChanges(ctx.account.id, "identity", {
-      updated: Object.keys(updated),
-    });
-  }
+  ctx.store.recordChanges(ctx.account.id, "identity", {
+    created: Object.values(created).map((c) => c.id),
+    updated: Object.keys(updated),
+    destroyed,
+  });
 
   return {
     accountId: args.accountId,
     oldState,
     newState: identityState(ctx.store, ctx.account.id),
-    created: null,
+    created: Object.keys(created).length ? created : null,
     notCreated: Object.keys(notCreated).length ? notCreated : null,
     updated: Object.keys(updated).length ? updated : null,
     notUpdated: Object.keys(notUpdated).length ? notUpdated : null,
-    destroyed: null,
+    destroyed: destroyed.length ? destroyed : null,
     notDestroyed: Object.keys(notDestroyed).length ? notDestroyed : null,
   };
 }
 
-function applyIdentityPatch(
-  ctx: { account: AccountRow; store: Store },
+// One address, no display name or list: what can go into MAIL FROM.
+function isPlainAddress(v: string): boolean {
+  return /^[^\s@<>",;:()[\]]+@[^\s@<>",;:()[\]]+$/.test(v.trim());
+}
+
+function patchSettings(
+  cur: IdentitySettings,
   patch: Record<string, unknown>,
-): void {
-  const cur = ctx.store.getIdentitySettings(ctx.account.id);
+  ...ownEmail: string[]
+): IdentitySettings {
   const next = { ...cur };
   for (const [k, v] of Object.entries(patch)) {
     switch (k) {
@@ -188,11 +247,9 @@ function applyIdentityPatch(
         }
         break;
       case "email":
-        // Server-derived; per RFC 8621 §6.1 changes are not allowed.
-        if (v !== ctx.account.username) {
-          throw new JmapError("invalidProperties", "email is server-controlled", {
-            properties: [k],
-          });
+        // Immutable (RFC 8621 §6); sending it back unchanged is fine.
+        if (!ownEmail.includes(String(v))) {
+          throw new JmapError("invalidProperties", "email is immutable", { properties: [k] });
         }
         break;
       case "id":
@@ -204,7 +261,7 @@ function applyIdentityPatch(
         throw new JmapError("invalidProperties", `unknown property: ${k}`, { properties: [k] });
     }
   }
-  ctx.store.putIdentitySettings(ctx.account.id, next);
+  return next;
 }
 
 export async function identityChanges(
