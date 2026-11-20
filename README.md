@@ -58,7 +58,7 @@ JMAP method coverage:
 | Email             | `get`, `query`, `queryChanges`, `changes`, `set`, `copy`, `import`, `parse` |
 | SearchSnippet     | `get` (returns null snippets; IMAP exposes no match offsets)         |
 | Thread            | `get`, `changes` (persistent header index in SQLite, updated incrementally per folder) |
-| Identity          | `get`, `set`, `changes`                                              |
+| Identity          | `get`, `set`, `changes` (the login's identity plus up to 100 added for aliases; the mail server decides at sending whether the login may use an address) |
 | EmailSubmission   | `get`, `query`, `changes`, `set` (with `onSuccessUpdateEmail` / `onSuccessDestroyEmail`) |
 | VacationResponse  | `get`, `set`, `changes` (full body + dates round-tripped through Sieve)  |
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
