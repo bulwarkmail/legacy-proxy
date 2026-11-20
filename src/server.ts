@@ -621,7 +621,7 @@ app.post("/jmap", async (req, reply) => {
 // Parts above this cap stream straight through without being cached -- they
 // are the ones streaming exists for, and holding one in memory to write it to
 // SQLite would undo that. Total cap and TTL are the BLOB_CACHE_* settings.
-const BLOB_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const DOWNLOAD_CACHE_MAX_PART_BYTES = 2 * 1024 * 1024;
 
 app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
   "/jmap/download/:accountId/:blobId/:type/:name",
@@ -747,7 +747,7 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
         transform(chunk: Buffer, _enc, cb) {
           if (collected) {
             collectedBytes += chunk.length;
-            if (collectedBytes > BLOB_CACHE_MAX_BYTES) collected = null;
+            if (collectedBytes > DOWNLOAD_CACHE_MAX_PART_BYTES) collected = null;
             else collected.push(chunk);
           }
           cb(null, chunk);
