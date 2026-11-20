@@ -222,6 +222,22 @@ CREATE TABLE IF NOT EXISTS identity_settings (
   updated_at      INTEGER NOT NULL
 );
 
+-- Further sending identities the user created with Identity/set (RFC 8621
+-- §6.3), next to the one derived from the login. Whether the mail server lets
+-- the login send as the address is its decision at submission time.
+CREATE TABLE IF NOT EXISTS identity_extra (
+  id              TEXT    PRIMARY KEY,
+  account_id      INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  email           TEXT    NOT NULL,
+  display_name    TEXT,
+  reply_to        TEXT, -- JSON array of {name?, email}
+  text_signature  TEXT,
+  html_signature  TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS identity_extra_account_idx ON identity_extra(account_id, created_at);
+
 -- sortOrder is opaque to IMAP and lives only on the JMAP side. We keep it as
 -- a side table so the main mailbox row stays in sync with what LIST returns.
 CREATE TABLE IF NOT EXISTS mailbox_sort_order (
@@ -1098,6 +1114,56 @@ export class Store {
       .run(row.account_id, row.mailbox_id, row.uidvalidity, row.uidnext, row.messages, row.scanned_at);
   }
 
+  listExtraIdentities(accountId: number): ExtraIdentity[] {
+    const rows = this.prep(
+        `SELECT id, email, display_name, reply_to, text_signature, html_signature
+           FROM identity_extra WHERE account_id = ? ORDER BY created_at, id`,
+      )
+      .all(accountId) as {
+        id: string;
+        email: string;
+        display_name: string | null;
+        reply_to: string | null;
+        text_signature: string | null;
+        html_signature: string | null;
+      }[];
+    return rows.map((r) => {
+      let replyTo: IdentitySettings["replyTo"] = null;
+      try {
+        replyTo = r.reply_to ? JSON.parse(r.reply_to) : null;
+      } catch {
+        replyTo = null;
+      }
+      return {
+        id: r.id,
+        email: r.email,
+        displayName: r.display_name,
+        replyTo,
+        textSignature: r.text_signature,
+        htmlSignature: r.html_signature,
+      };
+    });
+  }
+
+  putExtraIdentity(accountId: number, e: ExtraIdentity): void {
+    const now = Date.now();
+    this.prep(
+        `INSERT INTO identity_extra(id, account_id, email, display_name, reply_to, text_signature, html_signature, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           display_name = excluded.display_name,
+           reply_to = excluded.reply_to,
+           text_signature = excluded.text_signature,
+           html_signature = excluded.html_signature,
+           updated_at = excluded.updated_at`,
+      )
+      .run(e.id, accountId, e.email, e.displayName, e.replyTo ? JSON.stringify(e.replyTo) : null, e.textSignature, e.htmlSignature, now, now);
+  }
+
+  deleteExtraIdentity(accountId: number, id: string): boolean {
+    return this.prep(`DELETE FROM identity_extra WHERE account_id = ? AND id = ?`).run(accountId, id).changes > 0;
+  }
+
   putIdentitySettings(accountId: number, s: IdentitySettings): void {
     const replyJson = s.replyTo ? JSON.stringify(s.replyTo) : null;
     this.prep(
@@ -1216,6 +1282,11 @@ function rowToPushSub(r: PushRowRaw): PushSubscriptionRow {
     createdAt: r.created_at,
     lastPushAt: r.last_push_at,
   };
+}
+
+export interface ExtraIdentity extends IdentitySettings {
+  id: string;
+  email: string;
 }
 
 export interface IdentitySettings {
