@@ -45,7 +45,7 @@ export function blobCacheLimits(): BlobCacheLimits {
  */
 export async function readBlob(
   blobId: string,
-  ctx: { account: AccountRow; store: Store; client: ImapFlow; pool?: ImapPool },
+  ctx: { account: AccountRow; store: Store; client?: ImapFlow; pool?: ImapPool },
   limit?: number,
 ): Promise<{ body: Buffer; ctype: string } | null> {
   if (blobId.startsWith("U")) return ctx.store.getUpload(blobId, ctx.account.id);
@@ -89,7 +89,11 @@ export async function readBlob(
     });
   // Like the download route, fetch on the bulk connection so a large
   // forwarded attachment doesn't hold up the account's interactive calls.
-  const blob = await (ctx.pool ? ctx.pool.withConnection(ctx.account, "bulk", fetch) : fetch(ctx.client));
+  const blob = ctx.pool
+    ? await ctx.pool.withConnection(ctx.account, "bulk", fetch)
+    : ctx.client
+      ? await fetch(ctx.client)
+      : null;
   // A read cut off at the limit holds only the start of the part.
   if (blob && (limit === undefined || blob.body.length <= limit)) keepBlob(blobId, blob, ctx);
   return blob;
