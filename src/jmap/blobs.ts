@@ -90,7 +90,8 @@ export async function readBlob(
   // Like the download route, fetch on the bulk connection so a large
   // forwarded attachment doesn't hold up the account's interactive calls.
   const blob = await (ctx.pool ? ctx.pool.withConnection(ctx.account, "bulk", fetch) : fetch(ctx.client));
-  if (blob) keepBlob(blobId, blob, ctx);
+  // A read cut off at the limit holds only the start of the part.
+  if (blob && (limit === undefined || blob.body.length <= limit)) keepBlob(blobId, blob, ctx);
   return blob;
 }
 

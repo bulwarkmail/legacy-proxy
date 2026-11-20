@@ -79,6 +79,29 @@ describe("part blobs of a replaced draft", () => {
   });
 });
 
+it("does not keep a part whose read stopped at the limit", async () => {
+  store.db.prepare(`INSERT INTO account(id, slug, kind, host, username, vault, created_at) VALUES (1, 'imap:u', 'imap', 'imap.example.org', 'u@example.org', x'00', 0)`).run();
+  store.db.prepare(`INSERT INTO mailbox(id, account_id, name, role) VALUES (3, 1, 'Drafts', 'drafts')`).run();
+  const account = store.db.prepare(`SELECT * FROM account WHERE id = 1`).get() as AccountRow;
+  const pdf = Buffer.from("%PDF-1.7 a whole file");
+  // Like imapflow, hands out no more than maxBytes of the part.
+  const client = {
+    getMailboxLock: async () => ({ release: () => {} }),
+    download: async (_range: string, _part: string, opts: { maxBytes?: number }) => ({
+      content: Readable.from([pdf.subarray(0, opts.maxBytes ?? pdf.length)]),
+      meta: { contentType: "application/pdf" },
+    }),
+  } as unknown as ImapFlow;
+  const blobId = encodeBlobId(encodeEmailId({ accountIdx: 1, mailboxIdx: 3, uidvalidity: 7, uid: 9 }), "2");
+
+  // Another attachment of the same message left room for 5 bytes.
+  expect((await readBlob(blobId, { account, store, client }, 5))?.body.length).toBe(6);
+  expect(store.getCachedBlob(blobId, 1)).toBeNull();
+
+  // A download or a smaller message gets the whole part.
+  expect((await readBlob(blobId, { account, store, client }))?.body.equals(pdf)).toBe(true);
+});
+
 it("does not keep a part over BLOB_CACHE_MAX_PART_BYTES", async () => {
   store.db.prepare(`INSERT INTO account(id, slug, kind, host, username, vault, created_at) VALUES (1, 'imap:u', 'imap', 'imap.example.org', 'u@example.org', x'00', 0)`).run();
   store.db.prepare(`INSERT INTO mailbox(id, account_id, name, role) VALUES (3, 1, 'Drafts', 'drafts')`).run();
