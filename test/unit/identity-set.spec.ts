@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Store, type AccountRow } from "../../src/state/store.js";
-import { identityChanges, identityGet, identitySet } from "../../src/jmap/methods/identity.js";
+import { MAX_EXTRA_IDENTITIES, identityChanges, identityGet, identitySet } from "../../src/jmap/methods/identity.js";
 
 let dir: string;
 let store: Store;
@@ -75,4 +75,16 @@ it("still edits the login's identity as before", async () => {
   const res = await identitySet({ accountId: "1", update: { "i-1": { name: "Jane Doe", email: "user@example.org" } } }, ctx);
   expect(res.updated).toEqual({ "i-1": null });
   expect((await list())[0]).toMatchObject({ name: "Jane Doe" });
+});
+
+it("refuses identities past the limit, and forgets them with the account", async () => {
+  const create = Object.fromEntries(
+    Array.from({ length: MAX_EXTRA_IDENTITIES + 1 }, (_, i) => [`k${i}`, { email: `alias${i}@example.org` }]),
+  );
+  const res = await identitySet({ accountId: "1", create }, ctx);
+  expect(Object.keys(res.created!)).toHaveLength(MAX_EXTRA_IDENTITIES);
+  expect(res.notCreated).toMatchObject({ [`k${MAX_EXTRA_IDENTITIES}`]: { type: "overQuota" } });
+
+  store.db.prepare(`DELETE FROM account WHERE id = 1`).run();
+  expect(store.listExtraIdentities(1)).toEqual([]);
 });

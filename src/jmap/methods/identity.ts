@@ -101,9 +101,10 @@ export interface IdentitySetArgs {
   destroy?: string[] | null;
 }
 
-// Editable: name, replyTo, textSignature, htmlSignature.
-// Refused: create (we expose exactly one Identity), destroy (mayDelete:false),
-// changes to email (it's the IMAP login).
+// Identities one account may create next to the login's. They live in the
+// proxy's database, so the number is bounded like uploads are.
+export const MAX_EXTRA_IDENTITIES = 100;
+
 // Editable on every identity: name, replyTo, textSignature, htmlSignature.
 // email is immutable (RFC 8621 §6). The login's identity can't be destroyed;
 // further identities can be created with any single address - whether the
@@ -125,6 +126,9 @@ export async function identitySet(
   const notCreated: Record<string, SetError> = {};
   for (const [tempId, props] of Object.entries(args.create ?? {})) {
     try {
+      if (extras.size >= MAX_EXTRA_IDENTITIES) {
+        throw new JmapError("overQuota", `at most ${MAX_EXTRA_IDENTITIES} identities can be added`);
+      }
       const email = props.email;
       if (typeof email !== "string" || !isPlainAddress(email)) {
         throw new JmapError("invalidProperties", "email must be one plain address", { properties: ["email"] });
