@@ -1,7 +1,7 @@
 import net from "node:net";
-import type { AppConfig, ProviderConfig } from "../util/config.js";
+import type { AppConfig, DavConfig, ProviderConfig } from "../util/config.js";
 
-export type ProviderService = "imap" | "smtp" | "sieve" | "carddav";
+export type ProviderService = "imap" | "smtp" | "sieve" | "carddav" | "caldav";
 
 /** The transport fields every service entry of a provider may carry. */
 export interface TransportEntry {
@@ -34,7 +34,7 @@ export function loginName(entry: { localPartLogin?: boolean }, username: string)
  * for SMTP, plain for ManageSieve and CardDAV (http).
  */
 export function transportOf(service: ProviderService, entry: TransportEntry): { secure: boolean; starttls: boolean } {
-  const starttls = service !== "carddav" && entry.starttls === true;
+  const starttls = service !== "carddav" && service !== "caldav" && entry.starttls === true;
   if (typeof entry.secure === "boolean") return { secure: entry.secure, starttls };
   if (starttls) return { secure: false, starttls };
   switch (service) {
@@ -76,7 +76,7 @@ export function transportProblem(service: ProviderService, entry: TransportEntry
   const { secure, starttls } = transportOf(service, entry);
   if (secure || starttls) return null;
   if (entry.allowPlaintext === true || isLoopbackHost(entry.host)) return null;
-  if (service === "carddav") {
+  if (service === "carddav" || service === "caldav") {
     return `the connection is plain http, so the password would be sent in clear: set "secure": true (https), or "allowPlaintext": true to accept an unencrypted connection`;
   }
   return `the connection is not encrypted, so the password would be sent in clear: set "secure": true (implicit TLS), "starttls": true (STARTTLS required), or "allowPlaintext": true to accept an unencrypted connection`;
@@ -109,6 +109,7 @@ export function validateProviders(providers: Record<string, ProviderConfig>): vo
       ["smtp", p.smtp],
       ["sieve", p.sieve],
       ["carddav", p.carddav],
+      ["caldav", p.caldav],
     ];
     for (const [service, entry] of entries) {
       if (!entry) continue;
@@ -118,10 +119,11 @@ export function validateProviders(providers: Record<string, ProviderConfig>): vo
         problems.push((e as Error).message);
       }
     }
-    const dav = p.carddav;
-    if (dav && (dav.username || dav.password || dav.forUser) && !(dav.username && dav.password && dav.forUser)) {
-      // An unset $DAV_PASSWORD interpolates to "" and lands here too.
-      problems.push(`provider "${name}", carddav: username, password and forUser must be set together`);
+    for (const [service, dav] of [["carddav", p.carddav], ["caldav", p.caldav]] as const) {
+      if (dav && (dav.username || dav.password || dav.forUser) && !(dav.username && dav.password && dav.forUser)) {
+        // An unset $DAV_PASSWORD interpolates to "" and lands here too.
+        problems.push(`provider "${name}", ${service}: username, password and forUser must be set together`);
+      }
     }
   }
   if (problems.length) throw new Error(`providers file: ${problems.join("; ")}`);
@@ -226,18 +228,23 @@ function interpolate(p: ProviderConfig): ProviderConfig {
     imap: p.imap ? { ...p.imap, host: env(p.imap.host) } : p.imap,
     smtp: p.smtp ? { ...p.smtp, host: env(p.smtp.host) } : p.smtp,
     sieve: p.sieve ? { ...p.sieve, host: env(p.sieve.host) } : null,
-    carddav: p.carddav
-      ? {
-          ...p.carddav,
-          host: env(p.carddav.host),
-          basePath: p.carddav.basePath ? env(p.carddav.basePath) : undefined,
-          principalPath: p.carddav.principalPath ? env(p.carddav.principalPath) : undefined,
-          username: p.carddav.username ? env(p.carddav.username) : undefined,
-          password: p.carddav.password ? env(p.carddav.password) : undefined,
-          forUser: p.carddav.forUser ? env(p.carddav.forUser) : undefined,
-        }
-      : null,
+    carddav: dav(p.carddav),
+    caldav: dav(p.caldav),
     auth: p.auth,
+  };
+}
+
+function dav(d: DavConfig | null | undefined): DavConfig | null {
+  if (!d) return null;
+  const opt = (s?: string) => (s ? env(s) : undefined);
+  return {
+    ...d,
+    host: env(d.host),
+    basePath: opt(d.basePath),
+    principalPath: opt(d.principalPath),
+    username: opt(d.username),
+    password: opt(d.password),
+    forUser: opt(d.forUser),
   };
 }
 
