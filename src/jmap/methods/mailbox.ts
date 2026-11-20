@@ -48,6 +48,8 @@ export interface MailboxJson {
 interface ListCacheEntry {
   list: MailboxJson[];
   state: number;
+  /** The account's Email state when the LIST went out (see `opts.matchEmailState`). */
+  emailState: number;
   refreshedAt: number;
 }
 const listCache = new Map<number, ListCacheEntry>();
@@ -60,6 +62,12 @@ export interface LiveMailboxStatus {
   uidValidity: number;
   uidNext: number;
   messages: number;
+  /**
+   * HIGHESTMODSEQ (RFC 7162), when the server has CONDSTORE. It moves with
+   * every change in the folder, flags and keywords included, so a search
+   * result for the folder holds as long as it doesn't.
+   */
+  highestModseq?: number;
 }
 const liveStatus = new Map<number, Map<string, LiveMailboxStatus>>();
 
@@ -67,22 +75,33 @@ export function liveMailboxStatus(accountId: number, path: string): LiveMailboxS
   return liveStatus.get(accountId)?.get(path);
 }
 
+/**
+ * `matchEmailState` also refreshes when the Email state moved since the last
+ * LIST: a flag changed on another device moves only that, and a caller that
+ * relies on the folders' HIGHESTMODSEQ (the account-wide Email/query) must
+ * not judge by statuses from before the change.
+ */
 export async function listMailboxes(
   client: ImapFlow,
   account: AccountRow,
   store: Store,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; matchEmailState?: boolean } = {},
 ): Promise<MailboxJson[]> {
   if (!opts.force) {
     const cached = listCache.get(account.id);
     if (cached) {
       const fresh = Date.now() - cached.refreshedAt < LIST_CACHE_HARD_TTL_MS;
       const stateMatch = cached.state === store.getState(account.id, "mailbox");
-      if (fresh && stateMatch) return cached.list;
+      const emailMatch = !opts.matchEmailState || cached.emailState === store.getState(account.id, "email");
+      if (fresh && stateMatch && emailMatch) return cached.list;
     }
   }
+  // Taken before the LIST, so a change that lands while it runs leaves the
+  // entry looking older than it is, never newer.
+  const mailboxState = store.getState(account.id, "mailbox");
+  const emailState = store.getState(account.id, "email");
   const list = await client.list({
-    statusQuery: { messages: true, unseen: true, uidNext: true, uidValidity: true },
+    statusQuery: { messages: true, unseen: true, uidNext: true, uidValidity: true, highestModseq: true },
   });
   const statusByPath = new Map<string, LiveMailboxStatus>();
   for (const it of list) {
@@ -92,6 +111,7 @@ export async function listMailboxes(
       uidValidity: Number(st.uidValidity),
       uidNext: Number(st.uidNext),
       messages: st.messages,
+      ...(st.highestModseq != null ? { highestModseq: Number(st.highestModseq) } : {}),
     });
   }
   liveStatus.set(account.id, statusByPath);
@@ -185,10 +205,17 @@ export async function listMailboxes(
   }));
   listCache.set(account.id, {
     list: projected,
-    state: store.getState(account.id, "mailbox"),
+    state: mailboxState,
+    emailState,
     refreshedAt: Date.now(),
   });
   return projected;
+}
+
+/** Forget every account's cached folder list and statuses (tests start each from scratch). */
+export function resetMailboxListCache(): void {
+  listCache.clear();
+  liveStatus.clear();
 }
 
 // Force the next listMailboxes() call to re-run LIST (used after Mailbox/set).
