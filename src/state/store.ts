@@ -211,12 +211,13 @@ CREATE TABLE IF NOT EXISTS upload (
 );
 
 -- One row per account: the editable Identity properties (signatures, display
--- name, replyTo). The base identity is always derived from the IMAP
+-- name, replyTo, bcc). The base identity is always derived from the IMAP
 -- credentials; this table carries only the bits the client may edit.
 CREATE TABLE IF NOT EXISTS identity_settings (
   account_id      INTEGER PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE,
   display_name    TEXT,
   reply_to        TEXT, -- JSON array of {name?, email}
+  bcc             TEXT, -- JSON array of {name?, email}
   text_signature  TEXT,
   html_signature  TEXT,
   updated_at      INTEGER NOT NULL
@@ -231,6 +232,7 @@ CREATE TABLE IF NOT EXISTS identity_extra (
   email           TEXT    NOT NULL,
   display_name    TEXT,
   reply_to        TEXT, -- JSON array of {name?, email}
+  bcc             TEXT, -- JSON array of {name?, email}
   text_signature  TEXT,
   html_signature  TEXT,
   created_at      INTEGER NOT NULL,
@@ -304,6 +306,8 @@ const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: "account", column: "cred_check_since", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_check_attempts", definition: "INTEGER NOT NULL DEFAULT 0" },
   { table: "account", column: "cred_check_last", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "identity_settings", column: "bcc", definition: "TEXT" },
+  { table: "identity_extra", column: "bcc", definition: "TEXT" },
 ];
 
 /**
@@ -730,28 +734,22 @@ export class Store {
 
   getIdentitySettings(accountId: number): IdentitySettings {
     const row = this.prep(
-        `SELECT display_name, reply_to, text_signature, html_signature FROM identity_settings WHERE account_id = ?`,
+        `SELECT display_name, reply_to, bcc, text_signature, html_signature FROM identity_settings WHERE account_id = ?`,
       )
       .get(accountId) as
       | {
           display_name: string | null;
           reply_to: string | null;
+          bcc: string | null;
           text_signature: string | null;
           html_signature: string | null;
         }
       | undefined;
-    if (!row) return { displayName: null, replyTo: null, textSignature: null, htmlSignature: null };
-    let replyTo: IdentitySettings["replyTo"] = null;
-    if (row.reply_to) {
-      try {
-        replyTo = JSON.parse(row.reply_to);
-      } catch {
-        replyTo = null;
-      }
-    }
+    if (!row) return { displayName: null, replyTo: null, bcc: null, textSignature: null, htmlSignature: null };
     return {
       displayName: row.display_name,
-      replyTo,
+      replyTo: parseAddressList(row.reply_to),
+      bcc: parseAddressList(row.bcc),
       textSignature: row.text_signature,
       htmlSignature: row.html_signature,
     };
@@ -1116,7 +1114,7 @@ export class Store {
 
   listExtraIdentities(accountId: number): ExtraIdentity[] {
     const rows = this.prep(
-        `SELECT id, email, display_name, reply_to, text_signature, html_signature
+        `SELECT id, email, display_name, reply_to, bcc, text_signature, html_signature
            FROM identity_extra WHERE account_id = ? ORDER BY created_at, id`,
       )
       .all(accountId) as {
@@ -1124,40 +1122,46 @@ export class Store {
         email: string;
         display_name: string | null;
         reply_to: string | null;
+        bcc: string | null;
         text_signature: string | null;
         html_signature: string | null;
       }[];
-    return rows.map((r) => {
-      let replyTo: IdentitySettings["replyTo"] = null;
-      try {
-        replyTo = r.reply_to ? JSON.parse(r.reply_to) : null;
-      } catch {
-        replyTo = null;
-      }
-      return {
-        id: r.id,
-        email: r.email,
-        displayName: r.display_name,
-        replyTo,
-        textSignature: r.text_signature,
-        htmlSignature: r.html_signature,
-      };
-    });
+    return rows.map((r) => ({
+      id: r.id,
+      email: r.email,
+      displayName: r.display_name,
+      replyTo: parseAddressList(r.reply_to),
+      bcc: parseAddressList(r.bcc),
+      textSignature: r.text_signature,
+      htmlSignature: r.html_signature,
+    }));
   }
 
   putExtraIdentity(accountId: number, e: ExtraIdentity): void {
     const now = Date.now();
     this.prep(
-        `INSERT INTO identity_extra(id, account_id, email, display_name, reply_to, text_signature, html_signature, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?)
+        `INSERT INTO identity_extra(id, account_id, email, display_name, reply_to, bcc, text_signature, html_signature, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
            display_name = excluded.display_name,
            reply_to = excluded.reply_to,
+           bcc = excluded.bcc,
            text_signature = excluded.text_signature,
            html_signature = excluded.html_signature,
            updated_at = excluded.updated_at`,
       )
-      .run(e.id, accountId, e.email, e.displayName, e.replyTo ? JSON.stringify(e.replyTo) : null, e.textSignature, e.htmlSignature, now, now);
+      .run(
+        e.id,
+        accountId,
+        e.email,
+        e.displayName,
+        e.replyTo ? JSON.stringify(e.replyTo) : null,
+        e.bcc ? JSON.stringify(e.bcc) : null,
+        e.textSignature,
+        e.htmlSignature,
+        now,
+        now,
+      );
   }
 
   deleteExtraIdentity(accountId: number, id: string): boolean {
@@ -1166,17 +1170,19 @@ export class Store {
 
   putIdentitySettings(accountId: number, s: IdentitySettings): void {
     const replyJson = s.replyTo ? JSON.stringify(s.replyTo) : null;
+    const bccJson = s.bcc ? JSON.stringify(s.bcc) : null;
     this.prep(
-        `INSERT INTO identity_settings(account_id, display_name, reply_to, text_signature, html_signature, updated_at)
-         VALUES(?,?,?,?,?,?)
+        `INSERT INTO identity_settings(account_id, display_name, reply_to, bcc, text_signature, html_signature, updated_at)
+         VALUES(?,?,?,?,?,?,?)
          ON CONFLICT(account_id) DO UPDATE SET
            display_name = excluded.display_name,
            reply_to = excluded.reply_to,
+           bcc = excluded.bcc,
            text_signature = excluded.text_signature,
            html_signature = excluded.html_signature,
            updated_at = excluded.updated_at`,
       )
-      .run(accountId, s.displayName, replyJson, s.textSignature, s.htmlSignature, Date.now());
+      .run(accountId, s.displayName, replyJson, bccJson, s.textSignature, s.htmlSignature, Date.now());
   }
 }
 
@@ -1289,9 +1295,20 @@ export interface ExtraIdentity extends IdentitySettings {
   email: string;
 }
 
+/** A reply_to or bcc column: a JSON array of addresses, null when empty or unreadable. */
+function parseAddressList(json: string | null): IdentitySettings["replyTo"] {
+  if (!json) return null;
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 export interface IdentitySettings {
   displayName: string | null;
   replyTo: { name?: string | null; email: string }[] | null;
+  bcc: { name?: string | null; email: string }[] | null;
   textSignature: string | null;
   htmlSignature: string | null;
 }

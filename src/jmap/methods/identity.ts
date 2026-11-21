@@ -50,7 +50,7 @@ function projectIdentity(account: AccountRow, store: Store): IdentityJson {
     name: s.displayName ?? account.username,
     email: deriveIdentityEmail(account),
     replyTo: s.replyTo,
-    bcc: null,
+    bcc: s.bcc,
     textSignature: s.textSignature ?? "",
     htmlSignature: s.htmlSignature ?? "",
     // The Identity is a projection of the IMAP credentials; deleting it would
@@ -65,7 +65,7 @@ function projectExtra(e: ExtraIdentity): IdentityJson {
     name: e.displayName ?? "",
     email: e.email,
     replyTo: e.replyTo,
-    bcc: null,
+    bcc: e.bcc,
     textSignature: e.textSignature ?? "",
     htmlSignature: e.htmlSignature ?? "",
     mayDelete: true,
@@ -105,7 +105,7 @@ export interface IdentitySetArgs {
 // proxy's database, so the number is bounded like uploads are.
 export const MAX_EXTRA_IDENTITIES = 100;
 
-// Editable on every identity: name, replyTo, textSignature, htmlSignature.
+// Editable on every identity: name, replyTo, bcc, textSignature, htmlSignature.
 // email is immutable (RFC 8621 §6). The login's identity can't be destroyed;
 // further identities can be created with any single address - whether the
 // mail server lets the login send as it is decided when sending
@@ -134,7 +134,7 @@ export async function identitySet(
         throw new JmapError("invalidProperties", "email must be one plain address", { properties: ["email"] });
       }
       const { email: _email, ...rest } = props;
-      const settings = patchSettings({ displayName: null, replyTo: null, textSignature: null, htmlSignature: null }, rest, email);
+      const settings = patchSettings({ displayName: null, replyTo: null, bcc: null, textSignature: null, htmlSignature: null }, rest, email);
       const newId = `${id}-${randomBytes(6).toString("base64url")}`;
       const extra: ExtraIdentity = { id: newId, email: email.trim(), ...settings };
       ctx.store.putExtraIdentity(ctx.account.id, extra);
@@ -232,20 +232,21 @@ function patchSettings(
         next.htmlSignature = (v as string | null) ?? null;
         break;
       case "replyTo":
+      case "bcc":
         if (v == null) {
-          next.replyTo = null;
+          next[k] = null;
         } else if (Array.isArray(v)) {
-          next.replyTo = v.map((entry) => {
+          next[k] = v.map((entry) => {
             const e = entry as { name?: string | null; email?: unknown };
             if (typeof e.email !== "string") {
-              throw new JmapError("invalidProperties", "replyTo[].email is required", {
+              throw new JmapError("invalidProperties", `${k}[].email is required`, {
                 properties: [k],
               });
             }
             return { name: e.name ?? null, email: e.email };
           });
         } else {
-          throw new JmapError("invalidProperties", "replyTo must be an array or null", {
+          throw new JmapError("invalidProperties", `${k} must be an array or null`, {
             properties: [k],
           });
         }
@@ -258,8 +259,7 @@ function patchSettings(
         break;
       case "id":
       case "mayDelete":
-      case "bcc":
-        // ids are immutable; bcc and mayDelete are read-only in our model.
+        // ids are immutable; mayDelete is read-only in our model.
         break;
       default:
         throw new JmapError("invalidProperties", `unknown property: ${k}`, { properties: [k] });
