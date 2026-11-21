@@ -150,7 +150,12 @@ function escape(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-export async function readVacation(client: SieveClient): Promise<VacationProps> {
+/**
+ * The stored response. `forWrite` is for a caller that writes the result
+ * back: a script that is listed but cannot be read then fails the call
+ * instead of reading as blank, unless the server says it is gone.
+ */
+export async function readVacation(client: SieveClient, forWrite = false): Promise<VacationProps> {
   const list = await client.listScripts();
   const ours = list.find((s) => s.name === SCRIPT_NAME);
   if (!ours) {
@@ -159,10 +164,13 @@ export async function readVacation(client: SieveClient): Promise<VacationProps> 
   let body = "";
   try {
     body = await client.getScript(SCRIPT_NAME);
-  } catch {
+  } catch (e) {
+    const gone = /^NO\s+\(NONEXISTENT\)/i.test((e as Error).message);
+    if (forWrite && !gone) throw e;
     // Some servers return NO if the script is empty. Treat as a blank
-    // autoresponder so /get doesn't error out.
-    return { isEnabled: ours.active, subject: null, textBody: null, htmlBody: null, fromDate: null, toDate: null };
+    // autoresponder so /get doesn't error out. A script gone since the
+    // listing is a blank one for a write as well, and not an enabled one.
+    return { isEnabled: ours.active && !forWrite, subject: null, textBody: null, htmlBody: null, fromDate: null, toDate: null };
   }
   return {
     isEnabled: ours.active,
