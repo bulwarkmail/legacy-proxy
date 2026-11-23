@@ -88,3 +88,49 @@ it("refuses identities past the limit, and forgets them with the account", async
   store.db.prepare(`DELETE FROM account WHERE id = 1`).run();
   expect(store.listExtraIdentities(1)).toEqual([]);
 });
+
+it("keeps the Bcc addresses of the login's identity and of a further one", async () => {
+  const res = await identitySet(
+    {
+      accountId: "1",
+      create: { k1: { email: "alias@example.org", bcc: [{ name: "Archive", email: "archive@example.org" }] } },
+      update: { "i-1": { bcc: [{ email: "me@example.org" }] } },
+    },
+    ctx,
+  );
+  const id = res.created!.k1!.id;
+  expect(res.updated).toEqual({ "i-1": null });
+  expect(await list()).toMatchObject([
+    { id: "i-1", bcc: [{ name: null, email: "me@example.org" }] },
+    { id, bcc: [{ name: "Archive", email: "archive@example.org" }] },
+  ]);
+
+  // Another property changes, the Bcc stays; null clears it.
+  await identitySet({ accountId: "1", update: { "i-1": { name: "Jane Doe" }, [id]: { bcc: null } } }, ctx);
+  expect(await list()).toMatchObject([
+    { name: "Jane Doe", bcc: [{ name: null, email: "me@example.org" }] },
+    { id, bcc: null },
+  ]);
+
+  const bad = await identitySet({ accountId: "1", update: { [id]: { bcc: "archive@example.org" }, "i-1": { bcc: [{ name: "x" }] } } }, ctx);
+  expect(bad.notUpdated).toMatchObject({
+    [id]: { type: "invalidProperties", properties: ["bcc"] },
+    "i-1": { type: "invalidProperties", properties: ["bcc"] },
+  });
+});
+
+it("adds the bcc column to a database that predates it", async () => {
+  await identitySet({ accountId: "1", create: { k1: { email: "alias@example.org" } }, update: { "i-1": { name: "Jane Doe" } } }, ctx);
+  store.db.exec(`ALTER TABLE identity_settings DROP COLUMN bcc; ALTER TABLE identity_extra DROP COLUMN bcc;`);
+  store.db.close();
+
+  store = new Store(dir);
+  ctx = { account, store };
+  expect(await list()).toMatchObject([
+    { name: "Jane Doe", bcc: null },
+    { email: "alias@example.org", bcc: null },
+  ]);
+  const res = await identitySet({ accountId: "1", update: { "i-1": { bcc: [{ email: "me@example.org" }] } } }, ctx);
+  expect(res.updated).toEqual({ "i-1": null });
+  expect((await list())[0]).toMatchObject({ bcc: [{ name: null, email: "me@example.org" }] });
+});
