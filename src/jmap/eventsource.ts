@@ -139,6 +139,11 @@ export class EventSourceHub {
     this.dropAccountIfEmpty(accountId, set);
   }
 
+  /** Accounts with at least one open stream. */
+  accountIds(): number[] {
+    return [...this.clients.keys()];
+  }
+
   publish(account: AccountRow, change: StateChange): void {
     const set = this.clients.get(account.id);
     if (!set) return;

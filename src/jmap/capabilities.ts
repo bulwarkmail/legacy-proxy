@@ -7,6 +7,7 @@ export const VACATION_CAPABILITY = "urn:ietf:params:jmap:vacationresponse";
 export const WS_CAPABILITY = "urn:ietf:params:jmap:websocket";
 export const SIEVE_CAPABILITY = "urn:bulwark:params:jmap:sieve";
 export const CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
+export const CALENDARS_CAPABILITY = "urn:ietf:params:jmap:calendars";
 /**
  * Keyword enumeration: `Keyword/get` lists every keyword in the account with
  * its counts, so a client need not walk the whole mailbox to find out which
@@ -33,6 +34,7 @@ export const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
   VACATION_CAPABILITY,
   SIEVE_CAPABILITY,
   CONTACTS_CAPABILITY,
+  CALENDARS_CAPABILITY,
   KEYWORDS_CAPABILITY,
   EMAIL_PUSH_CAPABILITY,
 ]);
@@ -75,6 +77,12 @@ export function submissionCapabilityProps() {
     maxDelayedSend: 0,
     submissionExtensions: {},
   };
+}
+
+export function calendarsCapabilityProps() {
+  // CalDAV resources live in exactly one collection. Calendars are created
+  // with MKCALENDAR (Calendar/set).
+  return { maxCalendarsPerEvent: 1, mayCreateCalendar: true };
 }
 
 export function contactsCapabilityProps() {
