@@ -550,7 +550,7 @@ export async function calendarEventGet(args: { accountId: string; ids?: string[]
   const notFound: string[] = [];
   for (const id of ids) {
     const parts = splitEventId(id);
-    if (!parts || !cals.some((c) => c.href === parts.calHref)) {
+    if (!parts || !cals.some((c) => c.href === parts.calHref) || !isEventHref(client, parts)) {
       notFound.push(id);
       continue;
     }
@@ -601,6 +601,14 @@ export function isMember(parts: { calHref: string; href: string }): boolean {
   if (!href.startsWith(cal)) return false;
   const rest = href.slice(cal.length);
   return rest.length > 0 && !rest.includes("/");
+}
+
+// isMember on a decoded path, plus the CardDAV rules for an href that leaves
+// the server's origin or names `.` / `..` in any encoding: the URL parser
+// resolves those before the request goes out, so `<calendar>/.` would reach
+// the calendar itself and `<calendar>/..` the calendar home.
+function isEventHref(client: CalDavClient, parts: { calHref: string; href: string }): boolean {
+  return isMember(parts) && client.isInBook(parts.calHref, parts.href);
 }
 
 // What answering an invitation changes on a participant. An update that
@@ -696,7 +704,7 @@ export async function calendarEventSet(
     }
     try {
       const calId = encodeId(parts.calHref);
-      if (!calById.has(calId) || !isMember(parts)) throw new JmapError("notFound", "no such event");
+      if (!calById.has(calId) || !isEventHref(client, parts)) throw new JmapError("notFound", "no such event");
       const [res] = await client.fetchEvents(parts.calHref, [parts.href]);
       const current = res && icalToEvent(res.data, id, calId);
       if (!res || !current) throw new JmapError("notFound", "no such event");
@@ -729,7 +737,7 @@ export async function calendarEventSet(
   for (const id of args.destroy ?? []) {
     try {
       const parts = splitEventId(id);
-      if (!parts || !calById.has(encodeId(parts.calHref)) || !isMember(parts)) throw new JmapError("notFound", "no such event");
+      if (!parts || !calById.has(encodeId(parts.calHref)) || !isEventHref(client, parts)) throw new JmapError("notFound", "no such event");
       await client.deleteEvent(parts.href);
       destroyed.push(id);
     } catch (e) {

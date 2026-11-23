@@ -517,6 +517,26 @@ it("destroys only events: not the calendar, and not what isn't there", async () 
   expect(collections.has("/cal/u/work/")).toBe(true);
 });
 
+it("refuses event ids whose href is the calendar or its parent through a dot segment", async () => {
+  const ctx = plainCtx();
+  store.set("/cal/u/work/x", { data: EVENT, etag: `"7"` });
+  const enc = (s: string) => Buffer.from(s, "utf8").toString("base64url");
+  const sent: string[] = [];
+  const inner = globalThis.fetch;
+  vi.stubGlobal("fetch", (url: string, init: RequestInit) => {
+    if (init.method === "DELETE" || init.method === "PUT") sent.push(`${init.method} ${new URL(url).pathname}`);
+    return inner(url, init);
+  });
+  const ids = ["/cal/u/work/.", "/cal/u/work/%2e", "/cal/u/work/..", "/cal/u/work/%2E%2E", "/cal/u/work/%252e%252e"].map((h) => enc(`/cal/u/work/\n${h}`));
+  const res = await calendarEventSet({ accountId: "1", destroy: ids, update: { [ids[0]!]: { title: "x" } } }, ctx);
+  expect(res.destroyed).toBeNull();
+  for (const id of ids) expect(res.notDestroyed![id]).toMatchObject({ type: "notFound" });
+  expect(res.notUpdated![ids[0]!]).toMatchObject({ type: "notFound" });
+  expect(sent).toEqual([]);
+  expect(collections.has("/cal/u/work/")).toBe(true);
+  expect((await calendarEventGet({ accountId: "1", ids: [ids[2]!] }, ctx)).notFound).toEqual([ids[2]]);
+});
+
 it("refuses a move between calendars given as a patch path", async () => {
   const ctx = plainCtx();
   const [id] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
