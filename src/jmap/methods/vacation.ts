@@ -74,30 +74,50 @@ export async function vacationGet(
   };
 }
 
+const PATCHABLE = ["isEnabled", "fromDate", "toDate", "subject", "textBody", "htmlBody"] as const;
+
+/**
+ * `cur` with the patch applied (RFC 8620 §5.3): a property the patch does not
+ * name keeps its value, and null puts it back to its default.
+ */
+function patched(cur: VacationProps, patch: Partial<VacationProps>): VacationProps {
+  const next: VacationProps = { ...cur };
+  for (const key of PATCHABLE) {
+    if (!(key in patch)) continue;
+    if (key === "isEnabled") next.isEnabled = patch.isEnabled ?? false;
+    else next[key] = patch[key] ?? null;
+  }
+  return next;
+}
+
+const BLANK: VacationProps = { isEnabled: false, fromDate: null, toDate: null, subject: null, textBody: null, htmlBody: null };
+
 export async function vacationSet(
-  args: { accountId: string; update?: Record<string, Partial<VacationProps>> },
+  args: { accountId: string; update?: Record<string, Partial<VacationProps>> | null },
   ctx: { account: AccountRow; provider: ProviderConfig; creds: Credentials; store: Store },
 ) {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   if (!ctx.provider.sieve) throw forbidden();
   const oldState = vacationState(ctx.store, ctx.account.id);
-  const next = args.update?.singleton ?? {};
-  const v: VacationProps = {
-    isEnabled: next.isEnabled ?? false,
-    fromDate: next.fromDate ?? null,
-    toDate: next.toDate ?? null,
-    subject: next.subject ?? null,
-    textBody: next.textBody ?? null,
-    htmlBody: next.htmlBody ?? null,
-  };
+  const patch = args.update?.singleton;
+  // There is one VacationResponse, "singleton" (RFC 8621 §8): any other id names nothing.
+  const strangers = Object.keys(args.update ?? {}).filter((id) => id !== "singleton");
+  const notFound = strangers.length ? Object.fromEntries(strangers.map((id) => [id, { type: "notFound" }])) : null;
+  // Nothing asked of the singleton: nothing to write.
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+    return { accountId: args.accountId, oldState, newState: oldState, updated: null, ...(notFound ? { notUpdated: notFound } : {}) };
+  }
   // A value the script can't carry (a date that isn't one, a start after the
-  // end) is a SetError for the singleton, found before any ManageSieve session.
+  // end) is a SetError for the singleton. What the patch brings is checked on
+  // its own first, so a value wrong by itself is found before any ManageSieve
+  // session; the patch applied to the stored response is checked again when
+  // it is written.
   const refused = (e: unknown) =>
     e instanceof JmapError && e.type === "invalidProperties"
-      ? { accountId: args.accountId, oldState, newState: oldState, updated: null, notUpdated: { singleton: e.toMethodError() } }
+      ? { accountId: args.accountId, oldState, newState: oldState, updated: null, notUpdated: { ...notFound, singleton: e.toMethodError() } }
       : null;
   try {
-    generateScript(v);
+    generateScript(patched(BLANK, patch));
   } catch (e) {
     const answer = refused(e);
     if (answer) return answer;
@@ -106,6 +126,11 @@ export async function vacationSet(
   const c = new SieveClient({ ...ctx.provider.sieve, creds: ctx.creds });
   await c.connect();
   try {
+    // The stored response is read from the server, not from the cache: what
+    // is written back must not be older than what the server holds. A read
+    // that fails fails the call, or blanks would be written over the message.
+    const complete = PATCHABLE.every((key) => key in patch);
+    const v = patched(complete ? BLANK : await readVacation(c, true), patch);
     try {
       await writeVacation(c, v);
     } catch (e) {
@@ -122,6 +147,7 @@ export async function vacationSet(
       oldState,
       newState: vacationState(ctx.store, ctx.account.id),
       updated: { singleton: null },
+      ...(notFound ? { notUpdated: notFound } : {}),
     };
   } finally {
     await c.logout();
