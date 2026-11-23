@@ -507,8 +507,10 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
 
   // Every zone a DTSTART or DTEND is written in needs its VTIMEZONE (RFC 5545
   // §3.2.19), an occurrence moved to another zone included.
-  const keptZones = original ? original.match(/BEGIN:VTIMEZONE[\s\S]*?END:VTIMEZONE\r?\n?/g) ?? [] : [];
-  for (const z of keptZones) lines.push(z.replace(/\r?\n$/, ""));
+  // From the parsed tree, line by line: a regex over the raw text takes
+  // quadratic time on a body full of unclosed VTIMEZONEs.
+  const keptZones = original ? parseComponents(original).flatMap((c) => c.children).filter((c) => c.type === "VTIMEZONE") : [];
+  for (const z of keptZones) lines.push(...rawComponent(z));
   const year = Number(String(ev.start ?? "").slice(0, 4)) || new Date().getUTCFullYear();
   const zones = new Set<string>();
   if (tz && !allDay) zones.add(tz);
@@ -517,7 +519,7 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
     if (typeof o.timeZone === "string" && validZone(o.timeZone) && !(o.showWithoutTime ?? allDay)) zones.add(o.timeZone);
   }
   for (const z of zones) {
-    if (isUtc(z) || keptZones.some((k) => new RegExp(`^TZID:${escapeRe(z)}\\s*$`, "m").test(k))) continue;
+    if (isUtc(z) || keptZones.some((k) => prop(k, "TZID")?.value.trim() === z)) continue;
     lines.push(...vtimezone(z, year));
   }
 
@@ -575,7 +577,9 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
     lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts));
   }
   lines.push("END:VCALENDAR");
-  return lines.map(fold).join("\r\n") + "\r\n";
+  // Each entry is one content line. A line break in a value that skipped
+  // escaping would start a property of its own, so none gets through.
+  return lines.map((l) => fold(l.replace(/[\r\n]+/g, " "))).join("\r\n") + "\r\n";
 }
 
 function vevent(
@@ -587,7 +591,8 @@ function vevent(
   originalParticipants?: Map<string, ParsedLine>,
 ): string[] {
   const start = String(e.start ?? "");
-  const out = ["BEGIN:VEVENT", `UID:${e.uid}`, `DTSTAMP:${compactUtc(Date.now())}`];
+  // UID is TEXT (RFC 5545 §3.8.4.7) and read back unescaped, so it is written escaped.
+  const out = ["BEGIN:VEVENT", `UID:${escapeValue(String(e.uid ?? ""))}`, `DTSTAMP:${compactUtc(Date.now())}`];
   if (recurrenceId) out.push(recurrenceId);
   out.push(dateLine("DTSTART", start, tz, allDay));
   out.push(dateLine("DTEND", addSeconds(start, durationSeconds(String(e.duration ?? (allDay ? "P1D" : "PT0S"))), tz, allDay), tz, allDay));
@@ -718,8 +723,21 @@ function compactUtc(ms: number): string {
   return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 }
 
+// Without recursion: an unclosed BEGIN nests everything after it, so a
+// hostile body can be nested as deep as it has lines.
 function rawComponent(c: Component): string[] {
-  return [`BEGIN:${c.type}`, ...c.props.map(rawLine), ...c.children.flatMap(rawComponent), `END:${c.type}`];
+  const out: string[] = [];
+  const todo: (Component | string)[] = [c];
+  while (todo.length) {
+    const next = todo.pop()!;
+    if (typeof next === "string") {
+      out.push(next);
+      continue;
+    }
+    out.push(`BEGIN:${next.type}`, ...next.props.map(rawLine));
+    todo.push(`END:${next.type}`, ...[...next.children].reverse());
+  }
+  return out;
 }
 
 function rawLine(p: ParsedLine): string {
@@ -729,8 +747,4 @@ function rawLine(p: ParsedLine): string {
 
 function quoteParam(v: string): string {
   return /[:;,]/.test(v) ? `"${v.replace(/"/g, "")}"` : v;
-}
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

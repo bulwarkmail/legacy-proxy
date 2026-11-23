@@ -143,6 +143,22 @@ describe("eventToIcal", () => {
       expect(again[k], k).toEqual(ev[k]);
     }
   });
+
+  it("keeps a line break in an invitation's UID inside the UID", () => {
+    const invite = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\\nATTENDEE:mailto:evil@example.org\r\nDTSTART:20261007T120000Z\r\nSUMMARY:Hi\r\nEND:VEVENT\r\nEND:VCALENDAR";
+    const [ev] = icalToEvents(invite);
+    const out = eventToIcal(ev!);
+    expect(out).not.toMatch(/^ATTENDEE/m);
+    expect(icalToEvent(out, "e", "c")!.uid).toBe(ev!.uid);
+  });
+
+  it("copies the stored VTIMEZONEs in linear time, also from a body full of unclosed ones", () => {
+    const ev = icalToEvent(series, "e1", "c1")!;
+    const hostile = series.replace("END:VCALENDAR", "BEGIN:VTIMEZONE\r\n".repeat(40_000) + "END:VCALENDAR");
+    const t = Date.now();
+    eventToIcal(ev, hostile);
+    expect(Date.now() - t).toBeLessThan(2_000);
+  });
 });
 
 describe("RDATE", () => {
