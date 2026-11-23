@@ -8,7 +8,7 @@ import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
-import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
+import { listMailboxes, liveMailboxStatus, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
@@ -164,6 +164,7 @@ async function cachedSearch(
   cacheKey: string,
   imapFilter: ReturnType<typeof compileFilter>,
   wasOpen: boolean,
+  onSearched?: (uids: number[]) => void,
 ): Promise<number[]> {
   const emailState = store.getState(accountId, "email");
   const cached = searchCache.get(cacheKey);
@@ -173,6 +174,7 @@ async function cachedSearch(
   if (wasOpen) await client.noop();
   const searchResult = await client.search(imapFilter, { uid: true });
   const uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+  onSearched?.(uids);
   searchCache.set(cacheKey, {
     uids,
     modseq: openModseq(client),
@@ -181,6 +183,43 @@ async function cachedSearch(
   });
   pruneSearchCache();
   return uids;
+}
+
+// Search results of the account-wide Email/query, per folder, kept for as
+// long as the folder's HIGHESTMODSEQ in the last LIST-STATUS hasn't moved.
+// Unlike searchCache this needs no SELECT to tell a hit, and a change in one
+// folder leaves the others' entries alone: a client that counts a keyword
+// across the account after every change (label counters) then searches only
+// the folders that changed. Servers without CONDSTORE report no modseq and
+// never get an entry.
+interface FolderSearchEntry {
+  uids: number[];
+  modseq: number;
+  at: number;
+}
+const folderSearchCache = new Map<string, FolderSearchEntry>();
+const FOLDER_SEARCH_CACHE_MAX = 2048;
+const FOLDER_SEARCH_CACHE_TTL_MS = 10 * 60_000;
+
+function folderSearchHit(key: string, modseq: number | undefined): number[] | null {
+  if (!modseq) return null;
+  const e = folderSearchCache.get(key);
+  if (!e || e.modseq !== modseq || Date.now() - e.at > FOLDER_SEARCH_CACHE_TTL_MS) return null;
+  return e.uids;
+}
+
+function rememberFolderSearch(key: string, modseq: number | undefined, uids: number[]): void {
+  if (!modseq) return;
+  folderSearchCache.delete(key);
+  folderSearchCache.set(key, { uids, modseq, at: Date.now() });
+  while (folderSearchCache.size > FOLDER_SEARCH_CACHE_MAX) {
+    folderSearchCache.delete(folderSearchCache.keys().next().value!);
+  }
+}
+
+/** Forget every folder search result (tests start each from scratch). */
+export function resetFolderSearchCache(): void {
+  folderSearchCache.clear();
 }
 
 // Drop every cache entry for an account. Called after we mutate emails
@@ -635,7 +674,9 @@ async function emailQueryAccountWideFull(
     }
   }
 
-  const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
+  // Statuses from after the last change, so their HIGHESTMODSEQ can vouch
+  // for the folder search cache.
+  const all = await listMailboxes(ctx.client, ctx.account, ctx.store, { matchEmailState: true });
   type MboxRow = { id: number; name: string; uidvalidity: number };
   const rows = ctx.store
     .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
@@ -665,9 +706,32 @@ async function emailQueryAccountWideFull(
     targets.push({ idx, row });
   }
 
+  // A folder whose HIGHESTMODSEQ hasn't moved since its last search, with
+  // every hit's date in the SQLite cache, is answered without a connection.
+  const fromCache = (idx: number, row: MboxRow): SortableHit[] | null => {
+    // The key carries the UIDVALIDITY the LIST reported, so a recreated
+    // folder never matches an entry of the old one.
+    if (needsFetch) return null;
+    const live = liveMailboxStatus(ctx.account.id, row.name);
+    if (!live) return null;
+    const uids = folderSearchHit(searchCacheKey(ctx.account.id, idx, live.uidValidity, filter), live.highestModseq);
+    if (!uids) return null;
+    const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, live.uidValidity, uids);
+    const found: SortableHit[] = [];
+    for (const uid of uids) {
+      const r = cachedRows.get(uid);
+      if (!r || !(r.internaldate > 0)) return null;
+      found.push({ mailboxIdx: idx, uidvalidity: live.uidValidity, uid, receivedAt: r.internaldate });
+    }
+    return found;
+  };
+
   const scanFolder = async (idx: number, row: MboxRow, client: ImapFlow): Promise<SortableHit[]> => {
     const found: SortableHit[] = [];
     const wasOpen = isOpen(client, row.name);
+    // Taken before the SEARCH: a change that lands meanwhile makes the entry
+    // look older than its result, so it's searched again, never served stale.
+    const liveBefore = liveMailboxStatus(ctx.account.id, row.name);
     await withMailbox(client, row.name, async () => {
       const status =
         client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
@@ -676,7 +740,11 @@ async function emailQueryAccountWideFull(
       );
 
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
-      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen);
+      // Only a SEARCH that just ran vouches for the modseq read before it; a
+      // searchCache hit may be older than that.
+      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, (found) => {
+        if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore.highestModseq, found);
+      });
       if (uids.length === 0) return;
 
       // Cross-folder merge needs receivedAt for every hit. Prefer the
@@ -726,6 +794,8 @@ async function emailQueryAccountWideFull(
   };
 
   const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+    const cached = fromCache(t.idx, t.row);
+    if (cached) return cached;
     try {
       // Unit-test contexts are built without a pool; fall back to the
       // request's own connection, which reproduces the old serial walk.
