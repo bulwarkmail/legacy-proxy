@@ -93,7 +93,7 @@ function vevents(ics: string): Component[] {
 // to at least the highest stored.
 const OVERRIDE_KEYS = [
   "start", "duration", "timeZone", "showWithoutTime", "title", "description", "locations", "status",
-  "freeBusyStatus", "privacy", "participants", "alerts",
+  "freeBusyStatus", "privacy", "participants", "alerts", "virtualLocations", "keywords",
 ] as const;
 
 function veventsToEvent(vevents: Component[], id: string | null, calendarId: string | null): JsEvent | null {
@@ -206,9 +206,59 @@ function eventProps(v: Component): JsEvent {
     freeBusyStatus: prop(v, "TRANSP")?.value.toUpperCase() === "TRANSPARENT" ? "free" : "busy",
     privacy: cls === "PRIVATE" ? "private" : cls === "CONFIDENTIAL" ? "secret" : "public",
     locations: location ? { "1": { "@type": "Location", name: location } } : null,
+    virtualLocations: virtualLocations(v),
+    keywords: keywords(v),
     participants: participants(v),
     alerts: alerts(v),
   };
+}
+
+// RFC 7986 CONFERENCE <-> virtualLocations: a meeting link with its label and features.
+function virtualLocations(v: Component): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {};
+  let n = 0;
+  for (const p of v.props) {
+    if (p.name !== "CONFERENCE" || !p.value.trim()) continue;
+    const features = p.params.FEATURE?.map((f) => f.toLowerCase()).filter(Boolean) ?? [];
+    out[`v${++n}`] = {
+      "@type": "VirtualLocation",
+      name: p.params.LABEL?.[0] ?? null,
+      uri: p.value.trim(),
+      features: features.length ? Object.fromEntries(features.map((f) => [f, true])) : null,
+    };
+  }
+  return n ? out : null;
+}
+
+function conferenceLines(e: JsEvent): string[] {
+  const out: string[] = [];
+  for (const l of Object.values((e.virtualLocations ?? {}) as Record<string, { uri?: unknown; name?: unknown; features?: unknown }>)) {
+    if (typeof l?.uri !== "string" || !l.uri.trim()) continue;
+    const params = [";VALUE=URI"];
+    const features = Object.keys((l.features ?? {}) as Record<string, unknown>).filter((f) => /^[\w-]+$/.test(f));
+    if (features.length) params.push(`;FEATURE=${features.map((f) => f.toUpperCase()).join(",")}`);
+    if (typeof l.name === "string" && l.name) params.push(`;LABEL=${quoteParam(l.name)}`);
+    out.push(`CONFERENCE${params.join("")}:${l.uri.trim()}`);
+  }
+  return out;
+}
+
+// CATEGORIES <-> keywords. One property may list several, split at unescaped commas.
+function keywords(v: Component): Record<string, boolean> | null {
+  const out: Record<string, boolean> = {};
+  for (const p of v.props) {
+    if (p.name !== "CATEGORIES") continue;
+    for (const k of p.value.split(/(?<!\\),/)) {
+      const word = unescapeValue(k).trim();
+      if (word) out[word] = true;
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function categoriesLine(e: JsEvent): string[] {
+  const words = Object.entries((e.keywords ?? {}) as Record<string, unknown>).filter(([k, on]) => on === true && k).map(([k]) => escapeValue(k));
+  return words.length ? [`CATEGORIES:${words.join(",")}`] : [];
 }
 
 // iCalendar CUTYPE / ROLE <-> JSCalendar kind / roles (RFC 8984 §4.4.6,
@@ -491,7 +541,7 @@ function text(c: Component, name: string): string | undefined {
 const MANAGED = new Set([
   "UID", "DTSTAMP", "DTSTART", "DTEND", "DURATION", "SUMMARY", "DESCRIPTION", "LOCATION", "RRULE",
   "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "TRANSP", "CLASS", "CREATED", "LAST-MODIFIED",
-  "SEQUENCE", "ORGANIZER", "ATTENDEE",
+  "SEQUENCE", "ORGANIZER", "ATTENDEE", "CONFERENCE", "CATEGORIES",
 ]);
 
 /**
@@ -600,6 +650,7 @@ function vevent(
   if (e.description) out.push(`DESCRIPTION:${escapeValue(String(e.description))}`);
   const loc = Object.values((e.locations ?? {}) as Record<string, { name?: string }>).find((l) => l?.name)?.name;
   if (loc) out.push(`LOCATION:${escapeValue(loc)}`);
+  out.push(...conferenceLines(e), ...categoriesLine(e));
   if (typeof e.status === "string") out.push(`STATUS:${e.status.toUpperCase()}`);
   out.push(`TRANSP:${e.freeBusyStatus === "free" ? "TRANSPARENT" : "OPAQUE"}`);
   out.push(`CLASS:${e.privacy === "private" ? "PRIVATE" : e.privacy === "secret" ? "CONFIDENTIAL" : "PUBLIC"}`);

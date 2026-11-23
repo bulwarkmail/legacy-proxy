@@ -144,6 +144,35 @@ describe("eventToIcal", () => {
     }
   });
 
+  it("keeps a meeting link and keywords through a create and an edit", () => {
+    const created = eventToIcal({
+      "@type": "Event", uid: "m1", title: "Sync", start: "2026-10-07T10:00:00", timeZone: "Europe/Berlin", duration: "PT30M",
+      virtualLocations: { vl1: { "@type": "VirtualLocation", name: null, description: null, uri: "https://meet.example/abc", features: null } },
+      keywords: { "bulwark-out-of-office": true },
+    });
+    expect(created).toMatch(/^CONFERENCE;VALUE=URI:https:\/\/meet\.example\/abc$/m);
+    const ev = icalToEvent(created, "e", "c")!;
+    expect(ev.virtualLocations).toEqual({ v1: { "@type": "VirtualLocation", name: null, uri: "https://meet.example/abc", features: null } });
+    expect(ev.keywords).toEqual({ "bulwark-out-of-office": true });
+    // An edit of something else writes both back once.
+    const edited = eventToIcal({ ...ev, title: "Sync 2" }, created);
+    expect(edited.match(/^CONFERENCE/gm)).toHaveLength(1);
+    expect(edited.match(/^CATEGORIES/gm)).toHaveLength(1);
+    expect(icalToEvent(edited, "e", "c")).toMatchObject({ virtualLocations: ev.virtualLocations, keywords: ev.keywords });
+  });
+
+  it("reads CONFERENCE labels and features and every CATEGORIES line", () => {
+    const ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:c1\r\nDTSTART:20261007T120000Z\r\n" +
+      "CONFERENCE;VALUE=URI;FEATURE=PHONE,MODERATOR;LABEL=\"Dial-in, moderator\":tel:+49-30-123\r\n" +
+      "CATEGORIES:Work,Kunde\\, A\r\nCATEGORIES:Travel\r\nEND:VEVENT\r\nEND:VCALENDAR";
+    const ev = icalToEvent(ics, "e", "c")!;
+    expect(ev.virtualLocations).toEqual({ v1: { "@type": "VirtualLocation", name: "Dial-in, moderator", uri: "tel:+49-30-123", features: { phone: true, moderator: true } } });
+    expect(ev.keywords).toEqual({ Work: true, "Kunde, A": true, Travel: true });
+    const out = eventToIcal(ev, ics);
+    expect(out.replace(/\r\n[ \t]/g, "")).toContain(`CONFERENCE;VALUE=URI;FEATURE=PHONE,MODERATOR;LABEL="Dial-in, moderator":tel:+49-30-123`);
+    expect(icalToEvent(out, "e", "c")!.keywords).toEqual(ev.keywords);
+  });
+
   it("keeps a line break in an invitation's UID inside the UID", () => {
     const invite = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\\nATTENDEE:mailto:evil@example.org\r\nDTSTART:20261007T120000Z\r\nSUMMARY:Hi\r\nEND:VEVENT\r\nEND:VCALENDAR";
     const [ev] = icalToEvents(invite);
