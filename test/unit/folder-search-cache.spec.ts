@@ -8,7 +8,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ImapFlow } from "imapflow";
 import { Store } from "../../src/state/store.js";
-import { emailQuery, resetFolderSearchCache } from "../../src/jmap/methods/email.js";
+import {
+  emailQuery,
+  FOLDER_SEARCH_CACHE_MAX_UIDS,
+  folderSearchHit,
+  rememberFolderSearch,
+  resetFolderSearchCache,
+} from "../../src/jmap/methods/email.js";
 import { listMailboxes, resetMailboxListCache } from "../../src/jmap/methods/mailbox.js";
 
 let dir: string;
@@ -142,6 +148,23 @@ it("searches a folder again after an expunge that left its modseq alone", async 
   searched.length = 0;
   expect((await labelQuery(ctx, trashId)).total).toBe(1);
   expect(searched).toEqual(["Archive"]);
+});
+
+it("keeps the UIDs of all remembered searches under the cap", () => {
+  const live = { path: "Archive", uidValidity: 7, uidNext: 1, messages: 0, highestModseq: 5 };
+  const uids = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+  const half = Math.ceil(FOLDER_SEARCH_CACHE_MAX_UIDS * 0.6);
+
+  rememberFolderSearch("a", live, uids(half));
+  expect(folderSearchHit("a", live)).toHaveLength(half);
+  // The second big result pushes the first one out.
+  rememberFolderSearch("b", live, uids(half));
+  expect(folderSearchHit("a", live)).toBeNull();
+  expect(folderSearchHit("b", live)).toHaveLength(half);
+  // One result above the cap is not kept, and leaves the others alone.
+  rememberFolderSearch("c", live, uids(FOLDER_SEARCH_CACHE_MAX_UIDS + 1));
+  expect(folderSearchHit("c", live)).toBeNull();
+  expect(folderSearchHit("b", live)).toHaveLength(half);
 });
 
 it("keeps searching every folder on a server without CONDSTORE", async () => {

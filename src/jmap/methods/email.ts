@@ -204,9 +204,22 @@ interface FolderSearchEntry {
 }
 const folderSearchCache = new Map<string, FolderSearchEntry>();
 const FOLDER_SEARCH_CACHE_MAX = 2048;
+// A query with no condition but inMailboxOtherThan returns every UID of every
+// folder, so the entry count alone doesn't bound the memory: the UIDs of all
+// entries together are kept under this many (about 8 MB).
+export const FOLDER_SEARCH_CACHE_MAX_UIDS = 1_000_000;
 const FOLDER_SEARCH_CACHE_TTL_MS = 10 * 60_000;
+let folderSearchCacheUids = 0;
 
-function folderSearchHit(key: string, live: LiveMailboxStatus): number[] | null {
+function dropFolderSearch(key: string): void {
+  const e = folderSearchCache.get(key);
+  if (!e) return;
+  folderSearchCacheUids -= e.uids.length;
+  folderSearchCache.delete(key);
+}
+
+/** Exported for tests. */
+export function folderSearchHit(key: string, live: LiveMailboxStatus): number[] | null {
   if (!live.highestModseq) return null;
   const e = folderSearchCache.get(key);
   if (
@@ -221,18 +234,22 @@ function folderSearchHit(key: string, live: LiveMailboxStatus): number[] | null 
   return e.uids;
 }
 
-function rememberFolderSearch(key: string, live: LiveMailboxStatus, uids: number[]): void {
-  if (!live.highestModseq) return;
-  folderSearchCache.delete(key);
+/** Exported for tests. */
+export function rememberFolderSearch(key: string, live: LiveMailboxStatus, uids: number[]): void {
+  dropFolderSearch(key);
+  if (!live.highestModseq || uids.length > FOLDER_SEARCH_CACHE_MAX_UIDS) return;
   folderSearchCache.set(key, { uids, modseq: live.highestModseq, messages: live.messages, uidNext: live.uidNext, at: Date.now() });
-  while (folderSearchCache.size > FOLDER_SEARCH_CACHE_MAX) {
-    folderSearchCache.delete(folderSearchCache.keys().next().value!);
+  folderSearchCacheUids += uids.length;
+  // Map preserves insertion order and a stored key is re-inserted: drop the oldest first.
+  while (folderSearchCache.size > FOLDER_SEARCH_CACHE_MAX || folderSearchCacheUids > FOLDER_SEARCH_CACHE_MAX_UIDS) {
+    dropFolderSearch(folderSearchCache.keys().next().value!);
   }
 }
 
 /** Forget every folder search result (tests start each from scratch). */
 export function resetFolderSearchCache(): void {
   folderSearchCache.clear();
+  folderSearchCacheUids = 0;
 }
 
 // Drop every cache entry for an account. Called after we mutate emails
