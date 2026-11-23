@@ -473,6 +473,21 @@ it("reports what a server kept when it drops description and order", async () =>
   expect((await calendarGet({ accountId: "1" }, ctx)).list[1]).toMatchObject({ name: "Neu" });
 });
 
+it("keeps the calendar server's answer out of a refused PROPPATCH's error", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  const inner = globalThis.fetch;
+  vi.stubGlobal("fetch", (url: string, init: RequestInit) =>
+    init.method === "PROPPATCH"
+      ? ms(`<D:response><D:href>/cal/u/work/</D:href><D:propstat><D:status>HTTP/1.1 403 secret-store refused</D:status><D:prop/></D:propstat></D:response>`)
+      : inner(url, init),
+  );
+  const [cal] = (await calendarGet({ accountId: "1" }, ctx)).list;
+  const res = await calendarSet({ accountId: "1", update: { [cal!.id]: { name: "Renamed" } } }, ctx);
+  expect(res.notUpdated![cal!.id]).toMatchObject({ type: "invalidProperties" });
+  expect(JSON.stringify(res.notUpdated)).not.toContain("secret-store");
+});
+
 // -- Review fixes -----------------------------------------------------------------
 
 function plainCtx(): CalendarCtx {

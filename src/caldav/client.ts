@@ -121,10 +121,10 @@ export class CalDavClient extends CardDavClient {
       (set.length ? `<D:set><D:prop>${set.join("")}</D:prop></D:set>` : "") +
       (remove.length ? `<D:remove><D:prop>${remove.join("")}</D:prop></D:remove>` : "") +
       `</D:propertyupdate>`;
-    const res = await this.raw("PROPPATCH", href, body, { "Content-Type": "application/xml; charset=utf-8" });
-    if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
-    const text = await res.text();
-    if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) throw new Error(`CalDAV PROPPATCH ${href} → property failure: ${text.slice(0, 200)}`);
+    // request() bounds the answer's size and time; like httpError, the error
+    // carries nothing of the answer, since its message reaches the client.
+    const text = await this.request("PROPPATCH", href, body);
+    if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) throw new Error("CalDAV PROPPATCH: the server refused a property");
   }
 
   async deleteCalendar(href: string): Promise<void> {
