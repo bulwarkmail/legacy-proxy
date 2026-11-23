@@ -453,8 +453,15 @@ function parseDate(p: ParsedLine | undefined): IcalDate | null {
   // without a zone and the server's reply put it an hour off. Any other
   // unknown TZID is still floating: resolving it would mean evaluating the
   // resource's VTIMEZONE, which we don't do.
-  const zone = tzid && (validZone(tzid) ? tzid : WINDOWS_ZONES[tzid]);
+  const zone = tzid && (validZone(tzid) ? tzid : WINDOWS_ZONES[tzid] ?? prefixedZone(tzid));
   return { local, tz: zone || null, date: false };
+}
+
+// Older Thunderbird, Evolution and Citadel write an IANA name behind a
+// prefix of their own ("/mozilla.org/20050126_1/Europe/Berlin").
+function prefixedZone(tzid: string): string | undefined {
+  const m = /\/((?:Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific|Etc)\/[\w+-]+(?:\/[\w+-]+)?)$/.exec(tzid);
+  return m && validZone(m[1]!) ? m[1] : undefined;
 }
 
 /** The date's wall clock in `tz` (unchanged when either side is floating). */

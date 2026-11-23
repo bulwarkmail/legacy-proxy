@@ -94,6 +94,20 @@ describe("icalToEvent", () => {
     expect(eventToIcal(ev, outlook)).toMatch(/^DTSTART;TZID=Europe\/Berlin:20261030T110000\r?$/m);
   });
 
+  it("reads a TZID with a vendor prefix as its IANA zone and keeps it when writing back", () => {
+    const tb = [
+      "BEGIN:VCALENDAR", "BEGIN:VTIMEZONE", "TZID:/mozilla.org/20050126_1/Europe/Berlin", "END:VTIMEZONE",
+      "BEGIN:VEVENT", "UID:t", "DTSTART;TZID=/mozilla.org/20050126_1/Europe/Berlin:20261030T110000",
+      "DTEND;TZID=/mozilla.org/20050126_1/Europe/Berlin:20261030T120000", "END:VEVENT", "END:VCALENDAR",
+    ].join("\r\n");
+    const ev = icalToEvent(tb, "e", "c")!;
+    expect(ev).toMatchObject({ start: "2026-10-30T11:00:00", timeZone: "Europe/Berlin", utcStart: "2026-10-30T10:00:00Z" });
+    const out = eventToIcal(ev, tb);
+    expect(out).toMatch(/^DTSTART;TZID=Europe\/Berlin:20261030T110000\r?$/m);
+    expect(out).toMatch(/^TZID:Europe\/Berlin\r?$/m);
+    expect(icalToEvent("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=/vendor/Nowhere/Atlantis:20261030T110000\r\nEND:VEVENT\r\nEND:VCALENDAR", "e", "c")!.timeZone).toBeNull();
+  });
+
   it("leaves floating time without a UTC instant", () => {
     const floating = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:f\nDTSTART:20261028T110000\nDTEND:20261028T120000\nEND:VEVENT\nEND:VCALENDAR";
     expect(icalToEvent(floating, "e", "c")).toMatchObject({
