@@ -121,6 +121,29 @@ it("searches again only the folders that changed", async () => {
   expect(searched).toEqual(["INBOX"]);
 });
 
+it("searches a folder again after an expunge that left its modseq alone", async () => {
+  const account = store.upsertAccount({ slug: "d", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+  const folders: Record<string, Folder> = {
+    INBOX: { uids: [1], labelled: [], modseq: 10 },
+    Archive: { uids: [1, 2], labelled: [1, 2], modseq: 20 },
+    Trash: { uids: [9], labelled: [], modseq: 40 },
+  };
+  const { client, searched } = fakeServer(folders);
+  const ctx = { account, client, store };
+  const trashId = (await listMailboxes(client, account, store)).find((m) => m.role === "trash")!.id;
+  expect((await labelQuery(ctx, trashId)).total).toBe(2);
+
+  // Message 1 is moved out of Archive on another device. A CONDSTORE server
+  // without QRESYNC needn't move HIGHESTMODSEQ for that, and UIDNEXT stays;
+  // only the count drops.
+  folders.Archive!.uids = [2];
+  folders.Archive!.labelled = [2];
+  store.bumpState(account.id, "email");
+  searched.length = 0;
+  expect((await labelQuery(ctx, trashId)).total).toBe(1);
+  expect(searched).toEqual(["Archive"]);
+});
+
 it("keeps searching every folder on a server without CONDSTORE", async () => {
   const account = store.upsertAccount({ slug: "b", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
   const folders: Record<string, Folder> = {

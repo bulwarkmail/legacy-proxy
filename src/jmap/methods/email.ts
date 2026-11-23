@@ -8,7 +8,7 @@ import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
-import { listMailboxes, liveMailboxStatus, refreshMailboxCounts } from "./mailbox.js";
+import { listMailboxes, liveMailboxStatus, refreshMailboxCounts, type LiveMailboxStatus } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
@@ -191,27 +191,40 @@ async function cachedSearch(
 // folder leaves the others' entries alone: a client that counts a keyword
 // across the account after every change (label counters) then searches only
 // the folders that changed. Servers without CONDSTORE report no modseq and
-// never get an entry.
+// never get an entry. The message count and UIDNEXT must match as well: only
+// a QRESYNC server has to move HIGHESTMODSEQ on an expunge (RFC 7162 §3.2),
+// so on a CONDSTORE-only server a message moved out of the folder would
+// otherwise stay in the result.
 interface FolderSearchEntry {
   uids: number[];
   modseq: number;
+  messages: number;
+  uidNext: number;
   at: number;
 }
 const folderSearchCache = new Map<string, FolderSearchEntry>();
 const FOLDER_SEARCH_CACHE_MAX = 2048;
 const FOLDER_SEARCH_CACHE_TTL_MS = 10 * 60_000;
 
-function folderSearchHit(key: string, modseq: number | undefined): number[] | null {
-  if (!modseq) return null;
+function folderSearchHit(key: string, live: LiveMailboxStatus): number[] | null {
+  if (!live.highestModseq) return null;
   const e = folderSearchCache.get(key);
-  if (!e || e.modseq !== modseq || Date.now() - e.at > FOLDER_SEARCH_CACHE_TTL_MS) return null;
+  if (
+    !e ||
+    e.modseq !== live.highestModseq ||
+    e.messages !== live.messages ||
+    e.uidNext !== live.uidNext ||
+    Date.now() - e.at > FOLDER_SEARCH_CACHE_TTL_MS
+  ) {
+    return null;
+  }
   return e.uids;
 }
 
-function rememberFolderSearch(key: string, modseq: number | undefined, uids: number[]): void {
-  if (!modseq) return;
+function rememberFolderSearch(key: string, live: LiveMailboxStatus, uids: number[]): void {
+  if (!live.highestModseq) return;
   folderSearchCache.delete(key);
-  folderSearchCache.set(key, { uids, modseq, at: Date.now() });
+  folderSearchCache.set(key, { uids, modseq: live.highestModseq, messages: live.messages, uidNext: live.uidNext, at: Date.now() });
   while (folderSearchCache.size > FOLDER_SEARCH_CACHE_MAX) {
     folderSearchCache.delete(folderSearchCache.keys().next().value!);
   }
@@ -714,7 +727,7 @@ async function emailQueryAccountWideFull(
     if (needsFetch) return null;
     const live = liveMailboxStatus(ctx.account.id, row.name);
     if (!live) return null;
-    const uids = folderSearchHit(searchCacheKey(ctx.account.id, idx, live.uidValidity, filter), live.highestModseq);
+    const uids = folderSearchHit(searchCacheKey(ctx.account.id, idx, live.uidValidity, filter), live);
     if (!uids) return null;
     const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, live.uidValidity, uids);
     const found: SortableHit[] = [];
@@ -743,7 +756,7 @@ async function emailQueryAccountWideFull(
       // Only a SEARCH that just ran vouches for the modseq read before it; a
       // searchCache hit may be older than that.
       const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, (found) => {
-        if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore.highestModseq, found);
+        if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore, found);
       });
       if (uids.length === 0) return;
 
