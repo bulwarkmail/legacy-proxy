@@ -591,6 +591,25 @@ const MANAGED = new Set([
   "SEQUENCE", "ORGANIZER", "ATTENDEE", "CONFERENCE", "CATEGORIES",
 ]);
 
+// Other versions of DESCRIPTION (HTML from Outlook and Exchange, RFC 9073
+// styled text). Kept while the description is unchanged; once it changes
+// they are stale, and other clients would go on showing the old text.
+const DESCRIPTION_VERSIONS = new Set(["X-ALT-DESC", "STYLED-DESCRIPTION"]);
+
+/** The stored VEVENT's lines eventToIcal doesn't write itself, for `e` written over it. */
+function keptLines(c: Component, e: JsEvent): string[] {
+  const descChanged = sameText(c, "DESCRIPTION", e.description) === null;
+  return c.props.filter((p) => !MANAGED.has(p.name) && !(descChanged && DESCRIPTION_VERSIONS.has(p.name))).map(rawLine);
+}
+
+/** The stored line for a text property when `value` is still what it says; null when it changed or there is none. */
+function sameText(c: Component | undefined, name: string, value: unknown): string | null {
+  const p = c && prop(c, name);
+  if (!p) return value ? null : "";
+  const norm = (s: string) => s.replace(/\r\n?/g, "\n");
+  return norm(unescapeValue(p.value)) === norm(String(value ?? "")) ? rawLine(p) : null;
+}
+
 /**
  * Serialise a JSCalendar Event as a CalDAV resource. `original` is the stored
  * iCalendar body on update: its VTIMEZONEs and unmodelled master properties
@@ -633,7 +652,7 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
   const masterOrig = instance === null
     ? origVevents.find((c) => !prop(c, "RECURRENCE-ID"))
     : origVevents.find((c) => ridOf(c) === instance) ?? origVevents[0];
-  const extra = masterOrig ? masterOrig.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
+  const extra = masterOrig ? keptLines(masterOrig, ev) : [];
 
   const exdates = Object.entries(overrides).filter(([, o]) => o.excluded).map(([k]) => dateLine("EXDATE", k, tz, allDay));
   // An added occurrence comes back as an override with an empty patch; one the
@@ -669,7 +688,7 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
     // A reply leaves every VEVENT at the SEQUENCE it had: it is the organizer's.
     const ownSeq = own && prop(own, "SEQUENCE");
     if (opts.keepSequence && ownSeq) o.sequence = Number(ownSeq.value) || 0;
-    const ownExtra = own ? own.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
+    const ownExtra = own ? keptLines(own, o) : [];
     const ownParts = own ? new Map([...origParts, ...participantLines(own)]) : origParts;
     // Alerts the occurrence doesn't change are the series', and so are their VALARMs.
     const alarmSource = own && "alerts" in patch ? own : masterOrig;

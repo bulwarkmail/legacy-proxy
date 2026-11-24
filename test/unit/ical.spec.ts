@@ -536,6 +536,17 @@ describe("what an edit keeps of the stored event", () => {
     expect(shown).toMatch(/^ACKNOWLEDGED:20261007T115600Z$/m);
   });
 
+  it("keeps the HTML description while the description is unchanged, and drops it once it changes", () => {
+    const ev = icalToEvent(stored, "e", "c")!;
+    const same = eventToIcal({ ...ev, title: "Abstimmung 2" }, stored);
+    expect(same).toMatch(/^X-ALT-DESC;FMTTYPE=text\/html:/m);
+    const changed = eventToIcal({ ...ev, description: "Agenda: travel" }, stored);
+    expect(changed).toMatch(/^DESCRIPTION:Agenda: travel$/m);
+    expect(changed).not.toMatch(/X-ALT-DESC/);
+    const cleared = eventToIcal({ ...ev, description: "" }, stored);
+    expect(cleared.slice(0, cleared.indexOf("BEGIN:VALARM"))).not.toMatch(/X-ALT-DESC|^DESCRIPTION/m);
+  });
+
   it("writes an occurrence that keeps the series' alerts with the series' alarms", () => {
     const series = stored.replace("DTEND:20261007T130000Z", "DTEND:20261007T130000Z\r\nRRULE:FREQ=DAILY");
     const ev = icalToEvent(series, "e", "c")!;
