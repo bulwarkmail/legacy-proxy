@@ -31,6 +31,7 @@ import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.j
 import { LoginLimiter } from "./auth/loginLimit.js";
 import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
 import { BasicLoginCache } from "./auth/basicCache.js";
+import { LOGIN_GRANT_HEADER, LoginGrants } from "./auth/loginGrant.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 import { CalendarWatcher } from "./push/calendar-watch.js";
@@ -153,6 +154,29 @@ await app.register(compress, { global: true, threshold: 1024 });
 // Failed logins by callers without a session are counted before anything
 // reaches the mail server (see auth/loginLimit.ts).
 const logins = new LoginLimiter();
+
+// With LOGIN_GRANT_SECRET set, an address without an account here signs in
+// only with a grant from the operator's webmail (auth/loginGrant.ts).
+const grants = cfg.loginGrantSecret ? new LoginGrants(cfg.loginGrantSecret, cfg.publicUrl) : null;
+
+/**
+ * True after logging it when the login of `username` is refused for want of
+ * a grant: a new address without a valid one. Runs before the provider is
+ * looked up, so a refused caller reaches no mail server and no discovery.
+ */
+function grantMissing(headers: Record<string, string | string[] | undefined>, username: string): boolean {
+  if (!grants || store.hasAccountForUsername(username)) return false;
+  const check = grants.check(headers[LOGIN_GRANT_HEADER], username);
+  if (!check.ok) {
+    log.warn(
+      { reason: check.reason },
+      "login refused: an address without an account needs a login grant from the operator's webmail (LOGIN_GRANT_SECRET)",
+    );
+    return true;
+  }
+  log.info({ username, grantedTo: check.claims.pri || null }, "new account admitted with a login grant");
+  return false;
+}
 
 const gmailStore = gmailConfig ? openOrExit(() => new GmailStore(cfg.dataDir, cfg.vaultKey)) : null;
 // Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
@@ -278,6 +302,10 @@ app.post("/api/login", async (req, reply) => {
 
   const gate = await logins.begin(req.ip, body.username);
   if (!gate.ok) return sendLimited(reply, gate);
+  if (grantMissing(req.headers, body.username)) {
+    gate.finish("refused");
+    return reply.code(401).send({ error: "auth failed" });
+  }
   const found = await loginProvider(body.username, body.provider);
   if (!found) {
     // Like a refused password: a caller can't probe domains without limit.
@@ -1004,7 +1032,7 @@ async function authn(req: {
         }
         revalidations.set(known.accountId, inFlight + 1);
       }
-      running = basicLogin(username, password, tag, req.ip, !!known).finally(() => {
+      running = basicLogin(username, password, tag, req.ip, !!known, req.headers).finally(() => {
         basicLogins.delete(runningKey);
         if (!known) return;
         const left = (revalidations.get(known.accountId) ?? 1) - 1;
@@ -1026,6 +1054,7 @@ async function basicLogin(
   tag: string,
   ip: string,
   known: boolean,
+  headers: Record<string, string | string[] | undefined>,
 ): Promise<AuthOutcome> {
   if (bridgeSecretOffered(password)) return UNAUTHORIZED;
 
@@ -1033,6 +1062,10 @@ async function basicLogin(
 
   const gate = await logins.begin(ip, username, { known });
   if (!gate.ok) return gate;
+  if (grantMissing(headers, username)) {
+    gate.finish("refused");
+    return UNAUTHORIZED;
+  }
   const found = await loginProvider(username);
   if (!found) {
     gate.finish("refused");

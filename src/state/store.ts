@@ -642,6 +642,11 @@ export class Store {
     return this.prep(`SELECT * FROM account WHERE id = ?`).get(id) as AccountRow | undefined;
   }
 
+  /** Whether any provider's account signs in with this address (in any letter case). */
+  hasAccountForUsername(username: string): boolean {
+    return this.prep(`SELECT 1 FROM account WHERE lower(username) = lower(?) LIMIT 1`).get(username.trim()) !== undefined;
+  }
+
   // In-memory change log. Each entry records a single id-level mutation
   // (`created` / `updated` / `destroyed`) tagged with the post-mutation state
   // for its kind, so `*/changes(sinceState)` can replay the diff. The log is

@@ -449,6 +449,30 @@ proxy's address and all of them share one budget. The same goes for a webmail in
 front of the proxy, which checks every user's sign-in from its own server: put
 the webmail server's address in `TRUST_PROXY` too.
 
+### Only for users of your webmail
+
+By default anyone with an account at one of your providers can sign in
+through the proxy. To keep it for the users of your own Bulwark, set the same
+random value as `LOGIN_GRANT_SECRET` here and in Bulwark (at least 32
+characters, for example from `openssl rand -base64 32`), and mark the proxy's
+server entry in Bulwark as only usable as an extra account.
+
+The proxy then refuses a login for an address it has no account for yet,
+with `401` and before it looks up a provider or contacts a mail server,
+unless the login carries a grant from Bulwark in the `X-Bulwark-Login-Grant`
+header. Bulwark sends one from its own server when a user who is signed in to
+your main mail server adds the address as an extra account. A grant is good
+for one login of that address at this proxy (`PUBLIC_URL`), for one minute
+(30 seconds of clock difference allowed), and only once. The log names the
+Bulwark account each new address was added from.
+
+Addresses that already have an account here sign in as before, over
+`/api/login` and HTTP Basic, without a grant: the browser keeps talking to
+the proxy directly, and a user who signs in again days later needs no new
+grant. Accounts from before you set the secret stay; delete the ones you
+don't want from the database. The Gmail API connection has its own allowlist,
+`GMAIL_ALLOWED_EMAILS`.
+
 ### Provider selection
 
 Every login resolves to exactly one provider, in this order:
@@ -1003,6 +1027,7 @@ network and needs no published port at all. Publish it on all interfaces
 | `DATA_DIR`                 | `./data` (or `/data` in Docker)    | SQLite database, vault entries, upload bodies        |
 | `VAULT_KEY`                | required                           | base64 of 32 bytes; AES-256-GCM credential vault     |
 | `SESSION_HMAC_KEY`         | required                           | base64 of 32 bytes; HMAC-SHA-256 over session tokens |
+| `LOGIN_GRANT_SECRET`       | unset (off)                        | 32+ characters, same value as in Bulwark; new addresses need a grant, see [Only for users of your webmail](#only-for-users-of-your-webmail) |
 | `DEFAULT_PROVIDER`         | `generic`                          | provider key when `/api/login` omits one             |
 | `PROVIDERS_FILE`           | `/etc/legacy-proxy/providers.json` | provider catalogue                                   |
 | `DISCOVERY`                | unset (off)                        | `autoconfig`, `srv` or both; see [Discovery](#discovery) |

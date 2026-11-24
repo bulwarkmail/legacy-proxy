@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { validateProviders } from "../auth/providers.js";
+import { parseLoginGrantSecret } from "../auth/loginGrant.js";
 
 export interface DavConfig {
   host: string;
@@ -72,6 +73,11 @@ export interface AppConfig {
   dataDir: string;
   vaultKey: Buffer;
   sessionHmacKey: Buffer;
+  /**
+   * `LOGIN_GRANT_SECRET`: when set, a login for an address without an
+   * account needs a grant from the operator's webmail (auth/loginGrant.ts).
+   */
+  loginGrantSecret?: Buffer;
   defaultProvider: string;
   providers: Record<string, ProviderConfig>;
   /** `DISCOVERY` and `DISCOVERY_ALLOWED_HOSTS`; missing means discovery is off. */
@@ -337,6 +343,7 @@ export function loadConfig(): AppConfig {
     dataDir,
     vaultKey: b64Key("VAULT_KEY", null),
     sessionHmacKey: b64Key("SESSION_HMAC_KEY", null),
+    loginGrantSecret: parseLoginGrantSecret(process.env.LOGIN_GRANT_SECRET),
     defaultProvider: process.env.DEFAULT_PROVIDER ?? "generic",
     providers,
     discovery: {
