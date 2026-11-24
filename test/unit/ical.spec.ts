@@ -547,6 +547,15 @@ describe("what an edit keeps of the stored event", () => {
     expect(cleared.slice(0, cleared.indexOf("BEGIN:VALARM"))).not.toMatch(/X-ALT-DESC|^DESCRIPTION/m);
   });
 
+  it("keeps the language of an unchanged title, the calendar's X- lines and components it doesn't model", () => {
+    const ev = icalToEvent(stored, "e", "c")!;
+    const out = eventToIcal({ ...ev, description: "Agenda: travel" }, stored);
+    expect(out).toMatch(/^SUMMARY;LANGUAGE=de:Abstimmung$/m);
+    expect(out).toMatch(/^X-WR-CALNAME:Work$/m);
+    expect(out).toMatch(/^BEGIN:VLOCATION\r\nUID:room-1\r\nNAME:Room 1\r\nEND:VLOCATION$/m);
+    expect(eventToIcal({ ...ev, title: "Vote" }, stored)).toMatch(/^SUMMARY:Vote$/m);
+  });
+
   it("writes an occurrence that keeps the series' alerts with the series' alarms", () => {
     const series = stored.replace("DTEND:20261007T130000Z", "DTEND:20261007T130000Z\r\nRRULE:FREQ=DAILY");
     const ev = icalToEvent(series, "e", "c")!;

@@ -602,7 +602,10 @@ function keptLines(c: Component, e: JsEvent): string[] {
   return c.props.filter((p) => !MANAGED.has(p.name) && !(descChanged && DESCRIPTION_VERSIONS.has(p.name))).map(rawLine);
 }
 
-/** The stored line for a text property when `value` is still what it says; null when it changed or there is none. */
+/**
+ * The stored line for a text property when `value` is still what it says,
+ * so its LANGUAGE and ALTREP stay; null when it changed or there is none.
+ */
 function sameText(c: Component | undefined, name: string, value: unknown): string | null {
   const p = c && prop(c, name);
   if (!p) return value ? null : "";
@@ -625,6 +628,9 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
   // §3.2.19), an occurrence moved to another zone included.
   // From the parsed tree, line by line: a regex over the raw text takes
   // quadratic time on a body full of unclosed VTIMEZONEs.
+  const origCalendar = original ? parseComponents(original).find((c) => c.type === "VCALENDAR") : undefined;
+  // The calendar's own X- lines (X-WR-CALNAME, X-MICROSOFT-CDO-..., ...).
+  for (const p of origCalendar?.props ?? []) if (p.name.startsWith("X-")) lines.push(rawLine(p));
   const keptZones = original ? parseComponents(original).flatMap((c) => c.children).filter((c) => c.type === "VTIMEZONE") : [];
   for (const z of keptZones) lines.push(...rawComponent(z));
   const year = Number(String(ev.start ?? "").slice(0, 4)) || new Date().getUTCFullYear();
@@ -716,10 +722,15 @@ function vevent(
   if (recurrenceId) out.push(recurrenceId);
   out.push(dateLine("DTSTART", start, tz, allDay));
   out.push(dateLine("DTEND", addSeconds(start, durationSeconds(String(e.duration ?? (allDay ? "P1D" : "PT0S"))), tz, allDay), tz, allDay));
-  if (e.title) out.push(`SUMMARY:${escapeValue(String(e.title))}`);
-  if (e.description) out.push(`DESCRIPTION:${escapeValue(String(e.description))}`);
-  const loc = Object.values((e.locations ?? {}) as Record<string, { name?: string }>).find((l) => l?.name)?.name;
-  if (loc) out.push(`LOCATION:${escapeValue(loc)}`);
+  // A text the event still has is written as stored, with its LANGUAGE and ALTREP.
+  const textLine = (name: string, value: unknown) => {
+    const same = sameText(stored, name, value);
+    if (same) out.push(same);
+    else if (same === null && value) out.push(`${name}:${escapeValue(String(value))}`);
+  };
+  textLine("SUMMARY", e.title);
+  textLine("DESCRIPTION", e.description);
+  textLine("LOCATION", Object.values((e.locations ?? {}) as Record<string, { name?: string }>).find((l) => l?.name)?.name);
   out.push(...conferenceLines(e), ...categoriesLine(e));
   if (typeof e.status === "string") out.push(`STATUS:${e.status.toUpperCase()}`);
   out.push(`TRANSP:${e.freeBusyStatus === "free" ? "TRANSPARENT" : "OPAQUE"}`);
@@ -745,6 +756,8 @@ function vevent(
   for (const [id, a] of Object.entries((e.alerts ?? {}) as Record<string, Record<string, unknown> | null>)) {
     if (a) out.push(...alarmLines(id, a, e.title, storedAlarms));
   }
+  // Components the mapping doesn't model (RFC 9073 VLOCATION, PARTICIPANT) stay.
+  for (const c of stored?.children ?? []) if (c.type !== "VALARM") out.push(...rawComponent(c));
   out.push("END:VEVENT");
   return out;
 }
