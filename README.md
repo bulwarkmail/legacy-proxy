@@ -116,6 +116,9 @@ Transport:
   use `closeafter=state`) don't log in again each time. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
   `Email`; expunges bump `Email` and `Mailbox`.
+  IDLE only watches INBOX, so unread and total counts of other folders
+  follow changes made on another device within 30 seconds, when the cached
+  folder list expires.
 
 Backends:
 
@@ -123,7 +126,10 @@ Backends:
   request-path pool of up to three interactive and two bulk connections per
   account (separate from the IDLE socket). A free connection is logged out
   after 5 minutes without use.
-- ManageSieve (RFC 5804) for the vacation autoresponder.
+- ManageSieve (RFC 5804) for the vacation autoresponder. ManageSieve runs one
+  script at a time, so switching the responder on makes its script the active
+  one and pauses filters another client set up; switching it off makes their
+  script active again.
 - SMTP Submission via nodemailer.
 - CardDAV (RFC 6352) for AddressBook and ContactCard. Reads are live
   PROPFIND / `addressbook-multiget`; writes are `PUT` with `If-None-Match: *`
