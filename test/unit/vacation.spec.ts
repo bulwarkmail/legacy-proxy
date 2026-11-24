@@ -265,6 +265,7 @@ describe("vacation start and end date", () => {
       ({
         capabilities: new Map(sieve === null ? [] : [["SIEVE", sieve]]),
         putScript: async (_name: string, body: string) => void written.push(body),
+        listScripts: async () => [],
         setActive: async () => {},
       }) as unknown as SieveClient;
     const v = { isEnabled: true, fromDate: "2026-12-24T00:00:00Z", toDate: "2027-01-06T08:30:00Z" };

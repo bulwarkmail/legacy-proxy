@@ -57,7 +57,11 @@ function nowBefore(p: { date: string; time: string }): string {
  * are kept in the markers either way. A date that isn't one, or a fromDate
  * after the toDate, is refused with invalidProperties.
  */
-export function generateScript(v: VacationProps, extensions: ReadonlySet<string> = new Set()): string {
+export function generateScript(
+  v: VacationProps,
+  extensions: ReadonlySet<string> = new Set(),
+  previous: string | null = null,
+): string {
   const from = v.fromDate ? utcParts(v.fromDate, "fromDate") : null;
   const to = v.toDate ? utcParts(v.toDate, "toDate") : null;
   if (from && to && from.ms > to.ms) {
@@ -67,8 +71,9 @@ export function generateScript(v: VacationProps, extensions: ReadonlySet<string>
   // Markers are stored on dedicated comment lines so re-reading the script
   // can recover what the user typed even when the autoresponder is disabled.
   // We only emit the actual `vacation` action when enabled; otherwise the
-  // script contains markers + a no-op so the server still has something to
-  // load and `SETACTIVE ""` is what disables it.
+  // script contains markers + a no-op and isn't the active one. `previous`
+  // is the script that was active before ours, put back when the responder
+  // is switched off.
   const markers = [
     markerLine("subject", v.subject),
     markerLine("from", v.fromDate),
@@ -76,6 +81,7 @@ export function generateScript(v: VacationProps, extensions: ReadonlySet<string>
     markerLine("text", v.textBody),
     markerLine("html", v.htmlBody),
   ];
+  if (v.isEnabled && previous) markers.push(markerLine("previous", previous));
 
   if (!v.isEnabled) {
     return [
@@ -182,15 +188,35 @@ export async function readVacation(client: SieveClient, forWrite = false): Promi
   };
 }
 
+/** The script that was active before ours, as our stored script records it; null when it can't be read. */
+async function previousScript(client: SieveClient): Promise<string | null> {
+  try {
+    return readMarker(await client.getScript(SCRIPT_NAME), "previous");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Writes the response. A server runs one script at a time (RFC 5804), so
+ * switching the responder on makes ours the active one, and the script that
+ * was active before it (filters another client manages) is recorded in ours.
+ * Switching it off gives that script its place back. When ours isn't the
+ * active script, switching off leaves whatever is active alone.
+ */
 export async function writeVacation(client: SieveClient, v: VacationProps): Promise<void> {
-  const body = generateScript(v, serverExtensions(client));
-  await client.putScript(SCRIPT_NAME, body);
+  const extensions = serverExtensions(client);
+  generateScript(v, extensions); // refuse a bad date before anything is written
+  const scripts = await client.listScripts();
+  const active = scripts.find((s) => s.active)?.name ?? null;
+  const oursActive = active === SCRIPT_NAME;
+  const previous = oursActive ? await previousScript(client) : active;
+  await client.putScript(SCRIPT_NAME, generateScript(v, extensions, previous));
   if (v.isEnabled) {
-    await client.setActive(SCRIPT_NAME);
-  } else {
-    // RFC 5804 §2.8: SETACTIVE with an empty script name deactivates the
-    // currently active script. Without this, disabling the responder leaves
-    // the server still running our previous script.
-    await client.setActive("");
+    if (!oursActive) await client.setActive(SCRIPT_NAME);
+  } else if (oursActive) {
+    // RFC 5804 §2.8: SETACTIVE with an empty name deactivates the active script.
+    const back = previous && scripts.some((s) => s.name === previous) ? previous : "";
+    await client.setActive(back);
   }
 }

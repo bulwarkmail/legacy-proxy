@@ -197,6 +197,51 @@ describe("VacationResponse/set as a patch", () => {
     expect([...server.scripts]).toEqual(before);
   });
 
+  describe("next to a script another client manages", () => {
+    const FILTERS = 'require ["fileinto"]; if header :contains "subject" "invoice" { fileinto "Invoices"; }';
+
+    it("leaves the other script active when the responder is switched off while it isn't on", async () => {
+      server.scripts.set("roundcube", FILTERS);
+      server.active = "roundcube";
+      await set({ ...AWAY, isEnabled: false });
+      await set({ subject: "Still not away" });
+      expect(server.active).toBe("roundcube");
+      expect(server.commands.filter((c) => c.startsWith("SETACTIVE"))).toEqual([]);
+      expect(server.scripts.get("roundcube")).toBe(FILTERS);
+    });
+
+    it("gives the other script its place back when the responder is switched off", async () => {
+      server.scripts.set("roundcube", FILTERS);
+      server.active = "roundcube";
+      await set(AWAY);
+      expect(server.active).toBe("bulwark-vacation");
+      await set({ subject: "Away until January" });
+      await set({ isEnabled: false });
+      expect(server.active).toBe("roundcube");
+      expect(server.scripts.get("roundcube")).toBe(FILTERS);
+      expect(await stored()).toEqual({ id: "singleton", ...AWAY, subject: "Away until January", isEnabled: false });
+    });
+
+    it("leaves a script activated by the other client while the responder was on", async () => {
+      server.scripts.set("roundcube", FILTERS);
+      server.active = "roundcube";
+      await set(AWAY);
+      server.scripts.set("other", FILTERS);
+      server.active = "other";
+      await set({ isEnabled: false });
+      expect(server.active).toBe("other");
+    });
+
+    it("deactivates ours when the script it replaced is gone", async () => {
+      server.scripts.set("roundcube", FILTERS);
+      server.active = "roundcube";
+      await set(AWAY);
+      server.scripts.delete("roundcube");
+      await set({ isEnabled: false });
+      expect(server.active).toBeNull();
+    });
+  });
+
   describe("when the stored response cannot be read", () => {
     it.each([
       ["a NO", 'NO "Internal error"\r\n'],
