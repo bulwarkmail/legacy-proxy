@@ -360,24 +360,64 @@ function participantLine(name: "ORGANIZER" | "ATTENDEE", addr: string, p: Record
   return `${name}${params.map(([k, v, wire]) => `;${k}=${wire ? v : quoteParam(v)}`).join("")}:mailto:${addr}`;
 }
 
+/** A VEVENT's VALARMs that have a TRIGGER; alert "aN" is the Nth of them. */
+function triggeredAlarms(v: Component | undefined): Component[] {
+  return (v?.children ?? []).filter((a) => a.type === "VALARM" && prop(a, "TRIGGER"));
+}
+
 function alerts(v: Component): Record<string, unknown> | null {
   const out: Record<string, unknown> = {};
   let n = 0;
-  for (const a of v.children) {
-    const t = a.type === "VALARM" ? prop(a, "TRIGGER") : undefined;
-    if (!t) continue;
+  for (const a of triggeredAlarms(v)) {
+    const t = prop(a, "TRIGGER")!;
     const abs = t.params.VALUE?.[0]?.toUpperCase() === "DATE-TIME";
     out[`a${++n}`] = {
       "@type": "Alert",
       trigger: abs
         ? { "@type": "AbsoluteTrigger", when: utcStamp(t) }
         : { "@type": "OffsetTrigger", offset: t.value, relativeTo: t.params.RELATED?.[0]?.toUpperCase() === "END" ? "end" : "start" },
+      // AUDIO and other actions read as display; the stored VALARM keeps its own when written back.
       action: prop(a, "ACTION")?.value.toUpperCase() === "EMAIL" ? "email" : "display",
-      acknowledged: null,
+      // RFC 9074 §6
+      acknowledged: utcStamp(prop(a, "ACKNOWLEDGED")),
       relatedTo: null,
     };
   }
   return n ? out : null;
+}
+
+// What alarmLines writes itself on a stored VALARM; the rest of it is kept.
+const MANAGED_ALARM = new Set(["TRIGGER", "ACKNOWLEDGED"]);
+
+/**
+ * One alert as a VALARM. An alert read from a stored VALARM ("aN") is written
+ * over that VALARM: its ACTION, DESCRIPTION, ATTENDEE, ATTACH, REPEAT, UID and
+ * X- lines stay, so an AUDIO or EMAIL alarm stays one. A new alert, or one
+ * switched between email and display, is a DISPLAY alarm: EMAIL alarms need
+ * ATTENDEE and SUMMARY lines of their own (RFC 5545 §3.6.6).
+ */
+function alarmLines(id: string, a: Record<string, unknown>, title: unknown, stored: Component[]): string[] {
+  const t = a.trigger as Record<string, string> | undefined;
+  if (!t) return [];
+  const trigger = t["@type"] === "AbsoluteTrigger" && t.when
+    ? `TRIGGER;VALUE=DATE-TIME:${compactUtc(Date.parse(t.when))}`
+    : `TRIGGER${t.relativeTo === "end" ? ";RELATED=END" : ""}:${t.offset ?? "PT0S"}`;
+  const ackMs = typeof a.acknowledged === "string" ? Date.parse(a.acknowledged) : NaN;
+  const ack = Number.isFinite(ackMs) ? [`ACKNOWLEDGED:${compactUtc(ackMs)}`] : [];
+  const n = /^a([1-9]\d{0,5})$/.exec(id);
+  const orig = n ? stored[Number(n[1]) - 1] : undefined;
+  const origEmail = orig ? prop(orig, "ACTION")?.value.toUpperCase() === "EMAIL" : false;
+  if (orig && origEmail === (a.action === "email")) {
+    return [
+      "BEGIN:VALARM",
+      ...orig.props.filter((p) => !MANAGED_ALARM.has(p.name)).map(rawLine),
+      trigger,
+      ...ack,
+      ...orig.children.flatMap(rawComponent),
+      "END:VALARM",
+    ];
+  }
+  return ["BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeValue(String(title || "Reminder"))}`, trigger, ...ack, "END:VALARM"];
 }
 
 // -- RRULE ---------------------------------------------------------------------
@@ -607,7 +647,7 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
   const origParts = participantLines(masterOrig);
   const rule = ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : [];
   const instanceLine = instance === null ? undefined : dateLine("RECURRENCE-ID", instance, instanceTz, allDay);
-  lines.push(...vevent(ev, tz, allDay, [...rule, ...rdates, ...exdates, ...extra], instanceLine, origParts));
+  lines.push(...vevent(ev, tz, allDay, [...rule, ...rdates, ...exdates, ...extra], instanceLine, origParts, masterOrig));
   if (instance !== null) {
     for (const c of origVevents) if (c !== masterOrig && prop(c, "RECURRENCE-ID")) lines.push(...rawComponent(c));
   }
@@ -631,7 +671,9 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
     if (opts.keepSequence && ownSeq) o.sequence = Number(ownSeq.value) || 0;
     const ownExtra = own ? own.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
     const ownParts = own ? new Map([...origParts, ...participantLines(own)]) : origParts;
-    lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts));
+    // Alerts the occurrence doesn't change are the series', and so are their VALARMs.
+    const alarmSource = own && "alerts" in patch ? own : masterOrig;
+    lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts, own, alarmSource));
   }
   lines.push("END:VCALENDAR");
   // Each entry is one content line. A line break in a value that skipped
@@ -646,6 +688,8 @@ function vevent(
   extra: string[],
   recurrenceId?: string,
   originalParticipants?: Map<string, ParsedLine>,
+  stored?: Component,
+  alarmSource: Component | undefined = stored,
 ): string[] {
   const start = String(e.start ?? "");
   // UID is TEXT (RFC 5545 §3.8.4.7) and read back unescaped, so it is written escaped.
@@ -678,15 +722,9 @@ function vevent(
     }
   }
 
-  for (const a of Object.values((e.alerts ?? {}) as Record<string, { trigger?: Record<string, string> }>)) {
-    const t = a?.trigger;
-    if (!t) continue;
-    const trigger = t["@type"] === "AbsoluteTrigger" && t.when
-      ? `TRIGGER;VALUE=DATE-TIME:${compactUtc(Date.parse(t.when))}`
-      : `TRIGGER${t.relativeTo === "end" ? ";RELATED=END" : ""}:${t.offset ?? "PT0S"}`;
-    // EMAIL alarms need ATTENDEE / SUMMARY lines of their own (RFC 5545
-    // §3.6.6), so every alert is written as a DISPLAY alarm.
-    out.push("BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeValue(String(e.title || "Reminder"))}`, trigger, "END:VALARM");
+  const storedAlarms = triggeredAlarms(alarmSource);
+  for (const [id, a] of Object.entries((e.alerts ?? {}) as Record<string, Record<string, unknown> | null>)) {
+    if (a) out.push(...alarmLines(id, a, e.title, storedAlarms));
   }
   out.push("END:VEVENT");
   return out;

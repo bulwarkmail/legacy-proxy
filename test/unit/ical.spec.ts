@@ -447,3 +447,103 @@ describe("review round two", () => {
     expect(out).toMatch(/^DTSTART;TZID=America\/New_York:20261012T090000$/m);
   });
 });
+
+describe("what an edit keeps of the stored event", () => {
+  const stored = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "X-WR-CALNAME:Work",
+    "BEGIN:VEVENT",
+    "UID:keep-1",
+    "DTSTART:20261007T120000Z",
+    "DTEND:20261007T130000Z",
+    "SUMMARY;LANGUAGE=de:Abstimmung",
+    "DESCRIPTION:Agenda: budget",
+    "X-ALT-DESC;FMTTYPE=text/html:<p>Agenda: <b>budget</b></p>",
+    "BEGIN:VALARM",
+    "UID:alarm-sound",
+    "ACTION:AUDIO",
+    "ATTACH;FMTTYPE=audio/basic:https://example.org/ding.au",
+    "TRIGGER:-PT10M",
+    "END:VALARM",
+    "BEGIN:VALARM",
+    "ACTION:EMAIL",
+    "SUMMARY:Reminder",
+    "DESCRIPTION:Abstimmung soon",
+    "ATTENDEE:mailto:user@example.org",
+    "TRIGGER:-PT1H",
+    "END:VALARM",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "DESCRIPTION:Abstimmung",
+    "TRIGGER:-PT5M",
+    "ACKNOWLEDGED:20261007T115600Z",
+    "END:VALARM",
+    "BEGIN:VLOCATION",
+    "UID:room-1",
+    "NAME:Room 1",
+    "END:VLOCATION",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+  const valarms = (out: string) => out.replace(/\r\n[ \t]/g, "").split("BEGIN:VALARM").slice(1).map((a) => a.slice(0, a.indexOf("END:VALARM")));
+
+  it("reads when an alarm was acknowledged", () => {
+    const ev = icalToEvent(stored, "e", "c")!;
+    expect(ev.alerts).toMatchObject({
+      a1: { action: "display", acknowledged: null },
+      a2: { action: "email", acknowledged: null },
+      a3: { action: "display", acknowledged: "2026-10-07T11:56:00Z" },
+    });
+  });
+
+  it("keeps each alarm's action, sound, recipients and acknowledgement when the event is edited", () => {
+    const ev = icalToEvent(stored, "e", "c")!;
+    const out = eventToIcal({ ...ev, title: "Abstimmung 2" }, stored);
+    const [sound, mail, shown] = valarms(out);
+    expect(sound).toMatch(/^ACTION:AUDIO$/m);
+    expect(sound).toMatch(/^ATTACH;FMTTYPE=audio\/basic:https:\/\/example.org\/ding.au$/m);
+    expect(sound).toMatch(/^UID:alarm-sound$/m);
+    expect(mail).toMatch(/^ACTION:EMAIL$/m);
+    expect(mail).toMatch(/^ATTENDEE:mailto:user@example.org$/m);
+    expect(shown).toMatch(/^ACKNOWLEDGED:20261007T115600Z$/m);
+    expect(icalToEvent(out, "e", "c")!.alerts).toEqual(ev.alerts);
+  });
+
+  it("writes a changed trigger and acknowledgement over the stored alarm", () => {
+    const ev = icalToEvent(stored, "e", "c")!;
+    const alerts = structuredClone(ev.alerts) as Record<string, Record<string, unknown>>;
+    alerts.a1!.trigger = { "@type": "OffsetTrigger", offset: "-PT30M", relativeTo: "start" };
+    alerts.a2!.acknowledged = "2026-10-07T11:00:00Z";
+    alerts.a3!.acknowledged = null;
+    const [sound, mail, shown] = valarms(eventToIcal({ ...ev, alerts }, stored));
+    expect(sound).toMatch(/^ACTION:AUDIO$/m);
+    expect(sound).toMatch(/^TRIGGER:-PT30M$/m);
+    expect(sound).not.toMatch(/-PT10M/);
+    expect(mail).toMatch(/^ACKNOWLEDGED:20261007T110000Z$/m);
+    expect(shown).not.toMatch(/ACKNOWLEDGED/);
+  });
+
+  it("drops a removed alarm and writes an alarm switched to display as a display alarm", () => {
+    const ev = icalToEvent(stored, "e", "c")!;
+    const { a1: _sound, ...rest } = structuredClone(ev.alerts) as Record<string, Record<string, unknown>>;
+    rest.a2!.action = "display";
+    const out = eventToIcal({ ...ev, alerts: rest }, stored);
+    expect(out).not.toMatch(/AUDIO/);
+    const [mail, shown] = valarms(out);
+    expect(mail).toMatch(/^ACTION:DISPLAY$/m);
+    expect(mail).not.toMatch(/ATTENDEE/);
+    expect(shown).toMatch(/^ACKNOWLEDGED:20261007T115600Z$/m);
+  });
+
+  it("writes an occurrence that keeps the series' alerts with the series' alarms", () => {
+    const series = stored.replace("DTEND:20261007T130000Z", "DTEND:20261007T130000Z\r\nRRULE:FREQ=DAILY");
+    const ev = icalToEvent(series, "e", "c")!;
+    ev.recurrenceOverrides = { "2026-10-08T12:00:00": { title: "Moved title" } };
+    const out = eventToIcal(ev, series);
+    const occurrence = out.slice(out.lastIndexOf("BEGIN:VEVENT"));
+    expect(occurrence).toMatch(/^RECURRENCE-ID:20261008T120000Z$/m);
+    expect(occurrence).toMatch(/^ACTION:AUDIO$/m);
+    expect(occurrence).toMatch(/^ACTION:EMAIL$/m);
+  });
+});
