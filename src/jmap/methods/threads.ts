@@ -307,6 +307,25 @@ async function rebuildThreadIndex(
   }
 }
 
+function cachedThreadMembers(ctx: ThreadCtx, threadId: string): string[] | null {
+  const rows = ctx.store
+    .prep(
+      `SELECT mailbox_id, uidvalidity, uid FROM email_cache
+       WHERE account_id = ? AND thread_id = ?
+       ORDER BY internaldate ASC, uid ASC`,
+    )
+    .all(ctx.account.id, threadId) as { mailbox_id: number; uidvalidity: number; uid: number }[];
+  if (rows.length === 0) return null;
+  return rows.map((r) =>
+    encodeEmailId({
+      accountIdx: ctx.account.id,
+      mailboxIdx: r.mailbox_id,
+      uidvalidity: r.uidvalidity,
+      uid: r.uid,
+    }),
+  );
+}
+
 export async function threadGet(
   args: ThreadGetArgs,
   ctx: ThreadCtx,
@@ -315,9 +334,28 @@ export async function threadGet(
   const list: ThreadJson[] = [];
   const notFound: string[] = [];
   const ids = args.ids ?? [];
-  // Build (or reuse cached) thread membership map across the account.
-  const idx = await buildThreadIndex(ctx);
+  // A thread the index already stored is a few rows. Do not rebuild the
+  // account to answer it. An unknown id still builds the index, which is how
+  // the first scan is started.
+  const unresolved: string[] = [];
   for (const id of ids) {
+    const cached = cachedThreadMembers(ctx, id);
+    if (cached) {
+      list.push({ id, emailIds: cached });
+      continue;
+    }
+    unresolved.push(id);
+  }
+  if (unresolved.length === 0) {
+    return {
+      accountId: args.accountId,
+      state: encodeEmailState({ uidvalidity: 0, modseq: ctx.store.getState(ctx.account.id, "email") }),
+      list,
+      notFound,
+    };
+  }
+  const idx = await buildThreadIndex(ctx);
+  for (const id of unresolved) {
     const members = idx.members.get(id);
     if (members && members.length > 0) {
       list.push({ id, emailIds: members });
