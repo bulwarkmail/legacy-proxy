@@ -1,10 +1,12 @@
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store } from "../../state/store.js";
+import type { ImapPool } from "../../imap/pool.js";
 import { inferRole } from "../../mapping/mailboxRoles.js";
 import { decodeMailboxId, encodeMailboxId } from "../../mapping/ids.js";
 import { decodeCounterState, encodeCounterState } from "../../state/states.js";
 import { JmapError, accountNotFound, invalidArguments, notFound } from "../errors.js";
 import { changesFromLog } from "./_shared.js";
+import { log } from "../../util/log.js";
 import {
   changesOrCannotCalculate,
   queryChangesOrCannotCalculate,
@@ -54,6 +56,8 @@ interface ListCacheEntry {
 }
 const listCache = new Map<number, ListCacheEntry>();
 const LIST_CACHE_HARD_TTL_MS = 30_000;
+const LIST_CACHE_STALE_MS = 30 * 60_000;
+const listRefresh = new Map<number, Promise<void>>();
 
 // What the last LIST reported for each folder, by account and path. With
 // LIST-STATUS this costs nothing extra, and it lets the thread index tell a
@@ -81,19 +85,46 @@ export function liveMailboxStatus(accountId: number, path: string): LiveMailboxS
  * relies on the folders' HIGHESTMODSEQ (the account-wide Email/query) must
  * not judge by statuses from before the change.
  */
+function scheduleListRefresh(pool: ImapPool, account: AccountRow, store: Store): void {
+  if (listRefresh.has(account.id)) return;
+  const job = (async () => {
+    let lease: { client: ImapFlow; release: () => void } | null = null;
+    try {
+      lease = await pool.acquire(account, "bulk");
+      await listMailboxes(lease.client, account, store, { force: true });
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "mailbox list refresh failed",
+      );
+    } finally {
+      lease?.release();
+    }
+  })();
+  listRefresh.set(account.id, job);
+  void job.finally(() => {
+    if (listRefresh.get(account.id) === job) listRefresh.delete(account.id);
+  });
+}
+
 export async function listMailboxes(
   client: ImapFlow,
   account: AccountRow,
   store: Store,
-  opts: { force?: boolean; matchEmailState?: boolean } = {},
+  opts: { force?: boolean; matchEmailState?: boolean; pool?: ImapPool } = {},
 ): Promise<MailboxJson[]> {
   if (!opts.force) {
     const cached = listCache.get(account.id);
     if (cached) {
-      const fresh = Date.now() - cached.refreshedAt < LIST_CACHE_HARD_TTL_MS;
+      const age = Date.now() - cached.refreshedAt;
+      const fresh = age < LIST_CACHE_HARD_TTL_MS;
       const stateMatch = cached.state === store.getState(account.id, "mailbox");
       const emailMatch = !opts.matchEmailState || cached.emailState === store.getState(account.id, "email");
       if (fresh && stateMatch && emailMatch) return cached.list;
+      if (opts.pool && age < LIST_CACHE_STALE_MS) {
+        scheduleListRefresh(opts.pool, account, store);
+        return cached.list;
+      }
     }
   }
   // Taken before the LIST, so a change that lands while it runs leaves the
@@ -278,7 +309,7 @@ function leafName(path: string): string {
 
 export async function mailboxGet(
   args: { accountId: string; ids: string[] | null; properties?: string[] | null },
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: { account: AccountRow; client: ImapFlow; store: Store; pool?: ImapPool },
 ): Promise<{ accountId: string; state: string; list: Partial<MailboxJson>[]; notFound: string[] }> {
   if (typeof args.accountId !== "string") throw invalidArguments("accountId is required");
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
@@ -288,7 +319,7 @@ export async function mailboxGet(
   if (args.properties != null && !Array.isArray(args.properties)) {
     throw invalidArguments("properties must be an array or null");
   }
-  const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
+  const all = await listMailboxes(ctx.client, ctx.account, ctx.store, { pool: ctx.pool });
   const list = args.ids ? all.filter((m) => args.ids!.includes(m.id)) : all;
   const notFound = args.ids ? args.ids.filter((id) => !all.some((m) => m.id === id)) : [];
   // RFC 8620 §5.1: if `properties` is given, return only those properties (id
@@ -332,7 +363,7 @@ export interface MailboxQueryArgs {
 // parentId, role). Sort is best-effort: we order by sortOrder then name.
 export async function mailboxQuery(
   args: MailboxQueryArgs,
-  ctx: { account: AccountRow; client: ImapFlow; store: Store },
+  ctx: { account: AccountRow; client: ImapFlow; store: Store; pool?: ImapPool },
 ): Promise<{
   accountId: string;
   queryState: string;
@@ -342,7 +373,7 @@ export async function mailboxQuery(
   ids: string[];
 }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
-  const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
+  const all = await listMailboxes(ctx.client, ctx.account, ctx.store, { pool: ctx.pool });
   let result = all;
   const f = args.filter;
   if (f) {
