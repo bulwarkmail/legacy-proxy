@@ -63,6 +63,30 @@ const indexCache = new Map<number, CachedIndex>();
 const INDEX_TTL_MS = 5_000;
 const inflight = new Map<number, Promise<ThreadIndex>>();
 
+// A folder this large makes `SEARCH ALL` return hundreds of thousands of UIDs.
+// The thread index can catch up from new UIDs; it must not list every UID to
+// notice a small count drift.
+export const LARGE_MAILBOX_MESSAGES = 20_000;
+
+/** Whether a count mismatch should be repaired with `SEARCH ALL`. An empty folder still reconciles, without a search. */
+export function shouldReconcileUidsBySearch(exists: number, cachedCount: number): boolean {
+  if (cachedCount === exists) return false;
+  if (exists > LARGE_MAILBOX_MESSAGES) return false;
+  return true;
+}
+
+/**
+ * First UID to fetch when bringing a folder current. A huge gap on a large
+ * folder is capped to the newest slice so one drifted scan cannot download
+ * the whole mailbox.
+ */
+export function incrementalFetchStart(exists: number, startUid: number, uidNext: number): number {
+  if (exists > LARGE_MAILBOX_MESSAGES && uidNext - startUid > 2_000) {
+    return Math.max(startUid, uidNext - 500);
+  }
+  return startUid;
+}
+
 // Nothing arrived and nothing was expunged since the folder was last scanned.
 export function sameAsLastScan(
   live: LiveMailboxStatus,
@@ -98,16 +122,17 @@ async function syncMailboxScan(
     store.purgeEmailCacheMailbox(account.id, mailboxId);
   }
 
-  if (exists > 0 && uidNext > startUid) {
+  const rangeStart = incrementalFetchStart(exists, startUid, uidNext);
+  if (exists > 0 && uidNext > rangeStart) {
     const upserts: EmailCacheUpsert[] = [];
     for await (const msg of client.fetch(
-      `${startUid}:*`,
+      `${rangeStart}:*`,
       { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
       { uid: true },
     )) {
       // `${x}:*` returns the highest-UID message even when x exceeds it. A
       // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
-      if (msg.uid == null || msg.uid < startUid || !msg.envelope) continue;
+      if (msg.uid == null || msg.uid < rangeStart || !msg.envelope) continue;
       const hb =
         typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
       const headers = parseHeaderBlock(hb);
@@ -130,7 +155,12 @@ async function syncMailboxScan(
   // Reconcile expunges (and self-heal any cache gaps): only when the row
   // count disagrees with EXISTS, ask the server for the live UID set.
   const cachedUids = store.getEmailCacheUids(account.id, mailboxId);
-  if (cachedUids.length !== exists) {
+  if (cachedUids.length !== exists && !shouldReconcileUidsBySearch(exists, cachedUids.length)) {
+    log.info(
+      { mailboxId, exists, cached: cachedUids.length },
+      "thread scan: skip full UID search on large mailbox",
+    );
+  } else if (cachedUids.length !== exists) {
     const searchResult = exists > 0 ? await client.search({ all: true }, { uid: true }) : [];
     const live = new Set(Array.isArray(searchResult) ? (searchResult as number[]) : []);
     const stale = cachedUids.filter((uid) => !live.has(uid));
