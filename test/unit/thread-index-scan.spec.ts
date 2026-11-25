@@ -81,4 +81,28 @@ describe("thread index scan", () => {
     expect(log.lists).toBe(1);
     expect(log.selects).toEqual(["INBOX"]);
   });
+
+  it("returns the bulk connection before reading the cached rows", async () => {
+    const { client, log } = fakeServer({ INBOX: { messages: 1, uidNext: 2, uidValidity: 1n } });
+    const account = store.upsertAccount({ slug: "c", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+    store.bumpState(account.id, "email");
+    let released = false;
+    const pool = {
+      acquire: async () => ({
+        client,
+        release: () => {
+          released = true;
+        },
+      }),
+    };
+    const original = store.getThreadIndexRows.bind(store);
+    store.getThreadIndexRows = ((id: number) => {
+      expect(released).toBe(true);
+      return original(id);
+    }) as typeof store.getThreadIndexRows;
+    const index = await buildThreadIndex({ account, client, store, pool: pool as never });
+    expect(log.selects).toEqual(["INBOX"]);
+    expect(released).toBe(true);
+    expect(index.members).toBeInstanceOf(Map);
+  });
 });

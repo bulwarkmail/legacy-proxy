@@ -214,13 +214,13 @@ async function rebuildThreadIndex(
   curState: number,
   now: number,
 ): Promise<ThreadIndex> {
-  // Long scans ride the bulk connection so they don't queue behind (or hold
-  // up) interactive method calls sharing the request-path connection. The
-  // lease is held for the whole scan and returned however this exits.
+  // The lease covers LIST and SELECT only. Reading the cached rows back does
+  // not need the IMAP connection, and holding it there queues body downloads
+  // behind the index.
   const lease = ctx.pool ? await ctx.pool.acquire(ctx.account, "bulk") : null;
   const client = lease ? lease.client : ctx.client;
+  const flagsByEmail = new Map<string, Set<string>>();
   try {
-
     // A fresh LIST reports every folder's UIDVALIDITY, UIDNEXT and count in one
     // round trip (LIST-STATUS); only folders where those moved get SELECTed.
     // Before, each build SELECTed every non-empty folder, and on Gmail, where
@@ -231,7 +231,6 @@ async function rebuildThreadIndex(
       .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
     const rowById = new Map(rows.map((r) => [r.id, r] as const));
 
-    const flagsByEmail = new Map<string, Set<string>>();
     for (const m of all) {
       const mailboxIdx = decodeMailboxId(m.id).mailboxIdx;
       const row = rowById.get(mailboxIdx);
@@ -272,39 +271,39 @@ async function rebuildThreadIndex(
         );
       }
     }
-
-    const index: ThreadIndex = {
-      members: new Map(),
-      byEmail: new Map(),
-      flagsByEmail,
-    };
-    // Rows come back ordered by internaldate ascending (RFC 8621 §3 order).
-    for (const r of ctx.store.getThreadIndexRows(ctx.account.id)) {
-      const eid = encodeEmailId({
-        accountIdx: ctx.account.id,
-        mailboxIdx: r.mailbox_id,
-        uidvalidity: r.uidvalidity,
-        uid: r.uid,
-      });
-      let arr = index.members.get(r.thread_id);
-      if (!arr) {
-        arr = [];
-        index.members.set(r.thread_id, arr);
-      }
-      arr.push(eid);
-      index.byEmail.set(eid, r.thread_id);
-    }
-
-    indexCache.set(ctx.account.id, {
-      expiresAt: now + INDEX_TTL_MS,
-      emailState: curState,
-      hasFlags: wantFlags,
-      index,
-    });
-    return index;
   } finally {
     lease?.release();
   }
+
+  const index: ThreadIndex = {
+    members: new Map(),
+    byEmail: new Map(),
+    flagsByEmail,
+  };
+  // Rows come back ordered by internaldate ascending (RFC 8621 §3 order).
+  for (const r of ctx.store.getThreadIndexRows(ctx.account.id)) {
+    const eid = encodeEmailId({
+      accountIdx: ctx.account.id,
+      mailboxIdx: r.mailbox_id,
+      uidvalidity: r.uidvalidity,
+      uid: r.uid,
+    });
+    let arr = index.members.get(r.thread_id);
+    if (!arr) {
+      arr = [];
+      index.members.set(r.thread_id, arr);
+    }
+    arr.push(eid);
+    index.byEmail.set(eid, r.thread_id);
+  }
+
+  indexCache.set(ctx.account.id, {
+    expiresAt: now + INDEX_TTL_MS,
+    emailState: curState,
+    hasFlags: wantFlags,
+    index,
+  });
+  return index;
 }
 
 export async function threadGet(
