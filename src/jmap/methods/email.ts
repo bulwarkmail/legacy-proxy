@@ -11,9 +11,10 @@ import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search
 import { listMailboxes, liveMailboxStatus, refreshMailboxCounts, type LiveMailboxStatus } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
-import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
+import { asMessageIds, headersToEmailHeaders, parseHeaderBlock, projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
+import { isGmailAccountWideContentSearch } from "../gmailSearch.js";
 import { unescapePointerToken } from "../refs.js";
 import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
 import { readBlob } from "../blobs.js";
@@ -354,7 +355,17 @@ export async function emailQuery(
   const ascending = sort[0]?.isAscending === true;
   const lim = Math.min(args.limit ?? 50, 500);
 
-  const inMailbox = findInMailbox(filter);
+  let inMailbox = findInMailbox(filter);
+  let searchedAllMail = false;
+  if (!inMailbox && ctx.account.kind === "gmail" && isGmailAccountWideContentSearch(filter)) {
+    const allMail = ctx.store
+      .prep(`SELECT id FROM mailbox WHERE account_id = ? AND role = ?`)
+      .get(ctx.account.id, "all") as { id: number } | undefined;
+    if (allMail) {
+      inMailbox = encodeMailboxId({ accountIdx: ctx.account.id, mailboxIdx: allMail.id });
+      searchedAllMail = true;
+    }
+  }
   const full = inMailbox
     ? await emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch)
     : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch);
@@ -362,7 +373,9 @@ export async function emailQuery(
   let orderedIds = full.ids;
 
   const wantsHasAttachment = findHasAttachment(filter);
-  if (wantsHasAttachment !== null) {
+  // Gmail text search already compiles hasAttachment into X-GM-RAW. Fetching
+  // BODYSTRUCTURE for every hit walks All Mail a second time.
+  if (wantsHasAttachment !== null && ctx.account.kind !== "gmail") {
     orderedIds = await postFilterByHasAttachment(ctx, orderedIds, wantsHasAttachment);
   }
 
@@ -407,14 +420,78 @@ export async function emailQuery(
   }
 
   const start = resolveQueryStart(orderedIds, args);
+  const page = orderedIds.slice(start, start + lim);
   return {
     accountId: args.accountId,
     queryState: full.queryState,
     canCalculateChanges: false,
     position: start,
     total: orderedIds.length,
-    ids: orderedIds.slice(start, start + lim),
+    ids: searchedAllMail ? page.map((id) => preferVisibleCopy(ctx, id)) : page,
   };
+}
+
+function messageIdOf(headersRaw: Buffer | string | null | undefined): string | null {
+  if (headersRaw == null) return null;
+  const ids = asMessageIds(parseHeaderBlock(headersRaw), "Message-ID");
+  return ids && ids.length > 0 ? ids[0]!.toLowerCase() : null;
+}
+
+function copyScore(role: string | null): number {
+  if (role === "all" || role === "important") return 100;
+  if (role === "inbox") return 0;
+  if (role === "sent" || role === "drafts") return 1;
+  return 10;
+}
+
+/** Point an All Mail hit at the same message in a smaller folder, when we know it. */
+function preferVisibleCopy(ctx: MailCtx, emailId: string): string {
+  let parts: { accountIdx: number; mailboxIdx: number; uidvalidity: number; uid: number };
+  try {
+    parts = decodeEmailId(emailId);
+  } catch {
+    return emailId;
+  }
+  const row = ctx.store
+    .prep(
+      `SELECT thread_id, uidvalidity, headers_raw FROM email_cache
+       WHERE account_id = ? AND mailbox_id = ? AND uid = ? AND uidvalidity = ?`,
+    )
+    .get(ctx.account.id, parts.mailboxIdx, parts.uid, parts.uidvalidity) as
+    | { thread_id: string | null; uidvalidity: number; headers_raw: Buffer | null }
+    | undefined;
+  const messageId = row ? messageIdOf(row.headers_raw) : null;
+  if (!row?.thread_id || !messageId) return emailId;
+  const mates = ctx.store
+    .prep(
+      `SELECT e.mailbox_id, e.uidvalidity, e.uid, e.headers_raw, m.role, m.total
+       FROM email_cache e
+       INNER JOIN mailbox m ON m.id = e.mailbox_id AND m.account_id = e.account_id
+       WHERE e.account_id = ? AND e.thread_id = ?`,
+    )
+    .all(ctx.account.id, row.thread_id) as {
+      mailbox_id: number;
+      uidvalidity: number;
+      uid: number;
+      headers_raw: Buffer | null;
+      role: string | null;
+      total: number;
+    }[];
+  const same = mates.filter((mate) => messageIdOf(mate.headers_raw) === messageId);
+  if (same.length === 0) return emailId;
+  let best = same[0]!;
+  for (const mate of same.slice(1)) {
+    const better =
+      copyScore(mate.role) < copyScore(best.role) ||
+      (copyScore(mate.role) === copyScore(best.role) && mate.total < best.total);
+    if (better) best = mate;
+  }
+  return encodeEmailId({
+    accountIdx: ctx.account.id,
+    mailboxIdx: best.mailbox_id,
+    uidvalidity: best.uidvalidity,
+    uid: best.uid,
+  });
 }
 
 interface SortSpec { property: string; isAscending?: boolean; keyword?: string }

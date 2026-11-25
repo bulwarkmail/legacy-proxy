@@ -122,6 +122,8 @@ async function syncMailboxScan(
         uid: msg.uid,
         threadId: tid,
         internaldate: dateMs(msg.internalDate) ?? 0,
+        headersRaw: Buffer.isBuffer(hb) ? hb : Buffer.from(hb),
+        headersFull: false,
       });
     }
     store.upsertEmailCacheRows(upserts);
@@ -159,6 +161,8 @@ async function syncMailboxScan(
           uid: msg.uid,
           threadId: tid,
           internaldate: dateMs(msg.internalDate) ?? 0,
+          headersRaw: Buffer.isBuffer(hb) ? hb : Buffer.from(hb),
+          headersFull: false,
         });
       }
       store.upsertEmailCacheRows(upserts);
