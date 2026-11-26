@@ -78,7 +78,8 @@ it("lists again when the mailbox state has moved", async () => {
     vault: Buffer.from("v"),
   });
   const imap = client(lists);
-  await listMailboxes(imap, account, store);
+  await listMailboxes(imap, account, store, { force: true });
+  expect(lists.n).toBe(1);
   store.bumpState(account.id, "mailbox");
   vi.advanceTimersByTime(31_000);
   const pool = { acquire: async () => { throw new Error("should not dial"); } };
