@@ -1369,10 +1369,15 @@ export class GmailMail {
         Math.min(500, Math.max(1, (pos as number) + count + ahead)),
       );
       type Listing = Record<string, string | string[]>;
+      // A folder other than Trash and Spam lists without them, as Gmail
+      // does and as the label's own counters count. A draft moved to Trash
+      // keeps its DRAFT label for 30 days, so Drafts would otherwise show it.
       const labelListing = (id: string): Listing => ({
         labelIds: unreadIn ? [id, "UNREAD"] : id,
         ...(readIn ? { q: "is:read" } : {}),
-        ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
+        ...(skipSpamTrash || (id !== "TRASH" && id !== "SPAM")
+          ? { includeSpamTrash: "false" }
+          : {}),
       });
       const listPage = (listing: Listing, cursor: string) =>
         this.cached<{

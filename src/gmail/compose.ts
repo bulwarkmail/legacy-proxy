@@ -444,6 +444,9 @@ export class GmailCompose {
     const tokens = new Set<string>();
     do {
       const page = await this.c.api.get<{ drafts?: Draft[]; nextPageToken?: string }>("drafts", 5, {
+        // A draft another tool moved to Trash is still a draft; without this,
+        // sending or deleting it fails with "Draft not found".
+        includeSpamTrash: "true",
         maxResults: "500",
         ...(pageToken ? { pageToken } : {}),
       });
