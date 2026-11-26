@@ -307,6 +307,20 @@ async function rebuildThreadIndex(
   }
 }
 
+function accountHasBeenScanned(ctx: ThreadCtx): boolean {
+  const missing = ctx.store
+    .prep(
+      `SELECT COUNT(*) AS n FROM mailbox m
+       LEFT JOIN mailbox_scan s ON s.account_id = m.account_id AND s.mailbox_id = m.id
+       WHERE m.account_id = ? AND m.total > 0 AND s.mailbox_id IS NULL`,
+    )
+    .get(ctx.account.id) as { n: number };
+  const scans = ctx.store
+    .prep(`SELECT COUNT(*) AS n FROM mailbox_scan WHERE account_id = ?`)
+    .get(ctx.account.id) as { n: number };
+  return scans.n > 0 && missing.n === 0;
+}
+
 function cachedThreadMembers(ctx: ThreadCtx, threadId: string): string[] | null {
   const rows = ctx.store
     .prep(
@@ -334,12 +348,13 @@ export async function threadGet(
   const list: ThreadJson[] = [];
   const notFound: string[] = [];
   const ids = args.ids ?? [];
-  // A thread the index already stored is a few rows. Do not rebuild the
-  // account to answer it. An unknown id still builds the index, which is how
-  // the first scan is started.
+  // Rows written by Email/get are not a full account scan. Use them only
+  // after every non-empty folder has a scan row. A known thread is then
+  // answered from those rows and is not rechecked against the server.
+  const scanned = accountHasBeenScanned(ctx);
   const unresolved: string[] = [];
   for (const id of ids) {
-    const cached = cachedThreadMembers(ctx, id);
+    const cached = scanned ? cachedThreadMembers(ctx, id) : null;
     if (cached) {
       list.push({ id, emailIds: cached });
       continue;
