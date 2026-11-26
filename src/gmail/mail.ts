@@ -192,6 +192,34 @@ function withoutSpamTrash(filter: unknown): unknown {
   return rest.length === 1 ? rest[0] : { operator: "AND", conditions: rest };
 }
 
+/**
+ * Whether a search reaches into Trash and Spam. One confined to another folder
+ * leaves them out, as that folder's own listing does: a draft moved to Trash
+ * keeps its DRAFT label for 30 days and would otherwise turn up in Drafts.
+ */
+function searchesBins(filter: unknown): boolean {
+  if (!filter || typeof filter !== "object") return true;
+  const f = filter as Record<string, unknown>;
+  const parts: unknown[] =
+    f.operator === undefined
+      ? [f]
+      : f.operator === "AND" && Array.isArray(f.conditions)
+        ? f.conditions
+        : [];
+  return !parts.some((c) => {
+    const id =
+      c && typeof c === "object"
+        ? (c as Record<string, unknown>).inMailbox
+        : undefined;
+    return (
+      typeof id === "string" &&
+      id !== ALL_MAIL &&
+      id !== "l_TRASH" &&
+      id !== "l_SPAM"
+    );
+  });
+}
+
 export class GmailMail {
   readonly accountId: string;
   private composer: GmailCompose;
@@ -1481,8 +1509,9 @@ export class GmailMail {
     // Enumerate IDs only: exact totals and reverse/anchor pagination without
     // fetching metadata for the entire mailbox. Never expose resultSizeEstimate as total.
     const gmailQuery = await q();
+    const bins = searchesBins(args.filter);
     const references = await this.cached<{ id: string; threadId: string }[]>(
-      `query:${state}:${hash(gmailQuery)}`,
+      `query:${state}:${hash(gmailQuery)}${bins ? "" : ":nobins"}`,
       MESSAGE_TTL,
       async () => {
         const result = new Map<string, { id: string; threadId: string }>();
@@ -1494,7 +1523,7 @@ export class GmailMail {
             nextPageToken?: string;
           }>("messages", 5, {
             q: gmailQuery,
-            includeSpamTrash: "true",
+            includeSpamTrash: bins ? "true" : "false",
             maxResults: "500",
             ...(pageToken ? { pageToken } : {}),
           });

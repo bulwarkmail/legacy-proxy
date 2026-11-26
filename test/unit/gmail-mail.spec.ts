@@ -463,6 +463,47 @@ it("lists Trash itself with its trashed messages", async () => {
   const listing = get.mock.calls.find((c) => c[0] === "messages")!;
   expect(listing[2]).toMatchObject({ labelIds: "TRASH", includeSpamTrash: "true" });
 });
+it("searches a folder other than Trash and Spam without them, as its listing does", async () => {
+  const { mail, get } = setup();
+  const fixture = get.getMockImplementation()!;
+  get.mockImplementation(async (resource: string, cost: number, params: any = {}) =>
+    resource === "labels"
+      ? {
+          labels: [
+            ...labels,
+            { id: "DRAFT", name: "DRAFT", type: "system" },
+            { id: "TRASH", name: "TRASH", type: "system" },
+          ],
+        }
+      : fixture(resource, cost, params),
+  );
+  const search = async (filter: unknown, isAscending = false) => {
+    const before = get.mock.calls.length;
+    await mail.methods()["Email/query"]!({
+      accountId: mail.accountId,
+      filter,
+      sort: [{ property: "receivedAt", isAscending }],
+    });
+    return get.mock.calls.slice(before).find((c) => c[0] === "messages")![2];
+  };
+  // A draft moved to Trash keeps its DRAFT label for 30 days.
+  expect(
+    await search({
+      operator: "AND",
+      conditions: [{ inMailbox: "l_DRAFT" }, { text: "offer" }],
+    }),
+  ).toMatchObject({ q: '(in:drafts) ("offer")', includeSpamTrash: "false" });
+  expect(await search({ inMailbox: "l_DRAFT" }, true)).toMatchObject({
+    q: "in:drafts",
+    includeSpamTrash: "false",
+  });
+  expect(await search({ inMailbox: "l_TRASH", text: "offer" })).toMatchObject({
+    includeSpamTrash: "true",
+  });
+  expect(await search({ text: "offer" })).toMatchObject({
+    includeSpamTrash: "true",
+  });
+});
 it("treats unmapped client keywords as absent", () => {
   expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe(
     "in:anywhere -in:anywhere",
