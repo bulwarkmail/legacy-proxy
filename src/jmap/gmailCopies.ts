@@ -67,13 +67,16 @@ export function collapseGmailCopies<T extends GmailCopy>(rows: T[]): { members: 
       buckets.set(row.mailboxId, bucket);
     }
     let width = 0;
+    const realFolders = new Set<number>();
     for (const bucket of buckets.values()) {
       bucket.sort((a, b) => a.uid - b.uid);
       if (bucket.length > width) width = bucket.length;
+      const role = bucket[0]?.role ?? null;
+      if (role !== "all" && role !== "important") realFolders.add(bucket[0]!.mailboxId);
     }
-    const lengths = [...buckets.values()].map((bucket) => bucket.length);
-    const aligned = lengths.every((length) => length === width);
-    if (!aligned) {
+    const aligned = [...buckets.values()].every((bucket) => bucket.length === width);
+    // Two ordinary folders in the same second are different messages.
+    if (realFolders.size > 1 || !aligned) {
       members.push(...group);
       continue;
     }

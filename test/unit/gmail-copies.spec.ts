@@ -42,3 +42,12 @@ it("does not drop a message when the folders do not hold the same set", () => {
   expect(collapsed.members.map((row) => row.uid).sort((a, b) => a - b)).toEqual([10, 100, 101]);
   expect(collapsed.aliases).toEqual([]);
 });
+
+it("does not merge two messages that each live in a different folder", () => {
+  const collapsed = collapseGmailCopies([
+    copy({ uid: 10, role: "inbox", mailboxId: 1 }),
+    copy({ uid: 40, role: "trash", mailboxId: 3, total: 2 }),
+  ]);
+  expect(collapsed.members.map((row) => row.uid).sort((a, b) => a - b)).toEqual([10, 40]);
+  expect(collapsed.aliases).toEqual([]);
+});
