@@ -79,12 +79,6 @@ export function liveMailboxStatus(accountId: number, path: string): LiveMailboxS
   return liveStatus.get(accountId)?.get(path);
 }
 
-/**
- * `matchEmailState` also refreshes when the Email state moved since the last
- * LIST: a flag changed on another device moves only that, and a caller that
- * relies on the folders' HIGHESTMODSEQ (the account-wide Email/query) must
- * not judge by statuses from before the change.
- */
 function scheduleListRefresh(pool: ImapPool, account: AccountRow, store: Store): void {
   if (listRefresh.has(account.id)) return;
   const job = (async () => {
@@ -107,6 +101,17 @@ function scheduleListRefresh(pool: ImapPool, account: AccountRow, store: Store):
   });
 }
 
+/**
+ * `matchEmailState` also refreshes when the Email state moved since the last
+ * LIST: a flag changed on another device moves only that, and a caller that
+ * relies on the folders' HIGHESTMODSEQ (the account-wide Email/query) must
+ * not judge by statuses from before the change.
+ *
+ * A list past the short TTL but younger than 30 minutes, whose mailbox and
+ * email states still match, is returned immediately. The recount runs on the
+ * bulk connection. A state mismatch, including an IDLE bump, still waits for
+ * a new LIST.
+ */
 export async function listMailboxes(
   client: ImapFlow,
   account: AccountRow,
@@ -121,7 +126,7 @@ export async function listMailboxes(
       const stateMatch = cached.state === store.getState(account.id, "mailbox");
       const emailMatch = !opts.matchEmailState || cached.emailState === store.getState(account.id, "email");
       if (fresh && stateMatch && emailMatch) return cached.list;
-      if (opts.pool && age < LIST_CACHE_STALE_MS) {
+      if (opts.pool && stateMatch && emailMatch && age < LIST_CACHE_STALE_MS) {
         scheduleListRefresh(opts.pool, account, store);
         return cached.list;
       }

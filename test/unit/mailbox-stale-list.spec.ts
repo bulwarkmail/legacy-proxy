@@ -67,3 +67,21 @@ it("returns a stale list and swallows a failed background dial", async () => {
   await vi.runAllTimersAsync();
   expect(lists.n).toBe(1);
 });
+
+it("lists again when the mailbox state has moved", async () => {
+  const lists = { n: 0 };
+  const account = store.upsertAccount({
+    slug: "b",
+    kind: "generic",
+    host: "imap.example",
+    username: "u",
+    vault: Buffer.from("v"),
+  });
+  const imap = client(lists);
+  await listMailboxes(imap, account, store);
+  store.bumpState(account.id, "mailbox");
+  vi.advanceTimersByTime(31_000);
+  const pool = { acquire: async () => { throw new Error("should not dial"); } };
+  await listMailboxes(imap, account, store, { pool: pool as never });
+  expect(lists.n).toBe(2);
+});
