@@ -31,17 +31,23 @@ function leaves(filter: object): object[] | null {
   return out;
 }
 
-export function isGmailAccountWideContentSearch(filter: object): boolean {
+export function isGmailAccountWideContentSearch(filter: object): { excludedIds: string[] } | null {
   const parts = leaves(filter);
-  if (!parts || parts.length === 0) return false;
+  if (!parts || parts.length === 0) return null;
   let content = false;
+  const excludedIds: string[] = [];
   for (const condition of parts) {
     for (const [key, value] of Object.entries(condition)) {
       if (value === undefined || value === null || value === "") continue;
-      if (key === "inMailbox" || key === "inMailboxOtherThan") return false;
-      if (key === "hasKeyword" && value === "$junk") return false;
+      if (key === "inMailbox") return null;
+      if (key === "inMailboxOtherThan") {
+        if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) return null;
+        excludedIds.push(...(value as string[]));
+        continue;
+      }
+      if (key === "hasKeyword" && value === "$junk") return null;
       if (CONTENT_KEYS.has(key)) content = true;
     }
   }
-  return content;
+  return content ? { excludedIds } : null;
 }

@@ -357,13 +357,28 @@ export async function emailQuery(
 
   let inMailbox = findInMailbox(filter);
   let searchedAllMail = false;
-  if (!inMailbox && ctx.account.kind === "gmail" && isGmailAccountWideContentSearch(filter)) {
-    const allMail = ctx.store
-      .prep(`SELECT id FROM mailbox WHERE account_id = ? AND role = ?`)
-      .get(ctx.account.id, "all") as { id: number } | undefined;
-    if (allMail) {
-      inMailbox = encodeMailboxId({ accountIdx: ctx.account.id, mailboxIdx: allMail.id });
-      searchedAllMail = true;
+  const searchPlan =
+    !inMailbox && ctx.account.kind === "gmail" ? isGmailAccountWideContentSearch(filter) : null;
+  if (searchPlan) {
+    const excludedAreTrashOrJunk = searchPlan.excludedIds.every((id) => {
+      try {
+        const mailboxIdx = decodeMailboxId(id).mailboxIdx;
+        const excluded = ctx.store
+          .prep(`SELECT role FROM mailbox WHERE id = ? AND account_id = ?`)
+          .get(mailboxIdx, ctx.account.id) as { role: string | null } | undefined;
+        return excluded?.role === "trash" || excluded?.role === "junk";
+      } catch {
+        return false;
+      }
+    });
+    if (excludedAreTrashOrJunk) {
+      const allMail = ctx.store
+        .prep(`SELECT id FROM mailbox WHERE account_id = ? AND role = ?`)
+        .get(ctx.account.id, "all") as { id: number } | undefined;
+      if (allMail) {
+        inMailbox = encodeMailboxId({ accountIdx: ctx.account.id, mailboxIdx: allMail.id });
+        searchedAllMail = true;
+      }
     }
   }
   const full = inMailbox
