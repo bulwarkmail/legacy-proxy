@@ -51,3 +51,12 @@ it("does not merge two messages that each live in a different folder", () => {
   expect(collapsed.members.map((row) => row.uid).sort((a, b) => a - b)).toEqual([10, 40]);
   expect(collapsed.aliases).toEqual([]);
 });
+
+it("does not collapse a trash-only message into a different All Mail message", () => {
+  const collapsed = collapseGmailCopies([
+    copy({ uid: 40, role: "trash", mailboxId: 3, total: 2 }),
+    copy({ uid: 100, role: "all", mailboxId: 2, total: 100_000 }),
+  ]);
+  expect(collapsed.members.map((row) => row.uid).sort((a, b) => a - b)).toEqual([40, 100]);
+  expect(collapsed.aliases).toEqual([]);
+});

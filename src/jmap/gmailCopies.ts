@@ -3,6 +3,7 @@
 // share a thread id and an internal date. Several different messages can share
 // that same second; they are collapsed only when every folder holds the same
 // number of them, so a missing copy cannot drop a message or duplicate another.
+// Trash and Spam are not in All Mail, so a row there is a different message.
 
 export interface GmailCopy {
   threadId: string;
@@ -68,15 +69,20 @@ export function collapseGmailCopies<T extends GmailCopy>(rows: T[]): { members: 
     }
     let width = 0;
     const realFolders = new Set<number>();
+    let exclusive = false;
+    let shared = false;
     for (const bucket of buckets.values()) {
       bucket.sort((a, b) => a.uid - b.uid);
       if (bucket.length > width) width = bucket.length;
       const role = bucket[0]?.role ?? null;
+      if (role === "trash" || role === "junk") exclusive = true;
+      else shared = true;
       if (role !== "all" && role !== "important") realFolders.add(bucket[0]!.mailboxId);
     }
     const aligned = [...buckets.values()].every((bucket) => bucket.length === width);
-    // Two ordinary folders in the same second are different messages.
-    if (realFolders.size > 1 || !aligned) {
+    // Two ordinary folders in the same second are different messages. Trash
+    // and Spam never collapse into All Mail or Important.
+    if ((exclusive && shared) || realFolders.size > 1 || !aligned) {
       members.push(...group);
       continue;
     }
