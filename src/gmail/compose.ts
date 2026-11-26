@@ -417,7 +417,8 @@ export class GmailCompose {
         );
         const header = (name: string) =>
           original.payload?.headers?.find((h) => h.name?.toLowerCase() === name)?.value ?? "";
-        const subject = (value: string) => value.replace(/^(?:re:\s*)+/i, "").trim();
+        // A reply to "Fwd: X" or to Outlook's "AW: X" / "WG: X" is "Re: X" in most clients.
+        const subject = (value: string) => value.replace(/^(?:(?:re|fwd?|aw|wg)\s*:\s*)+/i, "").trim();
         if (
           header("message-id").replace(/^<|>$/g, "") === parent &&
           subject(header("subject")) === subject(String(input?.subject ?? ""))
