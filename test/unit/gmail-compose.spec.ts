@@ -46,7 +46,13 @@ async function setup() {
     if (resource === "profile") return { ...profile, messagesTotal: messages.size };
     if (resource === "labels") return { labels };
     if (resource.startsWith("labels/")) return labels.find((l) => l.id === resource.slice(7));
-    if (resource === "drafts") return { drafts: [...drafts.values()] };
+    if (resource === "drafts")
+      // Like Gmail: drafts in Trash only with includeSpamTrash.
+      return {
+        drafts: [...drafts.values()].filter(
+          (d) => params.includeSpamTrash === "true" || !d.message.labelIds?.includes("TRASH"),
+        ),
+      };
     if (resource.startsWith("drafts/")) {
       const d = drafts.get(resource.slice(7));
       if (!d) throw new JmapError("notFound");
@@ -300,6 +306,15 @@ it("keeps a draft sendable when Google provably did not send it", async () => {
   const second = (await mail.methods()["EmailSubmission/set"]!(args)) as any;
   expect(second.created.s.undoStatus).toBe("final");
   expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(2);
+});
+it("deletes a draft another tool moved to Trash", async () => {
+  const { mail, drafts, messages } = await setup();
+  const m = { id: "foreign", threadId: "fthread", labelIds: ["DRAFT", "TRASH"], internalDate: "1000", raw: "" };
+  messages.set(m.id, m);
+  drafts.set("fdraft", { id: "fdraft", message: m });
+  const r = (await mail.methods()["Email/set"]!({ accountId: mail.accountId, destroy: ["m_foreign"] })) as any;
+  expect(r.destroyed).toEqual(["m_foreign"]);
+  expect(drafts.size).toBe(0);
 });
 it("forgets the id mapping of a discarded draft", async () => {
   const { save, mail, store } = await setup();

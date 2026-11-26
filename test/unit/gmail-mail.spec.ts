@@ -441,10 +441,27 @@ it("lists a folder page by label id instead of a label-name search", async () =>
   const listing = get.mock.calls.find((c) => c[0] === "messages")!;
   expect(listing[2]).toMatchObject({
     labelIds: "Label_1",
-    includeSpamTrash: "true",
+    includeSpamTrash: "false",
   });
   expect(listing[2]).not.toHaveProperty("q");
   expect(get.mock.calls.some((c) => c[0] === "labels")).toBe(false);
+});
+it("lists Trash itself with its trashed messages", async () => {
+  const { mail, store, get } = setup();
+  store.cache(
+    email,
+    "label:TRASH:g123",
+    { id: "TRASH", name: "TRASH", type: "system", messagesTotal: 2 },
+    60_000,
+  );
+  await mail.methods()["Email/query"]!({
+    accountId: mail.accountId,
+    filter: { inMailbox: "l_TRASH" },
+    limit: 2,
+    calculateTotal: true,
+  });
+  const listing = get.mock.calls.find((c) => c[0] === "messages")!;
+  expect(listing[2]).toMatchObject({ labelIds: "TRASH", includeSpamTrash: "true" });
 });
 it("treats unmapped client keywords as absent", () => {
   expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe(
