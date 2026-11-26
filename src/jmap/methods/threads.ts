@@ -80,8 +80,13 @@ export function shouldReconcileUidsBySearch(exists: number, cachedCount: number)
  * folder is capped to the newest slice so one drifted scan cannot download
  * the whole mailbox.
  */
-export function incrementalFetchStart(exists: number, startUid: number, uidNext: number): number {
-  if (exists > LARGE_MAILBOX_MESSAGES && uidNext - startUid > 2_000) {
+export function incrementalFetchStart(
+  exists: number,
+  startUid: number,
+  uidNext: number,
+  hasPriorScan: boolean,
+): number {
+  if (hasPriorScan && exists > LARGE_MAILBOX_MESSAGES && uidNext - startUid > 2_000) {
     return Math.max(startUid, uidNext - 500);
   }
   return startUid;
@@ -122,7 +127,8 @@ async function syncMailboxScan(
     store.purgeEmailCacheMailbox(account.id, mailboxId);
   }
 
-  const rangeStart = incrementalFetchStart(exists, startUid, uidNext);
+  const hasPriorScan = scan != null && scan.uidvalidity === uidvalidity;
+  const rangeStart = incrementalFetchStart(exists, startUid, uidNext, hasPriorScan);
   if (exists > 0 && uidNext > rangeStart) {
     const upserts: EmailCacheUpsert[] = [];
     for await (const msg of client.fetch(

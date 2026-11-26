@@ -31,9 +31,10 @@ it("repairs an empty folder without searching, and skips the search on a large o
   expect(shouldReconcileUidsBySearch(0, 4)).toBe(true);
   expect(shouldReconcileUidsBySearch(12, 12)).toBe(false);
   expect(shouldReconcileUidsBySearch(LARGE_MAILBOX_MESSAGES + 1, 10)).toBe(false);
-  expect(incrementalFetchStart(90, 1, 5_000)).toBe(1);
-  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000)).toBe(79_500);
-  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 79_900, 80_000)).toBe(79_900);
+  expect(incrementalFetchStart(90, 1, 5_000, true)).toBe(1);
+  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, false)).toBe(1);
+  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, true)).toBe(79_500);
+  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 79_900, 80_000, true)).toBe(79_900);
 });
 
 it("does not SEARCH ALL when a large folder's cached count disagrees", async () => {
