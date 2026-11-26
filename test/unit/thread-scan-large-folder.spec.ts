@@ -11,6 +11,7 @@ import {
   LARGE_MAILBOX_MESSAGES,
   buildThreadIndex,
   incrementalFetchStart,
+  incrementalScan,
   shouldReconcileUidsBySearch,
 } from "../../src/jmap/methods/threads.js";
 
@@ -35,6 +36,14 @@ it("repairs an empty folder without searching, and skips the search on a large o
   expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, false)).toBe(1);
   expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, true)).toBe(79_500);
   expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 79_900, 80_000, true)).toBe(79_900);
+  expect(incrementalScan(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, true)).toEqual({
+    ranges: [
+      { start: 1, end: 500 },
+      { start: 79_500, end: null },
+    ],
+    uidnext: 501,
+  });
+  expect(incrementalScan(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, false).uidnext).toBe(80_000);
 });
 
 it("does not SEARCH ALL when a large folder's cached count disagrees", async () => {

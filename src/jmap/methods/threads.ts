@@ -75,21 +75,42 @@ export function shouldReconcileUidsBySearch(exists: number, cachedCount: number)
   return true;
 }
 
+export interface IncrementalScanPlan {
+  ranges: Array<{ start: number; end: number | null }>;
+  uidnext: number;
+}
+
 /**
- * First UID to fetch when bringing a folder current. A huge gap on a large
- * folder is capped to the newest slice so one drifted scan cannot download
- * the whole mailbox.
+ * How to catch a folder up. A large folder that already has a scan, and is
+ * more than 2,000 UIDs behind, fetches the newest 500 and the next 500 of the
+ * backlog. The saved uidnext moves only through the backlog, so a later scan
+ * continues into the hole. Expunged UIDs can still linger, because `SEARCH ALL`
+ * stays skipped on these folders.
  */
+export function incrementalScan(
+  exists: number,
+  startUid: number,
+  uidNext: number,
+  hasPriorScan: boolean,
+): IncrementalScanPlan {
+  const capped = hasPriorScan && exists > LARGE_MAILBOX_MESSAGES && uidNext - startUid > 2_000;
+  if (!capped) return { ranges: [{ start: startUid, end: null }], uidnext: uidNext };
+  const tail = Math.max(startUid, uidNext - 500);
+  const uidnext = Math.min(uidNext, startUid + 500);
+  const ranges: IncrementalScanPlan["ranges"] = [{ start: startUid, end: uidnext - 1 }];
+  if (tail > uidnext - 1) ranges.push({ start: tail, end: null });
+  return { ranges, uidnext };
+}
+
+/** Newest UID a capped catch-up fetches. Uncapped, this is `startUid`. */
 export function incrementalFetchStart(
   exists: number,
   startUid: number,
   uidNext: number,
   hasPriorScan: boolean,
 ): number {
-  if (hasPriorScan && exists > LARGE_MAILBOX_MESSAGES && uidNext - startUid > 2_000) {
-    return Math.max(startUid, uidNext - 500);
-  }
-  return startUid;
+  const plan = incrementalScan(exists, startUid, uidNext, hasPriorScan);
+  return plan.ranges[plan.ranges.length - 1]!.start;
 }
 
 // Nothing arrived and nothing was expunged since the folder was last scanned.
@@ -128,34 +149,46 @@ async function syncMailboxScan(
   }
 
   const hasPriorScan = scan != null && scan.uidvalidity === uidvalidity;
-  const rangeStart = incrementalFetchStart(exists, startUid, uidNext, hasPriorScan);
-  if (exists > 0 && uidNext > rangeStart) {
-    const upserts: EmailCacheUpsert[] = [];
-    for await (const msg of client.fetch(
-      `${rangeStart}:*`,
-      { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
-      { uid: true },
-    )) {
-      // `${x}:*` returns the highest-UID message even when x exceeds it. A
-      // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
-      if (msg.uid == null || msg.uid < rangeStart || !msg.envelope) continue;
-      const hb =
-        typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
-      const headers = parseHeaderBlock(hb);
-      const env = msg.envelope as { messageId?: string } | undefined;
-      const tid =
-        computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
-        encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid: msg.uid });
-      upserts.push({
-        accountId: account.id,
-        mailboxId,
-        uidvalidity,
-        uid: msg.uid,
-        threadId: tid,
-        internaldate: dateMs(msg.internalDate) ?? 0,
-      });
+  const plan = incrementalScan(exists, startUid, uidNext, hasPriorScan);
+  if (exists > 0) {
+    for (const range of plan.ranges) {
+      if (range.end != null && range.end < range.start) continue;
+      if (range.end == null && uidNext <= range.start) continue;
+      const spec = range.end == null ? `${range.start}:*` : `${range.start}:${range.end}`;
+      const upserts: EmailCacheUpsert[] = [];
+      for await (const msg of client.fetch(
+        spec,
+        { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
+        { uid: true },
+      )) {
+        // `${x}:*` returns the highest-UID message even when x exceeds it. A
+        // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
+        if (
+          msg.uid == null ||
+          msg.uid < range.start ||
+          (range.end != null && msg.uid > range.end) ||
+          !msg.envelope
+        ) {
+          continue;
+        }
+        const hb =
+          typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
+        const headers = parseHeaderBlock(hb);
+        const env = msg.envelope as { messageId?: string } | undefined;
+        const tid =
+          computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
+          encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid: msg.uid });
+        upserts.push({
+          accountId: account.id,
+          mailboxId,
+          uidvalidity,
+          uid: msg.uid,
+          threadId: tid,
+          internaldate: dateMs(msg.internalDate) ?? 0,
+        });
+      }
+      store.upsertEmailCacheRows(upserts);
     }
-    store.upsertEmailCacheRows(upserts);
   }
 
   // Reconcile expunges (and self-heal any cache gaps): only when the row
@@ -205,7 +238,7 @@ async function syncMailboxScan(
     account_id: account.id,
     mailbox_id: mailboxId,
     uidvalidity,
-    uidnext: uidNext,
+    uidnext: plan.uidnext,
     messages: exists,
     scanned_at: Date.now(),
   });
