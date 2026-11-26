@@ -80,3 +80,57 @@ it("does not SEARCH ALL when a large folder's cached count disagrees", async () 
   await buildThreadIndex({ account, client: client as unknown as ImapFlow, store });
   expect(searches).toEqual([]);
 });
+
+it("fetches the backlog and the newest slice, and saves the backlog watermark", async () => {
+  const fetches: string[] = [];
+  const searches: unknown[] = [];
+  const client = {
+    mailbox: null as unknown,
+    list: async () => [
+      {
+        path: "[Gmail]/All Mail",
+        name: "All Mail",
+        delimiter: "/",
+        subscribed: true,
+        specialUse: "\\All",
+        status: { messages: 20_001, unseen: 0, uidNext: 80_000, uidValidity: 1n },
+      },
+    ],
+    getMailboxLock: async (p: string) => {
+      client.mailbox = { path: p, exists: 20_001, uidNext: 80_000, uidValidity: 1n };
+      return { release: () => {} };
+    },
+    fetch: async function* (range: string) {
+      fetches.push(range);
+      if (range !== "1:500" && range !== "79500:*") return;
+      const kept = range === "1:500" ? 100 : 79_500;
+      const dropped = range === "1:500" ? 501 : 79_499;
+      yield { uid: kept, envelope: { messageId: `<${kept}@example>` }, internalDate: "2026-01-01T00:00:00Z" };
+      yield { uid: dropped, envelope: { messageId: `<${dropped}@example>` }, internalDate: "2026-01-01T00:00:00Z" };
+    },
+    search: async (query: unknown) => {
+      searches.push(query);
+      return [];
+    },
+  };
+  const account = store.upsertAccount({
+    slug: "gap",
+    kind: "gmail",
+    host: "imap.example",
+    username: "u",
+    vault: Buffer.from("v"),
+  });
+  store.bumpState(account.id, "email");
+  await buildThreadIndex({ account, client: client as unknown as ImapFlow, store });
+  const mailbox = store.prep(`SELECT id FROM mailbox WHERE account_id = ?`).get(account.id) as { id: number };
+  const scanned = store.getMailboxScan(account.id, mailbox.id);
+  expect(scanned?.uidnext).toBe(80_000);
+  store.putMailboxScan({ ...scanned!, uidnext: 1, scanned_at: Date.now() });
+  fetches.length = 0;
+  store.bumpState(account.id, "email");
+  await buildThreadIndex({ account, client: client as unknown as ImapFlow, store });
+  expect(fetches).toEqual(["1:500", "79500:*"]);
+  expect(store.getEmailCacheUids(account.id, mailbox.id).sort((a, b) => a - b)).toEqual([100, 79_500]);
+  expect(store.getMailboxScan(account.id, mailbox.id)?.uidnext).toBe(501);
+  expect(searches).toEqual([]);
+});
