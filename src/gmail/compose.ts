@@ -62,6 +62,29 @@ interface ComposeContext {
   /** Absent when GMAIL_SCHEDULE_ENABLED is off: HOLDFOR/HOLDUNTIL are rejected. */
   schedule?: { maxDelayedSend: number; lateTolerance: number };
 }
+// The reply and forward prefixes Bulwark strips when it builds a subject, in
+// every language it writes (webmail lib/subject-prefix.ts), with Outlook's
+// counter ("Re[2]:") and the full-width colon of CJK clients ("回复：").
+const SUBJECT_PREFIX_TOKENS = [
+  "Re", "AW", "Antw", "Sv", "Yn", "Yanit", "Odp", "Ответ", "Resp", "Vá", "回复", "回覆", "답장",
+  "Fwd", "Fw", "WG", "Tr", "Vs", "Enc", "Rv", "Rvf", "Inol", "PD", "PR", "İlt", "Ilt", "Пересл", "Пер",
+  "转发", "轉寄", "전달",
+];
+const SUBJECT_PREFIX = new RegExp(
+  `^\\s*(?:${[...SUBJECT_PREFIX_TOKENS].sort((a, b) => b.length - a.length).join("|")})(?:\\[\\d+\\]|\\*\\d*)?\\s*[:\\uFF1A]\\s*`,
+  "i",
+);
+
+function withoutSubjectPrefixes(value: string): string {
+  let rest = value;
+  for (let i = 0; i < 20; i++) {
+    const next = rest.replace(SUBJECT_PREFIX, "");
+    if (next === rest) break;
+    rest = next;
+  }
+  return rest.trim();
+}
+
 /** Native Gmail drafts preserve Bcc and make an ambiguous send non-replayable. */
 export class GmailCompose {
   constructor(private c: ComposeContext) {}
@@ -390,8 +413,9 @@ export class GmailCompose {
         );
         const header = (name: string) =>
           original.payload?.headers?.find((h) => h.name?.toLowerCase() === name)?.value ?? "";
-        // A reply to "Fwd: X" or to Outlook's "AW: X" / "WG: X" is "Re: X" in most clients.
-        const subject = (value: string) => value.replace(/^(?:(?:re|fwd?|aw|wg)\s*:\s*)+/i, "").trim();
+        // A reply to "Fwd: X" or to Outlook's "AW: X" / "WG: X" is "Re: X" in most
+        // clients, and "Sv: X" or "Ответ: X" from Bulwark in Swedish or Russian.
+        const subject = withoutSubjectPrefixes;
         if (
           header("message-id").replace(/^<|>$/g, "") === parent &&
           subject(header("subject")) === subject(String(input?.subject ?? ""))
