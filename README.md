@@ -705,7 +705,8 @@ Google Testing refresh tokens with Gmail scopes expire after seven days; reconne
 when consent expires or is revoked.
 
 To remove an account, revoke its Google grant and delete everything the bridge stored
-for it (tokens, bridge password, cache, draft mappings, send ledger and queues):
+for it (tokens, bridge password, cache, draft mappings, signatures, send ledger and
+queues):
 
 ```bash
 npm run gmail:disconnect -- tester@gmail.com
@@ -787,17 +788,20 @@ made in Gmail itself are picked up by the incremental sync described below.
 Set `GMAIL_COMPOSE_ENABLED=true` together with `GMAIL_WRITE_ENABLED=true` to enable
 composition. The existing verified `gmail.modify` grant is sufficient; reload the
 client to discover the submission capability. By default the only identity is the
-connected account address.
+connected account address. `Identity/set` changes only `textSignature` and
+`htmlSignature`; the bridge keeps them in `gmail.sqlite3` and returns them from
+`Identity/get`. Name, reply-to and bcc are managed in Gmail: a patch may repeat
+their current values, as an address form sends the whole identity, and is refused
+if it changes them. Google signatures are not imported.
 
 Set `GMAIL_ALIASES_ENABLED=true` to also expose the addresses configured under
 Gmail's "Send mail as" (`users.settings.sendAs`, readable with the existing
 `gmail.modify` grant, no new consent) as JMAP identities. The primary address keeps
 its identity id and gains Gmail's display name and reply-to; every alias whose
 verification status is `accepted` gets a stable id derived from the account and the
-address. Pending or failed aliases are never offered. Identities are read-only:
-create or edit aliases in Gmail or the Workspace admin console. Signatures are left
-empty on purpose so the client's own signatures apply; Google signatures are not
-imported. Settings are cached for five minutes; if Gmail settings are temporarily
+address. Pending or failed aliases are never offered. Create or edit aliases in
+Gmail or the Workspace admin console; each alias keeps its own signature, set as
+above. Settings are cached for five minutes; if Gmail settings are temporarily
 unreachable, `Identity/get` degrades to the primary address. Drafts and MIME
 imports may use any listed address in `From`. Before sending, the bridge re-reads
 the settings: an alias removed meanwhile yields `forbiddenFrom` and the draft is

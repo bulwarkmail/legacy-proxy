@@ -46,6 +46,57 @@ interface Identity {
   htmlSignature: string;
   mayDelete: false;
 }
+const identityState = (list: Identity[]): string =>
+  "identity-" + crypto.createHash("sha256").update(JSON.stringify(list)).digest("hex").slice(0, 16);
+/** A reply-to or bcc list by its addresses; null and an empty list are the same. */
+const addresses = (x: unknown): string =>
+  JSON.stringify(
+    Array.isArray(x)
+      ? x.map((e) => {
+          const a = e && typeof e === "object" ? (e as { email?: unknown }).email : undefined;
+          return typeof a === "string" ? a.trim().toLowerCase() : e;
+        })
+      : (x ?? []),
+  );
+/**
+ * The signatures of `identity` after an Identity/set patch. Everything else
+ * on a Gmail identity is managed in Gmail: a patch may only repeat it, as a
+ * client's address form sends the whole identity.
+ */
+function patchSignatures(
+  identity: Identity,
+  patch: Record<string, unknown>,
+): Pick<Identity, "textSignature" | "htmlSignature"> {
+  const next = { textSignature: identity.textSignature, htmlSignature: identity.htmlSignature };
+  const managed = () =>
+    new JmapError("forbidden", "Only signatures can be changed here; configure names and addresses in Gmail");
+  for (const [k, v] of Object.entries(patch))
+    switch (k) {
+      case "textSignature":
+      case "htmlSignature":
+        if (v != null && typeof v !== "string")
+          throw new JmapError("invalidProperties", `${k} must be a string`, { properties: [k] });
+        next[k] = (v as string | null) ?? "";
+        break;
+      case "name":
+        if (v !== identity.name) throw managed();
+        break;
+      case "replyTo":
+      case "bcc":
+        if (addresses(v) !== addresses(identity[k])) throw managed();
+        break;
+      case "email":
+        if (typeof v !== "string" || v.trim().toLowerCase() !== identity.email)
+          throw new JmapError("invalidProperties", "email is immutable", { properties: [k] });
+        break;
+      case "id":
+      case "mayDelete":
+        break;
+      default:
+        throw new JmapError("invalidProperties", `unknown property: ${k}`, { properties: [k] });
+    }
+  return next;
+}
 interface ComposeContext {
   email: string;
   accountId: string;
@@ -77,7 +128,7 @@ export class GmailCompose {
       mayDelete: false,
     };
   }
-  /** Primary address plus verified aliases. Signatures stay client-side by design; Google signatures are never imported. */
+  /** Primary address plus verified aliases, as Gmail has them. Google signatures are never imported; see {@link listed}. */
   async identities(fresh = false): Promise<Identity[]> {
     const primary = this.primary();
     if (!this.c.sendAs) return [primary];
@@ -118,6 +169,17 @@ export class GmailCompose {
       });
     }
     return result;
+  }
+  /**
+   * The identities Identity/get lists: Gmail's, with the signatures saved
+   * through Identity/set. Settings outages degrade to the primary address so
+   * composing keeps working; sending re-validates anyway.
+   */
+  private async listed(): Promise<Identity[]> {
+    const list = await this.identities().catch(() => [this.primary()]);
+    // Read after the await: nothing yields between this and the writes of Identity/set.
+    const saved = this.c.store.signatures(this.c.email);
+    return list.map((i) => ({ ...i, ...saved.get(i.id) }));
   }
   /** Lower-case addresses allowed in From. Falls back to the primary address if Gmail settings are unreachable. */
   private async senders(): Promise<Set<string>> {
@@ -868,22 +930,57 @@ export class GmailCompose {
       "Email/import": (a) => this.c.exclusive(() => this.importEmails(a)),
       "Identity/get": async (a) => {
         await this.check(a);
-        // Settings outages degrade to the primary address so composing keeps working; sending re-validates anyway.
-        const list = await this.identities().catch(() => [this.primary()]);
+        const list = await this.listed();
         const ids = a.ids as string[] | null | undefined;
         if (ids != null && (!Array.isArray(ids) || ids.length > 100)) fail("invalidArguments", "Invalid ids");
-        const state =
-          "identity-" + crypto.createHash("sha256").update(JSON.stringify(list)).digest("hex").slice(0, 16);
         return {
           accountId: this.c.accountId,
-          state,
+          state: identityState(list),
           list: ids ? list.filter((i) => ids.includes(i.id)) : list,
           notFound: (ids ?? []).filter((id) => !list.some((i) => i.id === id)),
         };
       },
+      // Signatures are kept here; addresses, names and reply-to are configured in Gmail.
       "Identity/set": async (a) => {
         await this.check(a);
-        throw new JmapError("forbidden", "Configure identities in Gmail");
+        const list = await this.listed();
+        const oldState = identityState(list);
+        if (a.ifInState != null && a.ifInState !== oldState) fail("stateMismatch", "Identity state changed");
+        const inGmail = { type: "forbidden", description: "Configure identities in Gmail" };
+        const notCreated: Record<string, unknown> = Object.create(null),
+          notDestroyed: Record<string, unknown> = Object.create(null),
+          notUpdated: Record<string, unknown> = Object.create(null),
+          updated: Record<string, null> = Object.create(null);
+        for (const key of Object.keys(a.create == null ? {} : obj(a.create))) notCreated[key] = inGmail;
+        if (a.destroy != null && !Array.isArray(a.destroy)) fail("invalidArguments", "Invalid destroy");
+        for (const id of (a.destroy as unknown[] | null | undefined) ?? []) notDestroyed[String(id)] = inGmail;
+        const changed = new Map<string, Pick<Identity, "textSignature" | "htmlSignature">>();
+        for (const [id, patch] of Object.entries(a.update == null ? {} : obj(a.update))) {
+          const identity = list.find((i) => i.id === id);
+          if (!identity) {
+            notUpdated[id] = { type: "notFound" };
+            continue;
+          }
+          try {
+            const next = patchSignatures(identity, obj(patch));
+            this.c.store.saveSignature(this.c.email, id, next.textSignature, next.htmlSignature);
+            changed.set(id, next);
+            updated[id] = null;
+          } catch (e) {
+            notUpdated[id] = e instanceof JmapError ? e.toMethodError() : { type: "invalidProperties" };
+          }
+        }
+        return {
+          accountId: this.c.accountId,
+          oldState,
+          newState: identityState(list.map((i) => ({ ...i, ...changed.get(i.id) }))),
+          created: null,
+          notCreated: Object.keys(notCreated).length ? notCreated : null,
+          updated: Object.keys(updated).length ? updated : null,
+          notUpdated: Object.keys(notUpdated).length ? notUpdated : null,
+          destroyed: null,
+          notDestroyed: Object.keys(notDestroyed).length ? notDestroyed : null,
+        };
       },
       "EmailSubmission/set": (a) => this.c.exclusive(() => this.submit(a)),
       "EmailSubmission/get": async (a) => {

@@ -78,6 +78,7 @@ export class GmailStore {
       CREATE INDEX IF NOT EXISTS gmail_draft_current ON gmail_draft(email,current);
       CREATE TABLE IF NOT EXISTS gmail_submission (email TEXT NOT NULL,original TEXT NOT NULL,id TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT,PRIMARY KEY(email,original));
       CREATE TABLE IF NOT EXISTS gmail_revision (email TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS gmail_signature (email TEXT NOT NULL,identity TEXT NOT NULL,text TEXT NOT NULL,html TEXT NOT NULL,PRIMARY KEY(email,identity));
       CREATE TABLE IF NOT EXISTS gmail_thread_index (
         email TEXT NOT NULL, message TEXT NOT NULL, thread TEXT NOT NULL, ord INTEGER NOT NULL,
         PRIMARY KEY(email, message)
@@ -1012,7 +1013,21 @@ export class GmailStore {
       )
       .run(email, original);
   }
-  /** Deletes everything stored for an account: grant, bridge password, sign-in tokens, cache, drafts, send ledger, queues and push subscriptions. */
+  /** Signatures saved through Identity/set, by identity id. Gmail's own signatures are never read. */
+  signatures(email: string): Map<string, { textSignature: string; htmlSignature: string }> {
+    const rows = this.db
+      .prepare("SELECT identity,text,html FROM gmail_signature WHERE email=?")
+      .all(email) as { identity: string; text: string; html: string }[];
+    return new Map(rows.map((r) => [r.identity, { textSignature: r.text, htmlSignature: r.html }]));
+  }
+  saveSignature(email: string, identity: string, textSignature: string, htmlSignature: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO gmail_signature VALUES(?,?,?,?) ON CONFLICT(email,identity) DO UPDATE SET text=excluded.text,html=excluded.html",
+      )
+      .run(email, identity, textSignature, htmlSignature);
+  }
+  /** Deletes everything stored for an account: grant, bridge password, sign-in tokens, cache, drafts, signatures, send ledger, queues and push subscriptions. */
   disconnect(email: string): void {
     const tables = [
       "gmail_connection",
@@ -1024,6 +1039,7 @@ export class GmailStore {
       "gmail_mailbox_snapshot",
       "gmail_upload",
       "gmail_draft",
+      "gmail_signature",
       "gmail_submission",
       "gmail_schedule",
       "gmail_watch",
