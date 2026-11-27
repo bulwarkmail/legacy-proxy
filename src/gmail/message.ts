@@ -150,6 +150,11 @@ export function parseBlob(id: string): [string, string | null] {
  * plain ASCII reads the same in both, so those keep it. A part that comes
  * through `attachments.get` has no bytes here and keeps it as well: checking
  * would cost a Gmail call per part.
+ *
+ * Only `charset` changes. The part's `headers` stay as the message has them,
+ * so a converted part's Content-Type header still names the sender's charset;
+ * a client that takes the charset from there instead of `charset` reads the
+ * blob as before.
  */
 function blobCharset(p: GmailPart, type: string, declared: string | null): string | null {
   const data = p.body?.data;
