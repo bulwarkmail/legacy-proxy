@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import type { EmailBodyPart } from "../mapping/structure.js";
 import { selectBodies } from "../mapping/structure.js";
 import { asAddresses, asDate, asMessageIds, asText, projectHeaderProp } from "../imap/headers.js";
@@ -137,6 +138,32 @@ export function parseBlob(id: string): [string, string | null] {
     throw new JmapError("notFound", "Invalid Gmail blob id");
   }
 }
+/**
+ * The charset of the bytes a part's blob serves.
+ *
+ * The full format hands a text part over already converted to UTF-8, while
+ * its Content-Type still names the charset the sender used, and the blob
+ * serves those bytes as they came. A client that decodes the blob with the
+ * declared charset would read the UTF-8 a second time. So a text part whose
+ * bytes are valid UTF-8 and read differently in the declared charset reports
+ * `utf-8`. Bytes that are not valid UTF-8 are in the declared charset, and
+ * plain ASCII reads the same in both, so those keep it. A part that comes
+ * through `attachments.get` has no bytes here and keeps it as well: checking
+ * would cost a Gmail call per part.
+ */
+function blobCharset(p: GmailPart, type: string, declared: string | null): string | null {
+  const data = p.body?.data;
+  if (declared === null || data === undefined || !type.startsWith("text/")) return declared;
+  const bytes = Buffer.from(data, "base64url");
+  if (!isUtf8(bytes)) return declared;
+  let text: string;
+  try {
+    text = new TextDecoder(declared).decode(bytes);
+  } catch {
+    return declared; // A label TextDecoder does not know.
+  }
+  return text === new TextDecoder().decode(bytes) ? declared : "utf-8";
+}
 export function partTree(message: GmailMessage): { root: EmailBodyPart; parts: Map<string, GmailPart> } {
   const parts = new Map<string, GmailPart>();
   function walk(p: GmailPart, fallback: string): EmailBodyPart {
@@ -146,7 +173,11 @@ export function partTree(message: GmailMessage): { root: EmailBodyPart; parts: M
     const type = (p.mimeType ?? "application/octet-stream").toLowerCase();
     const multipart = type.startsWith("multipart/");
     if (!multipart) parts.set(id, p);
-    const charset = /charset\s*=\s*"?([^";\s]+)/i.exec(header("content-type") ?? "")?.[1] ?? null;
+    const charset = blobCharset(
+      p,
+      type,
+      /charset\s*=\s*"?([^";\s]+)/i.exec(header("content-type") ?? "")?.[1] ?? null,
+    );
     return {
       partId: multipart ? null : id,
       blobId: multipart ? null : blobId(message.id, id),
