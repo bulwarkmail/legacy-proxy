@@ -287,7 +287,7 @@ it("keeps the signatures saved through Identity/set and returns them from Identi
   const r = await setIdentities(mail, {
     update: {
       [primary]: { textSignature: "-- \nOwner", htmlSignature: "<p>Owner</p>" },
-      // What the webmail's copy to the other addresses of the login sends.
+      // Two identities in one call, and a patch that carries only one of the signatures.
       [sales]: { textSignature: "-- \nSales" },
     },
   });
