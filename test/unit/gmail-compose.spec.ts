@@ -546,6 +546,11 @@ it("keeps a reply to a forwarded or Outlook-prefixed subject in the original thr
   expect(await threadOf("Fwd: Original", "Re: Original")).toBe("original-thread");
   expect(await threadOf("FW: Original", "Re: Original")).toBe("original-thread");
   expect(await threadOf("AW: WG: Original", "Re: Original")).toBe("original-thread");
+  // Bulwark writes the reply prefix of the user's language.
+  expect(await threadOf("Original", "Sv: Original")).toBe("original-thread");
+  expect(await threadOf("Original", "Ответ: Original")).toBe("original-thread");
+  expect(await threadOf("Re[2]: Original", "Yn: Original")).toBe("original-thread");
+  expect(await threadOf("转发：Original", "回复：Original")).toBe("original-thread");
   expect(await threadOf("Fwd: Original", "Re: Something else")).toBeUndefined();
 });
 
