@@ -175,6 +175,34 @@ it("downloads attachment bytes and scopes cache entries by account", async () =>
   ).toHaveLength(1);
   expect(store.cached("other@gmail.com", "profile")).toBeNull();
 });
+/** A copy of `message` whose text part carries these bytes under the same Latin-1 header. */
+function withTextBytes(bytes: Buffer) {
+  return {
+    ...message,
+    payload: {
+      ...message.payload,
+      parts: [
+        {
+          ...message.payload.parts[0],
+          body: { data: bytes.toString("base64url"), size: bytes.length },
+        },
+        message.payload.parts[1],
+      ],
+    },
+  };
+}
+const textPart = async (m: ReturnType<typeof withTextBytes>) =>
+  ((await mapMessage(m, {}, async () => Buffer.alloc(0))).bodyStructure as any).subParts[0];
+it("reports UTF-8 for a text part Gmail already converted, despite its Latin-1 header", async () => {
+  // The full format returns text parts as UTF-8 and keeps the original Content-Type;
+  // the part's blob serves those same bytes.
+  const part = await textPart(withTextBytes(Buffer.from("dafür", "utf8")));
+  expect(part.charset).toBe("utf-8");
+});
+it("keeps the declared charset when the bytes are in it", async () => {
+  expect((await textPart(withTextBytes(Buffer.from([99, 97, 102, 233])))).charset).toBe("iso-8859-1");
+  expect((await textPart(withTextBytes(Buffer.from("cafe", "ascii")))).charset).toBe("iso-8859-1");
+});
 it("rejects other accounts and writes, invalidates mailbox state on label changes", async () => {
   const { mail, store } = setup();
   const methods = mail.methods();
