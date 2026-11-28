@@ -1171,6 +1171,12 @@ their own. Setting some of the three keys but not all is an error.
 An optional `caldav` entry (same shape as `carddav`, discovery default
 `/.well-known/caldav`) turns on calendars.
 
+When a server wants only the part of the login before the `@` (`alice`
+instead of `alice@example.org`), set `"localPartLogin": true` on its entry.
+Each of `imap`, `smtp`, `sieve`, `carddav` and `caldav` takes it on its own,
+so set it on every entry whose server needs it. A separate DAV login set with
+`username` is used as written.
+
 ### Encryption to the mail server
 
 Each `imap`, `smtp` and `sieve` entry in `providers.json` says how the proxy

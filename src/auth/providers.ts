@@ -12,8 +12,8 @@ export interface TransportEntry {
   allowPlaintext?: boolean;
   /**
    * Log in with the part of the user name before the last `@` instead of the
-   * whole name. Set only by discovery, for an autoconfig file that asks for
-   * `%EMAILLOCALPART%`.
+   * whole name. Set in providers.json, or by discovery for an autoconfig file
+   * that asks for `%EMAILLOCALPART%`.
    */
   localPartLogin?: boolean;
 }

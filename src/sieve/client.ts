@@ -8,7 +8,7 @@
 import { TLSSocket, connect as tlsConnect } from "node:tls";
 import { Socket, connect as netConnect } from "node:net";
 import type { Credentials } from "../auth/credentials.js";
-import { assertTransport, transportOf } from "../auth/providers.js";
+import { assertTransport, loginName, transportOf } from "../auth/providers.js";
 
 interface SieveOpts {
   host: string;
@@ -16,6 +16,8 @@ interface SieveOpts {
   starttls?: boolean;
   secure?: boolean;
   allowPlaintext?: boolean;
+  /** Log in with the part of the user name before the `@`. */
+  localPartLogin?: boolean;
   creds: Credentials;
   servername?: string;
   /** How long one command, connecting included, may wait for its answer. */
@@ -200,7 +202,8 @@ export class SieveClient {
   private async authenticate(): Promise<void> {
     const c = this.opts.creds;
     if (c.mech === "PLAIN" && c.password) {
-      const blob = Buffer.from(`\x00${c.username}\x00${c.password}`).toString("base64");
+      const user = loginName(this.opts, c.username);
+      const blob = Buffer.from(`\x00${user}\x00${c.password}`).toString("base64");
       this.sock.write(`AUTHENTICATE "PLAIN" {${blob.length}+}\r\n${blob}\r\n`);
     } else {
       throw new Error(`unsupported sieve auth mech: ${c.mech}`);

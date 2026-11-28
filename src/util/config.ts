@@ -9,6 +9,8 @@ export interface DavConfig {
   port: number;
   secure?: boolean;
   allowPlaintext?: boolean;
+  /** Log in with the part of the mail login before the `@`, as on IMAP. */
+  localPartLogin?: boolean;
   basePath?: string;
   principalPath?: string;
   /**
@@ -33,10 +35,10 @@ export interface ProviderConfig {
   // before credentials are sent. A connection with neither is refused unless
   // the host is loopback or `allowPlaintext` is true (see auth/providers.ts).
   // `localPartLogin`: log in with the part of the user name before the `@`
-  // (set only by discovery, see auth/providers.ts loginName).
+  // (set by discovery or in providers.json, see auth/providers.ts loginName).
   imap: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean };
   smtp: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean };
-  sieve: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean } | null;
+  sieve: { host: string; port: number; secure?: boolean; starttls?: boolean; allowPlaintext?: boolean; localPartLogin?: boolean } | null;
   carddav: DavConfig | null;
   /** Optional; omitted or null means no calendars. */
   caldav?: DavConfig | null;

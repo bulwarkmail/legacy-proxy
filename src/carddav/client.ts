@@ -13,6 +13,7 @@
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
 import { JmapError } from "../jmap/errors.js";
+import { loginName } from "../auth/providers.js";
 import type { DavConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
@@ -34,12 +35,15 @@ export interface CardDavOpts {
  * every provider without one, gets the mail credentials.
  */
 export function davOptions(cfg: DavConfig, mailCreds: Credentials): CardDavOpts {
-  const { username, password, forUser, ...rest } = cfg;
-  if (!username && !password && !forUser) return { ...rest, creds: mailCreds };
+  const { username, password, forUser, localPartLogin, ...rest } = cfg;
+  const ownCreds = localPartLogin
+    ? { ...mailCreds, username: loginName({ localPartLogin }, mailCreds.username) }
+    : mailCreds;
+  if (!username && !password && !forUser) return { ...rest, creds: ownCreds };
   // Also catches an unset $DAV_PASSWORD, which interpolates to "".
   if (!username || !password || !forUser) throw new Error("DAV username, password and forUser must be set together");
   const mine = forUser.toLowerCase() === mailCreds.username.toLowerCase();
-  return { ...rest, creds: mine ? { mech: "PLAIN", username, password } : mailCreds };
+  return { ...rest, creds: mine ? { mech: "PLAIN", username, password } : ownCreds };
 }
 
 export interface AddressBookInfo {
