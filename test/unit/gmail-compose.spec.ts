@@ -248,6 +248,48 @@ it("sends through the Bulwark creation-reference flow and keeps a stable email I
   expect(query.ids).toEqual([created.draft.id]);
   expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(1);
 });
+it("accepts the Sent filing patches other JMAP clients send", async () => {
+  for (const patch of [
+    { "mailboxIds/l_SENT": true, "mailboxIds/l_DRAFT": null, "keywords/$draft": null, "keywords/$seen": true },
+    { mailboxIds: { l_SENT: true }, keywords: { $seen: true } },
+  ]) {
+    const { mail, request, mutate } = await setup();
+    const r = await request([
+      ["Email/set", { accountId: mail.accountId, create: { draft: draftInput() } }, "0"],
+      [
+        "EmailSubmission/set",
+        {
+          accountId: mail.accountId,
+          create: { send: { emailId: "#draft", identityId: "gi_" + mail.accountId } },
+          onSuccessUpdateEmail: { "#send": patch },
+        },
+        "1",
+      ],
+    ]);
+    expect(r.methodResponses.map((x) => x[0])).toEqual(["Email/set", "EmailSubmission/set", "Email/set"]);
+    expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(1);
+  }
+});
+it("refuses a Sent filing patch Gmail would not carry out", async () => {
+  for (const patch of [
+    { "mailboxIds/l_SENT": true, "mailboxIds/l_INBOX": true },
+    { "mailboxIds/l_SENT": null },
+    { "keywords/$flagged": true },
+    { mailboxIds: { l_SENT: true, l_INBOX: true } },
+    { keywords: {} },
+  ]) {
+    const { mail, save, mutate } = await setup();
+    const draft = await save();
+    await expect(
+      mail.methods()["EmailSubmission/set"]!({
+        accountId: mail.accountId,
+        create: { s: { emailId: draft.id, identityId: "gi_" + mail.accountId } },
+        onSuccessUpdateEmail: { "#s": patch },
+      }),
+    ).rejects.toMatchObject({ type: "invalidProperties" });
+    expect(mutate.mock.calls.filter((c) => c[0] === "drafts/send")).toHaveLength(0);
+  }
+});
 it("does not send twice when the same draft is submitted again", async () => {
   const { save, mail, mutate } = await setup();
   const draft = await save();

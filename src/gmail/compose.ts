@@ -28,6 +28,33 @@ interface Draft {
   id: string;
   message: GmailMessage & { raw?: string };
 }
+/**
+ * Whether an onSuccessUpdateEmail patch asks only for what Gmail does to a
+ * sent draft by itself: file it in Sent, take it out of Drafts, drop $draft
+ * and mark it seen. Clients write that as a whole `mailboxIds` or as
+ * `mailboxIds/...` paths (RFC 8620 §5.3).
+ */
+export function isGmailSentFiling(patch: Record<string, unknown>): boolean {
+  const isObject = (v: unknown): v is Record<string, unknown> =>
+    !!v && typeof v === "object" && !Array.isArray(v);
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === "keywords/$draft" && value === null) continue;
+    if (key === "keywords/$seen" && value === true) continue;
+    if (key === "mailboxIds/l_SENT" && value === true) continue;
+    if (key === "mailboxIds/l_DRAFT" && value === null) continue;
+    if (key === "keywords" && isObject(value)) {
+      if (value.$seen === true && Object.keys(value).length === 1) continue;
+      return false;
+    }
+    if (key === "mailboxIds" && isObject(value)) {
+      const entries = Object.entries(value);
+      if (value.l_SENT === true && entries.every(([k, v]) => (k === "l_SENT" || k === "all") && v === true)) continue;
+      return false;
+    }
+    return false;
+  }
+  return true;
+}
 /** Subset of Gmail users.settings.sendAs. */
 export interface SendAs {
   sendAsEmail?: string;
@@ -732,12 +759,7 @@ export class GmailCompose {
       fail("invalidProperties", "Gmail already files sent drafts; destruction is unsupported");
     const patches = obj(a.onSuccessUpdateEmail ?? {});
     for (const patch of Object.values(patches)) {
-      const p = obj(patch);
-      if (
-        Object.keys(p).some((k) => !["mailboxIds", "keywords/$draft"].includes(k)) ||
-        p["keywords/$draft"] !== null ||
-        JSON.stringify(obj(p.mailboxIds)) !== JSON.stringify({ l_SENT: true })
-      )
+      if (!isGmailSentFiling(obj(patch)))
         fail("invalidProperties", "Only Gmail native Sent filing is supported");
     }
     const oldState = String(this.c.store.revision(this.c.email));
