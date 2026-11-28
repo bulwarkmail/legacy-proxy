@@ -63,6 +63,56 @@ const indexCache = new Map<number, CachedIndex>();
 const INDEX_TTL_MS = 5_000;
 const inflight = new Map<number, Promise<ThreadIndex>>();
 
+// A folder this large makes `SEARCH ALL` return hundreds of thousands of UIDs.
+// The thread index can catch up from new UIDs; it must not list every UID to
+// notice a small count drift.
+export const LARGE_MAILBOX_MESSAGES = 20_000;
+
+/** Whether a count mismatch should be repaired with `SEARCH ALL`. An empty folder still reconciles, without a search. */
+export function shouldReconcileUidsBySearch(exists: number, cachedCount: number): boolean {
+  if (cachedCount === exists) return false;
+  if (exists > LARGE_MAILBOX_MESSAGES) return false;
+  return true;
+}
+
+export interface IncrementalScanPlan {
+  ranges: Array<{ start: number; end: number | null }>;
+  uidnext: number;
+}
+
+/**
+ * How to catch a folder up. A large folder that already has a scan, and is
+ * more than 2,000 UIDs behind, fetches the newest 500 and the next 500 of the
+ * backlog. The saved uidnext moves only through the backlog, so a later scan
+ * continues into the hole. Expunged UIDs can still linger, because `SEARCH ALL`
+ * stays skipped on these folders.
+ */
+export function incrementalScan(
+  exists: number,
+  startUid: number,
+  uidNext: number,
+  hasPriorScan: boolean,
+): IncrementalScanPlan {
+  const capped = hasPriorScan && exists > LARGE_MAILBOX_MESSAGES && uidNext - startUid > 2_000;
+  if (!capped) return { ranges: [{ start: startUid, end: null }], uidnext: uidNext };
+  const tail = Math.max(startUid, uidNext - 500);
+  const uidnext = Math.min(uidNext, startUid + 500);
+  const ranges: IncrementalScanPlan["ranges"] = [{ start: startUid, end: uidnext - 1 }];
+  if (tail > uidnext - 1) ranges.push({ start: tail, end: null });
+  return { ranges, uidnext };
+}
+
+/** Newest UID a capped catch-up fetches. Uncapped, this is `startUid`. */
+export function incrementalFetchStart(
+  exists: number,
+  startUid: number,
+  uidNext: number,
+  hasPriorScan: boolean,
+): number {
+  const plan = incrementalScan(exists, startUid, uidNext, hasPriorScan);
+  return plan.ranges[plan.ranges.length - 1]!.start;
+}
+
 // Nothing arrived and nothing was expunged since the folder was last scanned.
 export function sameAsLastScan(
   live: LiveMailboxStatus,
@@ -98,39 +148,58 @@ async function syncMailboxScan(
     store.purgeEmailCacheMailbox(account.id, mailboxId);
   }
 
-  if (exists > 0 && uidNext > startUid) {
-    const upserts: EmailCacheUpsert[] = [];
-    for await (const msg of client.fetch(
-      `${startUid}:*`,
-      { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
-      { uid: true },
-    )) {
-      // `${x}:*` returns the highest-UID message even when x exceeds it. A
-      // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
-      if (msg.uid == null || msg.uid < startUid || !msg.envelope) continue;
-      const hb =
-        typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
-      const headers = parseHeaderBlock(hb);
-      const env = msg.envelope as { messageId?: string } | undefined;
-      const tid =
-        computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
-        encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid: msg.uid });
-      upserts.push({
-        accountId: account.id,
-        mailboxId,
-        uidvalidity,
-        uid: msg.uid,
-        threadId: tid,
-        internaldate: dateMs(msg.internalDate) ?? 0,
-      });
+  const hasPriorScan = scan != null && scan.uidvalidity === uidvalidity;
+  const plan = incrementalScan(exists, startUid, uidNext, hasPriorScan);
+  if (exists > 0) {
+    for (const range of plan.ranges) {
+      if (range.end != null && range.end < range.start) continue;
+      if (range.end == null && uidNext <= range.start) continue;
+      const spec = range.end == null ? `${range.start}:*` : `${range.start}:${range.end}`;
+      const upserts: EmailCacheUpsert[] = [];
+      for await (const msg of client.fetch(
+        spec,
+        { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
+        { uid: true },
+      )) {
+        // `${x}:*` returns the highest-UID message even when x exceeds it. A
+        // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
+        if (
+          msg.uid == null ||
+          msg.uid < range.start ||
+          (range.end != null && msg.uid > range.end) ||
+          !msg.envelope
+        ) {
+          continue;
+        }
+        const hb =
+          typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
+        const headers = parseHeaderBlock(hb);
+        const env = msg.envelope as { messageId?: string } | undefined;
+        const tid =
+          computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
+          encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid: msg.uid });
+        upserts.push({
+          accountId: account.id,
+          mailboxId,
+          uidvalidity,
+          uid: msg.uid,
+          threadId: tid,
+          internaldate: dateMs(msg.internalDate) ?? 0,
+        });
+      }
+      store.upsertEmailCacheRows(upserts);
     }
-    store.upsertEmailCacheRows(upserts);
   }
 
   // Reconcile expunges (and self-heal any cache gaps): only when the row
   // count disagrees with EXISTS, ask the server for the live UID set.
   const cachedUids = store.getEmailCacheUids(account.id, mailboxId);
-  if (cachedUids.length !== exists) {
+  if (cachedUids.length !== exists && !shouldReconcileUidsBySearch(exists, cachedUids.length)) {
+    log.info(
+      { mailboxId, exists, cached: cachedUids.length },
+      "thread scan: skip full UID search on large mailbox",
+    );
+  } else if (cachedUids.length !== exists) {
     const searchResult = exists > 0 ? await client.search({ all: true }, { uid: true }) : [];
     const live = new Set(Array.isArray(searchResult) ? (searchResult as number[]) : []);
     const stale = cachedUids.filter((uid) => !live.has(uid));
@@ -169,7 +238,7 @@ async function syncMailboxScan(
     account_id: account.id,
     mailbox_id: mailboxId,
     uidvalidity,
-    uidnext: uidNext,
+    uidnext: plan.uidnext,
     messages: exists,
     scanned_at: Date.now(),
   });
