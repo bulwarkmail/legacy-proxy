@@ -355,8 +355,11 @@ export async function emailQuery(
   const ascending = sort[0]?.isAscending === true;
   const lim = Math.min(args.limit ?? 50, 500);
 
-  let inMailbox = findInMailbox(filter);
-  let searchedAllMail = false;
+  const inMailbox = findInMailbox(filter);
+  // Every Gmail message is in All Mail except those in Trash and Spam, so an
+  // account-wide search only needs those three folders, minus any the filter
+  // excludes.
+  let searchScope: Set<number> | null = null;
   const searchPlan =
     !inMailbox && ctx.account.kind === "gmail" ? isGmailAccountWideContentSearch(filter) : null;
   if (searchPlan) {
@@ -372,18 +375,15 @@ export async function emailQuery(
       }
     });
     if (excludedAreTrashOrJunk) {
-      const allMail = ctx.store
-        .prep(`SELECT id FROM mailbox WHERE account_id = ? AND role = ?`)
-        .get(ctx.account.id, "all") as { id: number } | undefined;
-      if (allMail) {
-        inMailbox = encodeMailboxId({ accountIdx: ctx.account.id, mailboxIdx: allMail.id });
-        searchedAllMail = true;
-      }
+      const scoped = ctx.store
+        .prep(`SELECT id, role FROM mailbox WHERE account_id = ? AND role IN ('all', 'trash', 'junk')`)
+        .all(ctx.account.id) as { id: number; role: string }[];
+      if (scoped.some((m) => m.role === "all")) searchScope = new Set(scoped.map((m) => m.id));
     }
   }
   const full = inMailbox
     ? await emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch)
-    : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch);
+    : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch, searchScope);
 
   let orderedIds = full.ids;
 
@@ -434,7 +434,12 @@ export async function emailQuery(
     orderedIds = dedup;
   }
 
-  const start = resolveQueryStart(orderedIds, args);
+  // A client anchors on the copy it was shown, which may not be the All Mail id.
+  const anchor =
+    searchScope && args.anchor !== undefined && !orderedIds.includes(args.anchor)
+      ? orderedIds.find((id) => preferVisibleCopy(ctx, id) === args.anchor) ?? args.anchor
+      : args.anchor;
+  const start = resolveQueryStart(orderedIds, { ...args, anchor });
   const page = orderedIds.slice(start, start + lim);
   return {
     accountId: args.accountId,
@@ -442,7 +447,7 @@ export async function emailQuery(
     canCalculateChanges: false,
     position: start,
     total: orderedIds.length,
-    ids: searchedAllMail ? page.map((id) => preferVisibleCopy(ctx, id)) : page,
+    ids: searchScope ? page.map((id) => preferVisibleCopy(ctx, id)) : page,
   };
 }
 
@@ -469,8 +474,9 @@ function preferVisibleCopy(ctx: MailCtx, emailId: string): string {
   }
   const row = ctx.store
     .prep(
-      `SELECT thread_id, uidvalidity, headers_raw FROM email_cache
-       WHERE account_id = ? AND mailbox_id = ? AND uid = ? AND uidvalidity = ?`,
+      `SELECT e.thread_id, e.uidvalidity, e.headers_raw FROM email_cache e
+       INNER JOIN mailbox m ON m.id = e.mailbox_id AND m.account_id = e.account_id
+       WHERE e.account_id = ? AND e.mailbox_id = ? AND e.uid = ? AND e.uidvalidity = ? AND m.role = 'all'`,
     )
     .get(ctx.account.id, parts.mailboxIdx, parts.uid, parts.uidvalidity) as
     | { thread_id: string | null; uidvalidity: number; headers_raw: Buffer | null }
@@ -783,6 +789,7 @@ async function emailQueryAccountWideFull(
   sort: SortSpec[],
   ascending: boolean,
   needsFetch: boolean,
+  scope: Set<number> | null = null,
 ): Promise<{ ids: string[]; queryState: string }> {
   const otherThan = findInMailboxOtherThan(filter);
   const excludedIdxs = new Set<number>();
@@ -819,6 +826,7 @@ async function emailQueryAccountWideFull(
   for (const m of all) {
     const idx = decodeMailboxId(m.id).mailboxIdx;
     if (excludedIdxs.has(idx)) continue;
+    if (scope && !scope.has(idx)) continue;
     // An empty folder can't contribute matches; skip the SELECT + SEARCH
     // round trips. The count comes from the cached LIST STATUS (<=30s stale,
     // the same window the search cache already tolerates).
