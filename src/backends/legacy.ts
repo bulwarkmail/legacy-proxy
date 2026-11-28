@@ -212,11 +212,11 @@ function makeMethodTable(): Record<string, Handler> {
       participantIdentitySet(a as never, { account: c.account, store: c.store }, await schedulingAddresses(c)),
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
-        mailboxGet(a as never, { account: c.account, client, store: c.store }),
+        mailboxGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
       ),
     "Mailbox/query": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
-        mailboxQuery(a as never, { account: c.account, client, store: c.store }),
+        mailboxQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
       ),
     "Mailbox/queryChanges": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
