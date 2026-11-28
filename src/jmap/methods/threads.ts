@@ -234,6 +234,45 @@ async function syncMailboxScan(
   });
 }
 
+// The index rows as copies; on a Gmail account the All Mail and Important
+// copies of a message fold into the one in its own folder.
+function threadCopies(
+  ctx: ThreadCtx,
+  rows: { thread_id: string; internaldate: number; mailbox_id: number; uidvalidity: number; uid: number }[],
+): { members: GmailCopy[]; aliases: GmailCopy[] } {
+  const mailboxMeta = new Map(
+    (
+      ctx.store.prep(`SELECT id, role, total FROM mailbox WHERE account_id = ?`).all(ctx.account.id) as {
+        id: number;
+        role: string | null;
+        total: number;
+      }[]
+    ).map((row) => [row.id, row] as const),
+  );
+  const copies: GmailCopy[] = rows.map((row) => {
+    const meta = mailboxMeta.get(row.mailbox_id);
+    return {
+      threadId: row.thread_id,
+      internaldate: row.internaldate,
+      mailboxId: row.mailbox_id,
+      uidvalidity: row.uidvalidity,
+      uid: row.uid,
+      role: meta?.role ?? null,
+      total: meta?.total ?? 0,
+    };
+  });
+  return ctx.account.kind === "gmail" ? collapseGmailCopies(copies) : { members: copies, aliases: [] };
+}
+
+function copyEmailId(ctx: ThreadCtx, row: GmailCopy): string {
+  return encodeEmailId({
+    accountIdx: ctx.account.id,
+    mailboxIdx: row.mailboxId,
+    uidvalidity: row.uidvalidity,
+    uid: row.uid,
+  });
+}
+
 export async function buildThreadIndex(
   ctx: ThreadCtx,
   opts: { withFlags?: boolean } = {},
@@ -332,53 +371,26 @@ async function rebuildThreadIndex(
       }
     }
 
-  const index: ThreadIndex = {
-    members: new Map(),
-    byEmail: new Map(),
-    flagsByEmail,
-  };
-  const cachedRows = ctx.store.getThreadIndexRows(ctx.account.id);
-  const mailboxMeta = new Map(
-    (
-      ctx.store.prep(`SELECT id, role, total FROM mailbox WHERE account_id = ?`).all(ctx.account.id) as {
-        id: number;
-        role: string | null;
-        total: number;
-      }[]
-    ).map((row) => [row.id, row] as const),
-  );
-  const copies: GmailCopy[] = cachedRows.map((row) => {
-    const meta = mailboxMeta.get(row.mailbox_id);
-    return {
-      threadId: row.thread_id,
-      internaldate: row.internaldate,
-      mailboxId: row.mailbox_id,
-      uidvalidity: row.uidvalidity,
-      uid: row.uid,
-      role: meta?.role ?? null,
-      total: meta?.total ?? 0,
+    const index: ThreadIndex = {
+      members: new Map(),
+      byEmail: new Map(),
+      flagsByEmail,
     };
-  });
-  const collapsed =
-    ctx.account.kind === "gmail" ? collapseGmailCopies(copies) : { members: copies, aliases: [] as GmailCopy[] };
-  const publish = (row: GmailCopy, asMember: boolean) => {
-    const eid = encodeEmailId({
-      accountIdx: ctx.account.id,
-      mailboxIdx: row.mailboxId,
-      uidvalidity: row.uidvalidity,
-      uid: row.uid,
-    });
-    index.byEmail.set(eid, row.threadId);
-    if (!asMember) return;
-    let arr = index.members.get(row.threadId);
-    if (!arr) {
-      arr = [];
-      index.members.set(row.threadId, arr);
-    }
-    arr.push(eid);
-  };
-  for (const row of collapsed.members) publish(row, true);
-  for (const row of collapsed.aliases) publish(row, false);
+    // Rows come back ordered by internaldate ascending (RFC 8621 §3 order).
+    const collapsed = threadCopies(ctx, ctx.store.getThreadIndexRows(ctx.account.id));
+    const publish = (row: GmailCopy, asMember: boolean) => {
+      const eid = copyEmailId(ctx, row);
+      index.byEmail.set(eid, row.threadId);
+      if (!asMember) return;
+      let arr = index.members.get(row.threadId);
+      if (!arr) {
+        arr = [];
+        index.members.set(row.threadId, arr);
+      }
+      arr.push(eid);
+    };
+    for (const row of collapsed.members) publish(row, true);
+    for (const row of collapsed.aliases) publish(row, false);
 
     indexCache.set(ctx.account.id, {
       expiresAt: now + INDEX_TTL_MS,
@@ -409,20 +421,19 @@ function accountHasBeenScanned(ctx: ThreadCtx): boolean {
 function cachedThreadMembers(ctx: ThreadCtx, threadId: string): string[] | null {
   const rows = ctx.store
     .prep(
-      `SELECT mailbox_id, uidvalidity, uid FROM email_cache
+      `SELECT mailbox_id, uidvalidity, uid, thread_id, internaldate FROM email_cache
        WHERE account_id = ? AND thread_id = ?
        ORDER BY internaldate ASC, uid ASC`,
     )
-    .all(ctx.account.id, threadId) as { mailbox_id: number; uidvalidity: number; uid: number }[];
+    .all(ctx.account.id, threadId) as {
+    mailbox_id: number;
+    uidvalidity: number;
+    uid: number;
+    thread_id: string;
+    internaldate: number;
+  }[];
   if (rows.length === 0) return null;
-  return rows.map((r) =>
-    encodeEmailId({
-      accountIdx: ctx.account.id,
-      mailboxIdx: r.mailbox_id,
-      uidvalidity: r.uidvalidity,
-      uid: r.uid,
-    }),
-  );
+  return threadCopies(ctx, rows).members.map((row) => copyEmailId(ctx, row));
 }
 
 export async function threadGet(

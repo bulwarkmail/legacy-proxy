@@ -7,6 +7,7 @@ import path from "node:path";
 import type { ImapFlow } from "imapflow";
 import { Store } from "../../src/state/store.js";
 import { threadGet } from "../../src/jmap/methods/threads.js";
+import { encodeEmailId } from "../../src/mapping/ids.js";
 
 let dir: string;
 let store: Store;
@@ -68,6 +69,50 @@ it("answers a stored thread without listing folders", async () => {
   expect(res.notFound).toEqual([]);
   expect(res.list).toHaveLength(1);
   expect(res.list[0]!.emailIds).toHaveLength(1);
+});
+
+it("answers a stored Gmail thread with one copy of each message", async () => {
+  const account = store.upsertAccount({
+    slug: "g",
+    kind: "gmail",
+    host: "imap.gmail.com",
+    username: "u",
+    vault: Buffer.from("v"),
+  });
+  const folder = (name: string, role: string) =>
+    (
+      store
+        .prep(
+          `INSERT INTO mailbox(account_id, name, delim, role, total, unread, subscribed, last_seen)
+           VALUES(?, ?, '/', ?, 1, 0, 1, 0) RETURNING id`,
+        )
+        .get(account.id, name, role) as { id: number }
+    ).id;
+  const inbox = folder("INBOX", "inbox");
+  const all = folder("[Gmail]/All Mail", "all");
+  for (const [mailboxId, uid] of [
+    [inbox, 4],
+    [all, 90],
+  ] as const) {
+    store.upsertEmailCacheRows([
+      { accountId: account.id, mailboxId, uidvalidity: 1, uid, threadId: "Tgmail", internaldate: 1_000 },
+    ]);
+    store.putMailboxScan({
+      account_id: account.id,
+      mailbox_id: mailboxId,
+      uidvalidity: 1,
+      uidnext: uid + 1,
+      messages: 1,
+      scanned_at: Date.now(),
+    });
+  }
+  const res = await threadGet(
+    { accountId: String(account.id), ids: ["Tgmail"] },
+    { account, client: { list: async () => [] } as unknown as ImapFlow, store },
+  );
+  expect(res.list).toEqual([
+    { id: "Tgmail", emailIds: [encodeEmailId({ accountIdx: account.id, mailboxIdx: inbox, uidvalidity: 1, uid: 4 })] },
+  ]);
 });
 
 it("scans the account when a cached row is not from a completed scan", async () => {
