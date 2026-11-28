@@ -533,6 +533,41 @@ it("attaches replies to the original Gmail thread after verifying Message-ID and
   await save({ subject: "Changed subject", inReplyTo: ["parent@example.test"] });
   expect(mutate.mock.calls.find((c) => c[0] === "drafts")?.[3].message.threadId).toBeUndefined();
 });
+it("keeps a reply to a forwarded or Outlook-prefixed subject in the original thread", async () => {
+  const { get, mutate, save } = await setup();
+  const implementation = get.getMockImplementation()!;
+  let parentSubject = "";
+  get.mockImplementation(async (resource: string, cost: number, params: any = {}) => {
+    if (resource === "messages") return { messages: [{ id: "parent", threadId: "original-thread" }] };
+    if (resource === "messages/parent")
+      return {
+        id: "parent",
+        threadId: "original-thread",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "<parent@example.test>" },
+            { name: "Subject", value: parentSubject },
+          ],
+        },
+      };
+    return implementation(resource, cost, params);
+  });
+  const threadOf = async (parent: string, reply: string) => {
+    parentSubject = parent;
+    mutate.mockClear();
+    await save({ subject: reply, inReplyTo: ["parent@example.test"] });
+    return mutate.mock.calls.find((c) => c[0] === "drafts")?.[3].message.threadId;
+  };
+  expect(await threadOf("Fwd: Original", "Re: Original")).toBe("original-thread");
+  expect(await threadOf("FW: Original", "Re: Original")).toBe("original-thread");
+  expect(await threadOf("AW: WG: Original", "Re: Original")).toBe("original-thread");
+  // Bulwark writes the reply prefix of the user's language.
+  expect(await threadOf("Original", "Sv: Original")).toBe("original-thread");
+  expect(await threadOf("Original", "Ответ: Original")).toBe("original-thread");
+  expect(await threadOf("Re[2]: Original", "Yn: Original")).toBe("original-thread");
+  expect(await threadOf("转发：Original", "回复：Original")).toBe("original-thread");
+  expect(await threadOf("Fwd: Original", "Re: Something else")).toBeUndefined();
+});
 
 it("imports foreign mail into a writable mailbox through messages.import, mapping keywords to labels", async () => {
   const { mail, request, mutate, messages, get } = await setup();
