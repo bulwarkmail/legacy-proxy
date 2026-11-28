@@ -235,10 +235,17 @@ export async function mapMessage(
       let value: string;
       let isEncodingProblem = false;
       try {
-        value = new TextDecoder(charset, { fatal: true }).decode(bytes);
+        // The full format hands text parts over already converted to UTF-8,
+        // whatever charset the part's Content-Type still names. Decoding them
+        // with that charset would read the UTF-8 bytes a second time.
+        value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       } catch {
-        value = bytes.toString("utf8");
-        isEncodingProblem = true;
+        try {
+          value = new TextDecoder(charset, { fatal: true }).decode(bytes);
+        } catch {
+          value = bytes.toString("utf8");
+          isEncodingProblem = true;
+        }
       }
       const utf8 = Buffer.from(value);
       const truncated = utf8.length > max;

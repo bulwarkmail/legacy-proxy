@@ -166,6 +166,29 @@ it("maps labels, charset, immutable part blobs, truncation and attachments", asy
   });
   expect(get).toHaveBeenCalledTimes(1);
 });
+it("reads a text part Gmail already converted to UTF-8 despite its Latin-1 header", async () => {
+  // The full format returns text parts as UTF-8 and keeps the original Content-Type.
+  const converted = {
+    ...message,
+    payload: {
+      ...message.payload,
+      parts: [
+        {
+          ...message.payload.parts[0],
+          body: { data: Buffer.from("dafür", "utf8").toString("base64url"), size: 6 },
+        },
+        message.payload.parts[1],
+      ],
+    },
+  };
+  const get = vi.fn(async (p: any) => Buffer.from(p.body.data, "base64url"));
+  const result = await mapMessage(converted, { fetchTextBodyValues: true }, get);
+  expect(result).toMatchObject({
+    bodyValues: {
+      "0": { value: "dafür", isTruncated: false, isEncodingProblem: false },
+    },
+  });
+});
 it("downloads attachment bytes and scopes cache entries by account", async () => {
   const { mail, store, get } = setup();
   expect((await mail.download(blobId("a", "1"))).body.toString()).toBe("PDF");
