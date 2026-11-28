@@ -441,10 +441,68 @@ it("lists a folder page by label id instead of a label-name search", async () =>
   const listing = get.mock.calls.find((c) => c[0] === "messages")!;
   expect(listing[2]).toMatchObject({
     labelIds: "Label_1",
-    includeSpamTrash: "true",
+    includeSpamTrash: "false",
   });
   expect(listing[2]).not.toHaveProperty("q");
   expect(get.mock.calls.some((c) => c[0] === "labels")).toBe(false);
+});
+it("lists Trash itself with its trashed messages", async () => {
+  const { mail, store, get } = setup();
+  store.cache(
+    email,
+    "label:TRASH:g123",
+    { id: "TRASH", name: "TRASH", type: "system", messagesTotal: 2 },
+    60_000,
+  );
+  await mail.methods()["Email/query"]!({
+    accountId: mail.accountId,
+    filter: { inMailbox: "l_TRASH" },
+    limit: 2,
+    calculateTotal: true,
+  });
+  const listing = get.mock.calls.find((c) => c[0] === "messages")!;
+  expect(listing[2]).toMatchObject({ labelIds: "TRASH", includeSpamTrash: "true" });
+});
+it("searches a folder other than Trash and Spam without them, as its listing does", async () => {
+  const { mail, get } = setup();
+  const fixture = get.getMockImplementation()!;
+  get.mockImplementation(async (resource: string, cost: number, params: any = {}) =>
+    resource === "labels"
+      ? {
+          labels: [
+            ...labels,
+            { id: "DRAFT", name: "DRAFT", type: "system" },
+            { id: "TRASH", name: "TRASH", type: "system" },
+          ],
+        }
+      : fixture(resource, cost, params),
+  );
+  const search = async (filter: unknown, isAscending = false) => {
+    const before = get.mock.calls.length;
+    await mail.methods()["Email/query"]!({
+      accountId: mail.accountId,
+      filter,
+      sort: [{ property: "receivedAt", isAscending }],
+    });
+    return get.mock.calls.slice(before).find((c) => c[0] === "messages")![2];
+  };
+  // A draft moved to Trash keeps its DRAFT label for 30 days.
+  expect(
+    await search({
+      operator: "AND",
+      conditions: [{ inMailbox: "l_DRAFT" }, { text: "offer" }],
+    }),
+  ).toMatchObject({ q: '(in:drafts) ("offer")', includeSpamTrash: "false" });
+  expect(await search({ inMailbox: "l_DRAFT" }, true)).toMatchObject({
+    q: "in:drafts",
+    includeSpamTrash: "false",
+  });
+  expect(await search({ inMailbox: "l_TRASH", text: "offer" })).toMatchObject({
+    includeSpamTrash: "true",
+  });
+  expect(await search({ text: "offer" })).toMatchObject({
+    includeSpamTrash: "true",
+  });
 });
 it("treats unmapped client keywords as absent", () => {
   expect(gmailFilter({ hasKeyword: "label/custom.tag" }, labels)).toBe(
