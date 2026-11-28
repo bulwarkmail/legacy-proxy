@@ -278,3 +278,104 @@ it("imports MIME whose From is a verified alias", async () => {
   })) as any;
   expect(refused.notCreated.d.type).toBe("invalidEmail");
 });
+const setIdentities = (mail: GmailMail, args: any) =>
+  mail.methods()["Identity/set"]!({ accountId: mail.accountId, ...args }) as Promise<any>;
+it("keeps the signatures saved through Identity/set and returns them from Identity/get", async () => {
+  const { mail, store, get, mutate, identities } = await setup();
+  const before = await identities();
+  const [primary, sales] = before.list.map((i: any) => i.id);
+  const r = await setIdentities(mail, {
+    update: {
+      [primary]: { textSignature: "-- \nOwner", htmlSignature: "<p>Owner</p>" },
+      // Two identities in one call, and a patch that carries only one of the signatures.
+      [sales]: { textSignature: "-- \nSales" },
+    },
+  });
+  expect(r.updated).toEqual({ [primary]: null, [sales]: null });
+  expect(r.notUpdated).toBeNull();
+  expect(r.oldState).toBe(before.state);
+  const after = await identities();
+  expect(after.list[0]).toMatchObject({ id: primary, textSignature: "-- \nOwner", htmlSignature: "<p>Owner</p>" });
+  expect(after.list[1]).toMatchObject({ id: sales, textSignature: "-- \nSales", htmlSignature: "" });
+  expect(after.state).not.toBe(before.state);
+  expect(r.newState).toBe(after.state);
+  // A patch of one signature leaves the other one as it was.
+  await setIdentities(mail, { update: { [primary]: { textSignature: "-- \nO." } } });
+  expect((await identities()).list[0]).toMatchObject({ textSignature: "-- \nO.", htmlSignature: "<p>Owner</p>" });
+  // Kept by the proxy, not by this instance.
+  const again = new GmailMail(email, { get, mutate } as any, store, true, true, false);
+  const kept = (await again.methods()["Identity/get"]!({ accountId: again.accountId })) as any;
+  expect(kept.list).toEqual([expect.objectContaining({ id: primary, textSignature: "-- \nO." })]);
+  // Disconnecting the account drops them with everything else.
+  store.disconnect(email);
+  await store.save(
+    email,
+    { mech: "XOAUTH2", username: email, refreshToken: "refresh", scopes: [GMAIL_MODIFY] },
+    { profile, labels },
+  );
+  const fresh = new GmailMail(email, { get, mutate } as any, store, true, true, false);
+  const gone = (await fresh.methods()["Identity/get"]!({ accountId: fresh.accountId })) as any;
+  expect(gone.list[0]).toMatchObject({ textSignature: "", htmlSignature: "" });
+});
+it("accepts the unchanged name, reply-to, bcc and address the address editor sends with a signature", async () => {
+  const { mail, identities } = await setup();
+  const [primary, sales] = (await identities()).list.map((i: any) => i.id);
+  const r = await setIdentities(mail, {
+    update: {
+      [primary]: {
+        name: "Owner Name",
+        replyTo: [{ email: "replies@example.test" }],
+        bcc: null,
+        textSignature: "Owner",
+        htmlSignature: "<p>Owner</p>",
+      },
+      [sales]: { email: "Sales@example.test", name: "Sales Desk", replyTo: null, bcc: [], textSignature: "Sales", htmlSignature: "" },
+    },
+  });
+  expect(r.updated).toEqual({ [primary]: null, [sales]: null });
+  expect(r.notUpdated).toBeNull();
+  expect((await identities()).list.map((i: any) => i.textSignature)).toEqual(["Owner", "Sales"]);
+});
+it("refuses changes to what Gmail manages and stores nothing of a refused patch", async () => {
+  const { mail, identities } = await setup();
+  const before = await identities();
+  const [primary, sales] = before.list.map((i: any) => i.id);
+  const r = await setIdentities(mail, {
+    update: {
+      [primary]: { name: "Someone Else", textSignature: "refused" },
+      [sales]: { replyTo: [{ email: "other@example.test" }], textSignature: "refused" },
+    },
+  });
+  expect(r.updated).toBeNull();
+  expect(r.notUpdated[primary].type).toBe("forbidden");
+  expect(r.notUpdated[sales].type).toBe("forbidden");
+  for (const [patch, type] of [
+    [{ bcc: [{ email: "copy@example.test" }] }, "forbidden"],
+    [{ email: "other@example.test" }, "invalidProperties"],
+    [{ color: "red" }, "invalidProperties"],
+    [{ htmlSignature: 42 }, "invalidProperties"],
+  ] as const) {
+    const one = await setIdentities(mail, { update: { [primary]: { ...patch, textSignature: "refused" } } });
+    expect(one.notUpdated[primary].type, JSON.stringify(patch)).toBe(type);
+  }
+  const missing = await setIdentities(mail, { update: { gi_missing: { textSignature: "x" } } });
+  expect(missing.notUpdated.gi_missing.type).toBe("notFound");
+  const after = await identities();
+  expect(after.list.map((i: any) => i.textSignature)).toEqual(["", ""]);
+  expect(after.state).toBe(before.state);
+});
+it("creates and destroys no identities and honours ifInState", async () => {
+  const { mail, identities } = await setup();
+  const { list, state } = await identities();
+  const primary = list[0].id;
+  const r = await setIdentities(mail, { create: { n: { email: "new@example.test" } }, destroy: [primary] });
+  expect(r.notCreated.n.type).toBe("forbidden");
+  expect(r.notDestroyed[primary].type).toBe("forbidden");
+  expect(r.created).toBeNull();
+  expect(r.destroyed).toBeNull();
+  await expect(
+    setIdentities(mail, { ifInState: "identity-0", update: { [primary]: { textSignature: "x" } } }),
+  ).rejects.toMatchObject({ type: "stateMismatch" });
+  const ok = await setIdentities(mail, { ifInState: state, update: { [primary]: { textSignature: "x" } } });
+  expect(ok.updated).toEqual({ [primary]: null });
+});
