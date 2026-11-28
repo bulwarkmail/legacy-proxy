@@ -365,6 +365,39 @@ async function rebuildThreadIndex(
   }
 }
 
+function accountHasBeenScanned(ctx: ThreadCtx): boolean {
+  const missing = ctx.store
+    .prep(
+      `SELECT COUNT(*) AS n FROM mailbox m
+       LEFT JOIN mailbox_scan s ON s.account_id = m.account_id AND s.mailbox_id = m.id
+       WHERE m.account_id = ? AND m.total > 0 AND s.mailbox_id IS NULL`,
+    )
+    .get(ctx.account.id) as { n: number };
+  const scans = ctx.store
+    .prep(`SELECT COUNT(*) AS n FROM mailbox_scan WHERE account_id = ?`)
+    .get(ctx.account.id) as { n: number };
+  return scans.n > 0 && missing.n === 0;
+}
+
+function cachedThreadMembers(ctx: ThreadCtx, threadId: string): string[] | null {
+  const rows = ctx.store
+    .prep(
+      `SELECT mailbox_id, uidvalidity, uid FROM email_cache
+       WHERE account_id = ? AND thread_id = ?
+       ORDER BY internaldate ASC, uid ASC`,
+    )
+    .all(ctx.account.id, threadId) as { mailbox_id: number; uidvalidity: number; uid: number }[];
+  if (rows.length === 0) return null;
+  return rows.map((r) =>
+    encodeEmailId({
+      accountIdx: ctx.account.id,
+      mailboxIdx: r.mailbox_id,
+      uidvalidity: r.uidvalidity,
+      uid: r.uid,
+    }),
+  );
+}
+
 export async function threadGet(
   args: ThreadGetArgs,
   ctx: ThreadCtx,
@@ -373,9 +406,29 @@ export async function threadGet(
   const list: ThreadJson[] = [];
   const notFound: string[] = [];
   const ids = args.ids ?? [];
-  // Build (or reuse cached) thread membership map across the account.
-  const idx = await buildThreadIndex(ctx);
+  // Rows written by Email/get are not a full account scan. Use them only
+  // after every non-empty folder has a scan row. A known thread is then
+  // answered from those rows and is not rechecked against the server.
+  const scanned = accountHasBeenScanned(ctx);
+  const unresolved: string[] = [];
   for (const id of ids) {
+    const cached = scanned ? cachedThreadMembers(ctx, id) : null;
+    if (cached) {
+      list.push({ id, emailIds: cached });
+      continue;
+    }
+    unresolved.push(id);
+  }
+  if (unresolved.length === 0) {
+    return {
+      accountId: args.accountId,
+      state: encodeEmailState({ uidvalidity: 0, modseq: ctx.store.getState(ctx.account.id, "email") }),
+      list,
+      notFound,
+    };
+  }
+  const idx = await buildThreadIndex(ctx);
+  for (const id of unresolved) {
     const members = idx.members.get(id);
     if (members && members.length > 0) {
       list.push({ id, emailIds: members });
