@@ -20,6 +20,7 @@ import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mail
 import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
 import { THREAD_HEADER_FIELDS, dateMs } from "../../imap/fetcher.js";
 import { log } from "../../util/log.js";
+import { collapseGmailCopies, type GmailCopy } from "../gmailCopies.js";
 import { type ChangesResponse } from "./_shared.js";
 
 export interface ThreadGetArgs {
@@ -331,27 +332,53 @@ async function rebuildThreadIndex(
       }
     }
 
-    const index: ThreadIndex = {
-      members: new Map(),
-      byEmail: new Map(),
-      flagsByEmail,
+  const index: ThreadIndex = {
+    members: new Map(),
+    byEmail: new Map(),
+    flagsByEmail,
+  };
+  const cachedRows = ctx.store.getThreadIndexRows(ctx.account.id);
+  const mailboxMeta = new Map(
+    (
+      ctx.store.prep(`SELECT id, role, total FROM mailbox WHERE account_id = ?`).all(ctx.account.id) as {
+        id: number;
+        role: string | null;
+        total: number;
+      }[]
+    ).map((row) => [row.id, row] as const),
+  );
+  const copies: GmailCopy[] = cachedRows.map((row) => {
+    const meta = mailboxMeta.get(row.mailbox_id);
+    return {
+      threadId: row.thread_id,
+      internaldate: row.internaldate,
+      mailboxId: row.mailbox_id,
+      uidvalidity: row.uidvalidity,
+      uid: row.uid,
+      role: meta?.role ?? null,
+      total: meta?.total ?? 0,
     };
-    // Rows come back ordered by internaldate ascending (RFC 8621 §3 order).
-    for (const r of ctx.store.getThreadIndexRows(ctx.account.id)) {
-      const eid = encodeEmailId({
-        accountIdx: ctx.account.id,
-        mailboxIdx: r.mailbox_id,
-        uidvalidity: r.uidvalidity,
-        uid: r.uid,
-      });
-      let arr = index.members.get(r.thread_id);
-      if (!arr) {
-        arr = [];
-        index.members.set(r.thread_id, arr);
-      }
-      arr.push(eid);
-      index.byEmail.set(eid, r.thread_id);
+  });
+  const collapsed =
+    ctx.account.kind === "gmail" ? collapseGmailCopies(copies) : { members: copies, aliases: [] as GmailCopy[] };
+  const publish = (row: GmailCopy, asMember: boolean) => {
+    const eid = encodeEmailId({
+      accountIdx: ctx.account.id,
+      mailboxIdx: row.mailboxId,
+      uidvalidity: row.uidvalidity,
+      uid: row.uid,
+    });
+    index.byEmail.set(eid, row.threadId);
+    if (!asMember) return;
+    let arr = index.members.get(row.threadId);
+    if (!arr) {
+      arr = [];
+      index.members.set(row.threadId, arr);
     }
+    arr.push(eid);
+  };
+  for (const row of collapsed.members) publish(row, true);
+  for (const row of collapsed.aliases) publish(row, false);
 
     indexCache.set(ctx.account.id, {
       expiresAt: now + INDEX_TTL_MS,
