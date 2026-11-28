@@ -24,19 +24,24 @@ export function errorFor(e: unknown, fallback = "serverFail"): SetError {
   return setError(fallback, (e as Error)?.message);
 }
 
+// Path segments that name an object's prototype rather than a property of
+// its own: walked into, they would write to Object.prototype.
+const PROTOTYPE_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
+
 /**
  * Apply an RFC 8620 §5.3 PatchObject. Keys are JSON-pointer-ish paths
  * (`emails/e1/address`); `null` removes. Top-level keys (`name`, `emails`)
- * replace the whole property, which is what the webmail client sends.
+ * replace the whole property, which is what the webmail client sends. Only
+ * own properties are walked into.
  */
 export function applyPatch(target: Record<string, unknown>, patch: Record<string, unknown>): void {
   for (const [path, value] of Object.entries(patch)) {
     const parts = path.split("/").map((s) => s.replaceAll("~1", "/").replaceAll("~0", "~"));
-    if (parts.some((p) => p === "")) throw new JmapError("invalidPatch", `bad path "${path}"`);
+    if (parts.some((p) => p === "" || PROTOTYPE_SEGMENTS.has(p))) throw new JmapError("invalidPatch", `bad path "${path}"`);
     let node: Record<string, unknown> = target;
     for (let i = 0; i < parts.length - 1; i++) {
       const key = parts[i]!;
-      const next = node[key];
+      const next = Object.hasOwn(node, key) ? node[key] : undefined;
       if (next == null || typeof next !== "object" || Array.isArray(next)) {
         if (value === null) {
           node = {};
