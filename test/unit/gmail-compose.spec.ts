@@ -567,6 +567,29 @@ it("keeps a reply to a forwarded or Outlook-prefixed subject in the original thr
   expect(await threadOf("Re[2]: Original", "Yn: Original")).toBe("original-thread");
   expect(await threadOf("转发：Original", "回复：Original")).toBe("original-thread");
   expect(await threadOf("Fwd: Original", "Re: Something else")).toBeUndefined();
+  expect(await threadOf("Fwd: Original", "Re: Original plan")).toBeUndefined();
+});
+it("keeps a reply out of a thread whose message only shares the subject", async () => {
+  const { get, mutate, save } = await setup();
+  const implementation = get.getMockImplementation()!;
+  get.mockImplementation(async (resource: string, cost: number, params: any = {}) => {
+    // The search hit is another message with the same subject.
+    if (resource === "messages") return { messages: [{ id: "other", threadId: "other-thread" }] };
+    if (resource === "messages/other")
+      return {
+        id: "other",
+        threadId: "other-thread",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "<other@example.test>" },
+            { name: "Subject", value: "Fwd: Original" },
+          ],
+        },
+      };
+    return implementation(resource, cost, params);
+  });
+  await save({ subject: "Re: Original", inReplyTo: ["parent@example.test"] });
+  expect(mutate.mock.calls.find((c) => c[0] === "drafts")?.[3].message.threadId).toBeUndefined();
 });
 
 it("imports foreign mail into a writable mailbox through messages.import, mapping keywords to labels", async () => {
