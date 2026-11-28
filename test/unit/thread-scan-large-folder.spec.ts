@@ -10,7 +10,6 @@ import { Store } from "../../src/state/store.js";
 import {
   LARGE_MAILBOX_MESSAGES,
   buildThreadIndex,
-  incrementalFetchStart,
   incrementalScan,
   shouldReconcileUidsBySearch,
 } from "../../src/jmap/methods/threads.js";
@@ -32,10 +31,8 @@ it("repairs an empty folder without searching, and skips the search on a large o
   expect(shouldReconcileUidsBySearch(0, 4)).toBe(true);
   expect(shouldReconcileUidsBySearch(12, 12)).toBe(false);
   expect(shouldReconcileUidsBySearch(LARGE_MAILBOX_MESSAGES + 1, 10)).toBe(false);
-  expect(incrementalFetchStart(90, 1, 5_000, true)).toBe(1);
-  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, false)).toBe(1);
-  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, true)).toBe(79_500);
-  expect(incrementalFetchStart(LARGE_MAILBOX_MESSAGES + 1, 79_900, 80_000, true)).toBe(79_900);
+  expect(incrementalScan(90, 1, 5_000, true).ranges).toEqual([{ start: 1, end: null }]);
+  expect(incrementalScan(LARGE_MAILBOX_MESSAGES + 1, 79_900, 80_000, true).ranges).toEqual([{ start: 79_900, end: null }]);
   expect(incrementalScan(LARGE_MAILBOX_MESSAGES + 1, 1, 80_000, true)).toEqual({
     ranges: [
       { start: 1, end: 500 },

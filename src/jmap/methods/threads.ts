@@ -102,17 +102,6 @@ export function incrementalScan(
   return { ranges, uidnext };
 }
 
-/** Newest UID a capped catch-up fetches. Uncapped, this is `startUid`. */
-export function incrementalFetchStart(
-  exists: number,
-  startUid: number,
-  uidNext: number,
-  hasPriorScan: boolean,
-): number {
-  const plan = incrementalScan(exists, startUid, uidNext, hasPriorScan);
-  return plan.ranges[plan.ranges.length - 1]!.start;
-}
-
 // Nothing arrived and nothing was expunged since the folder was last scanned.
 export function sameAsLastScan(
   live: LiveMailboxStatus,
