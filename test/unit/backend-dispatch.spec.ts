@@ -80,7 +80,7 @@ describe("legacy method binding", () => {
     try {
       const result = await dispatch({ using: [MAIL], methodCalls: [["Mailbox/get", { accountId: "7" }, "m"]] }, context(makeLegacyMethods(ctx)));
       expect(withConnection).toHaveBeenCalledWith(account, "interactive", expect.any(Function));
-      expect(get).toHaveBeenCalledWith({ accountId: "7" }, { account, client, store });
+      expect(get).toHaveBeenCalledWith({ accountId: "7" }, { account, client, store, pool: ctx.pool });
       expect(result.methodResponses[0]).toEqual(["Mailbox/get", { accountId: "7", state: "m1", list: [], notFound: [] }, "m"]);
     } finally {
       get.mockRestore();
