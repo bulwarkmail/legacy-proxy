@@ -322,6 +322,40 @@ function findInMailboxOtherThan(filter: Filter): string[] | null {
   return filter.inMailboxOtherThan ?? null;
 }
 
+// An OR of bare inMailbox conditions, at the top or in an AND tree: "in any of
+// these folders", as cross-account views (all unread, all starred) send it.
+// IMAP SEARCH has no folder criterion, so the folders choose which ones the
+// account-wide path searches and the OR leaves the IMAP filter.
+function isInMailboxAny(filter: Filter): filter is { operator: "OR"; conditions: Array<{ inMailbox: string }> } {
+  return (
+    "operator" in filter &&
+    filter.operator === "OR" &&
+    filter.conditions.length > 0 &&
+    filter.conditions.every(
+      (c) => !("operator" in c) && Object.keys(c).length === 1 && typeof c.inMailbox === "string",
+    )
+  );
+}
+
+function findInMailboxAny(filter: Filter): string[] | null {
+  if (isInMailboxAny(filter)) return filter.conditions.map((c) => c.inMailbox);
+  if ("operator" in filter && filter.operator === "AND") {
+    for (const c of filter.conditions) {
+      const m = findInMailboxAny(c);
+      if (m) return m;
+    }
+  }
+  return null;
+}
+
+function withoutInMailboxAny(filter: Filter): Filter {
+  if (isInMailboxAny(filter)) return {};
+  if ("operator" in filter && filter.operator === "AND") {
+    return { operator: "AND", conditions: filter.conditions.map(withoutInMailboxAny) };
+  }
+  return filter;
+}
+
 export async function emailQuery(
   args: EmailQueryArgs,
   ctx: MailCtx,
@@ -338,7 +372,7 @@ export async function emailQuery(
 
   let imapFilter;
   try {
-    imapFilter = compileFilter(filter, {
+    imapFilter = compileFilter(withoutInMailboxAny(filter), {
       dialect: ctx.account.kind === "gmail" ? "gmail" : "generic",
     });
   } catch (e) {
@@ -802,6 +836,18 @@ async function emailQueryAccountWideFull(
       }
     }
   }
+  const anyOf = findInMailboxAny(filter);
+  let onlyIdxs: Set<number> | null = null;
+  if (anyOf) {
+    onlyIdxs = new Set();
+    for (const enc of anyOf) {
+      try {
+        onlyIdxs.add(decodeMailboxId(enc).mailboxIdx);
+      } catch {
+        throw invalidArguments(`invalid inMailbox id: ${enc}`);
+      }
+    }
+  }
 
   // Statuses from after the last change, so their HIGHESTMODSEQ can vouch
   // for the folder search cache.
@@ -827,6 +873,7 @@ async function emailQueryAccountWideFull(
     const idx = decodeMailboxId(m.id).mailboxIdx;
     if (excludedIdxs.has(idx)) continue;
     if (scope && !scope.has(idx)) continue;
+    if (onlyIdxs && !onlyIdxs.has(idx)) continue;
     // An empty folder can't contribute matches; skip the SELECT + SEARCH
     // round trips. The count comes from the cached LIST STATUS (<=30s stale,
     // the same window the search cache already tolerates).
